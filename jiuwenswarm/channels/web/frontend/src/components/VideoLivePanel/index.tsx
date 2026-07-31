@@ -1,14 +1,39 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { Camera, FileVideo, LoaderCircle, Mic, Send, Square, Video, X } from 'lucide-react';
+import { Camera, FileVideo, LoaderCircle, Mic, Monitor, Send, Square, Video, X } from 'lucide-react';
 import { webClient, webRequest } from '../../services/webClient';
 import './VideoLivePanel.css';
 
-type VideoSource = 'camera' | 'file' | null;
+type VideoSource = 'camera' | 'file' | 'screen' | null;
 type AbortReason = 'manual' | 'timeout' | 'source';
 
 interface CapturedFrame {
   data_url: string;
   captured_at: number;
+  source_id: string;
+  source_label: string;
+}
+
+interface ScreenSource {
+  id: string;
+  name: string;
+  stream: MediaStream;
+}
+
+interface AudioInput {
+  data_url: string;
+  source_label: string;
+}
+
+interface SourceAudioCapture {
+  id: string;
+  label: string;
+  stream: MediaStream;
+  recorder: MediaRecorder | null;
+  chunks: Blob[];
+  latestBlob: Blob | null;
+  timerId: number | null;
+  disposed: boolean;
+  waiters: Array<() => void>;
 }
 
 interface VideoAskResponse {
@@ -20,9 +45,16 @@ interface VideoAskResponse {
 
 const FRAME_INTERVAL_MS = 500;
 const MAX_FRAMES = 6;
+const MAX_SCREENS = 4;
 const MAX_FRAME_WIDTH = 768;
 const REQUEST_TIMEOUT_MS = 15_000;
 const RECORDING_LIMIT_MS = 15_000;
+const SOURCE_AUDIO_SEGMENT_MS = 3_000;
+const AUDIO_MIME_TYPES = [
+  'audio/webm;codecs=opus',
+  'audio/webm',
+  'audio/ogg;codecs=opus',
+];
 
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -37,7 +69,11 @@ export function VideoLivePanel() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const screenVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const fileUrlRef = useRef<string | null>(null);
+  const fileCaptureStreamRef = useRef<MediaStream | null>(null);
+  const sourceAudioCapturesRef = useRef<Map<string, SourceAudioCapture>>(new Map());
   const framesRef = useRef<CapturedFrame[]>([]);
   const requestAbortRef = useRef<AbortController | null>(null);
   const requestStartedAtRef = useRef(0);
@@ -51,6 +87,7 @@ export function VideoLivePanel() {
 
   const [source, setSource] = useState<VideoSource>(null);
   const [sourceName, setSourceName] = useState('');
+  const [screens, setScreens] = useState<ScreenSource[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [frameCount, setFrameCount] = useState(0);
   const [question, setQuestion] = useState('');
@@ -63,10 +100,112 @@ export function VideoLivePanel() {
   const [requestCount, setRequestCount] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
+  const [audioSourceCount, setAudioSourceCount] = useState(0);
+
+  const stopSourceAudio = useCallback((sourceId: string) => {
+    const capture = sourceAudioCapturesRef.current.get(sourceId);
+    if (!capture) return;
+    capture.disposed = true;
+    if (capture.timerId !== null) window.clearTimeout(capture.timerId);
+    capture.timerId = null;
+    capture.recorder && (capture.recorder.onstop = null);
+    if (capture.recorder?.state === 'recording') capture.recorder.stop();
+    capture.waiters.splice(0).forEach((resolve) => resolve());
+    sourceAudioCapturesRef.current.delete(sourceId);
+    setAudioSourceCount(sourceAudioCapturesRef.current.size);
+  }, []);
+
+  const attachSourceAudio = useCallback((sourceId: string, label: string, stream: MediaStream) => {
+    stopSourceAudio(sourceId);
+    const liveAudioTracks = stream.getAudioTracks().filter((track) => track.readyState === 'live');
+    if (liveAudioTracks.length === 0 || typeof MediaRecorder === 'undefined') return false;
+
+    const capture: SourceAudioCapture = {
+      id: sourceId,
+      label,
+      stream,
+      recorder: null,
+      chunks: [],
+      latestBlob: null,
+      timerId: null,
+      disposed: false,
+      waiters: [],
+    };
+    const mimeType = AUDIO_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type));
+
+    const startSegment = () => {
+      if (capture.disposed) return;
+      const tracks = capture.stream.getAudioTracks().filter((track) => track.readyState === 'live');
+      if (tracks.length === 0) return;
+      capture.chunks = [];
+      const recorder = new MediaRecorder(
+        new MediaStream(tracks),
+        mimeType ? { mimeType } : undefined,
+      );
+      capture.recorder = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) capture.chunks.push(event.data);
+      };
+      recorder.onstop = () => {
+        if (capture.timerId !== null) window.clearTimeout(capture.timerId);
+        capture.timerId = null;
+        const blob = new Blob(capture.chunks, { type: recorder.mimeType || 'audio/webm' });
+        if (blob.size > 0) capture.latestBlob = blob;
+        capture.chunks = [];
+        capture.recorder = null;
+        capture.waiters.splice(0).forEach((resolve) => resolve());
+        if (!capture.disposed) startSegment();
+      };
+      recorder.start(250);
+      capture.timerId = window.setTimeout(() => {
+        if (recorder.state === 'recording') recorder.stop();
+      }, SOURCE_AUDIO_SEGMENT_MS);
+    };
+
+    try {
+      sourceAudioCapturesRef.current.set(sourceId, capture);
+      startSegment();
+      setAudioSourceCount(sourceAudioCapturesRef.current.size);
+      return true;
+    } catch {
+      capture.disposed = true;
+      sourceAudioCapturesRef.current.delete(sourceId);
+      setAudioSourceCount(sourceAudioCapturesRef.current.size);
+      return false;
+    }
+  }, [stopSourceAudio]);
+
+  const snapshotSourceAudio = useCallback(async (): Promise<AudioInput[]> => {
+    const captures = Array.from(sourceAudioCapturesRef.current.values())
+      .filter((capture) => !capture.disposed);
+    await Promise.all(captures.map((capture) => new Promise<void>((resolve) => {
+      const recorder = capture.recorder;
+      if (!recorder || recorder.state !== 'recording') {
+        resolve();
+        return;
+      }
+      capture.waiters.push(resolve);
+      if (capture.timerId !== null) window.clearTimeout(capture.timerId);
+      capture.timerId = null;
+      recorder.stop();
+    })));
+    const inputs = await Promise.all(captures.map(async (capture) => {
+      if (!capture.latestBlob) return null;
+      return {
+        data_url: await blobToDataUrl(capture.latestBlob),
+        source_label: capture.label,
+      };
+    }));
+    return inputs.filter((input): input is AudioInput => input !== null);
+  }, []);
 
   const releaseSource = useCallback(() => {
+    stopSourceAudio('camera');
+    stopSourceAudio('file');
     cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
     cameraStreamRef.current = null;
+    fileCaptureStreamRef.current?.getTracks().forEach((track) => track.stop());
+    fileCaptureStreamRef.current = null;
     if (fileUrlRef.current) {
       URL.revokeObjectURL(fileUrlRef.current);
       fileUrlRef.current = null;
@@ -81,7 +220,17 @@ export function VideoLivePanel() {
     framesRef.current = [];
     setFrameCount(0);
     setIsPlaying(false);
-  }, []);
+  }, [stopSourceAudio]);
+
+  const releaseScreens = useCallback((updateState = true) => {
+    screenStreamsRef.current.forEach((stream, screenId) => {
+      stopSourceAudio(screenId);
+      stream.getTracks().forEach((track) => track.stop());
+    });
+    screenStreamsRef.current.clear();
+    screenVideoRefs.current.clear();
+    if (updateState) setScreens([]);
+  }, [stopSourceAudio]);
 
   const abortQuestion = useCallback((reason: AbortReason) => {
     requestAbortReasonRef.current = reason;
@@ -114,6 +263,7 @@ export function VideoLivePanel() {
   const closeSource = () => {
     if (isAskingRef.current) abortQuestion('source');
     cancelRecording();
+    releaseScreens();
     releaseSource();
     setSource(null);
     setSourceName('');
@@ -124,8 +274,9 @@ export function VideoLivePanel() {
   useEffect(() => () => {
     requestAbortRef.current?.abort();
     cancelRecording(false);
+    releaseScreens(false);
     releaseSource();
-  }, [cancelRecording, releaseSource]);
+  }, [cancelRecording, releaseScreens, releaseSource]);
 
   useEffect(() => {
     const offStarted = webClient.on<{ request_id?: unknown }>('video.started', (event) => {
@@ -163,10 +314,9 @@ export function VideoLivePanel() {
   useEffect(() => {
     if (!isPlaying) return;
 
-    const capture = () => {
-      const video = videoRef.current;
+    const captureVideo = (video: HTMLVideoElement, sourceId: string, sourceLabel: string) => {
       const canvas = canvasRef.current;
-      if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      if (!canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
       if (!video.videoWidth || !video.videoHeight) return;
 
       const scale = Math.min(1, MAX_FRAME_WIDTH / video.videoWidth);
@@ -179,7 +329,27 @@ export function VideoLivePanel() {
       framesRef.current.push({
         data_url: canvas.toDataURL('image/jpeg', 0.72),
         captured_at: Date.now(),
+        source_id: sourceId,
+        source_label: sourceLabel,
       });
+    };
+
+    const capture = () => {
+      if (source === 'screen') {
+        screens.forEach((screen) => {
+          const video = screenVideoRefs.current.get(screen.id);
+          if (video) captureVideo(video, screen.id, screen.name);
+        });
+      } else {
+        const video = videoRef.current;
+        if (video) {
+          captureVideo(
+            video,
+            source || 'video',
+            source === 'camera' ? '摄像头' : sourceName || '本地视频',
+          );
+        }
+      }
       if (framesRef.current.length > MAX_FRAMES) {
         framesRef.current.splice(0, framesRef.current.length - MAX_FRAMES);
       }
@@ -189,10 +359,11 @@ export function VideoLivePanel() {
     capture();
     const timer = window.setInterval(capture, FRAME_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [isPlaying]);
+  }, [isPlaying, screens, source, sourceName]);
 
   const startCamera = async () => {
     cancelRecording();
+    releaseScreens();
     releaseSource();
     setSource(null);
     setSourceName('');
@@ -200,9 +371,13 @@ export function VideoLivePanel() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
       });
       cameraStreamRef.current = stream;
+      const hasAudio = attachSourceAudio('camera', '摄像头麦克风', stream);
       setSource('camera');
       setSourceName('Camera');
       const video = videoRef.current;
@@ -217,6 +392,7 @@ export function VideoLivePanel() {
       try {
         await video.play();
         setIsPlaying(true);
+        if (!hasAudio) setError('摄像头画面已打开，但没有可用的麦克风音轨。');
       } catch (playError) {
         setError(
           playError instanceof Error
@@ -238,6 +414,7 @@ export function VideoLivePanel() {
     if (!file) return;
 
     cancelRecording();
+    releaseScreens();
     releaseSource();
     setError('');
     const url = URL.createObjectURL(file);
@@ -248,13 +425,98 @@ export function VideoLivePanel() {
     video.src = url;
     video.muted = false;
     await video.play().catch(() => undefined);
+    const capturableVideo = video as HTMLVideoElement & {
+      captureStream?: () => MediaStream;
+      mozCaptureStream?: () => MediaStream;
+    };
+    const capturedStream = capturableVideo.captureStream?.()
+      ?? capturableVideo.mozCaptureStream?.()
+      ?? null;
+    fileCaptureStreamRef.current = capturedStream;
+    const hasAudio = capturedStream
+      ? attachSourceAudio('file', `${file.name} 原音轨`, capturedStream)
+      : false;
     setSource('file');
     setSourceName(file.name);
     setIsPlaying(!video.paused);
+    if (!hasAudio) setError('视频已打开，但浏览器没有提供可读取的原音轨。');
   };
 
-  const runOmniRequest = async (prompt: string, audioDataUrl?: string) => {
-    if ((!prompt && !audioDataUrl) || isAskingRef.current) return;
+  const removeScreen = useCallback((screenId: string) => {
+    stopSourceAudio(screenId);
+    const stream = screenStreamsRef.current.get(screenId);
+    stream?.getTracks().forEach((track) => track.stop());
+    screenStreamsRef.current.delete(screenId);
+    screenVideoRefs.current.delete(screenId);
+    framesRef.current = framesRef.current.filter((frame) => frame.source_id !== screenId);
+    setFrameCount(framesRef.current.length);
+    setScreens((current) => {
+      const next = current.filter((screen) => screen.id !== screenId);
+      if (next.length === 0) {
+        setSource(null);
+        setSourceName('');
+        setIsPlaying(false);
+      } else {
+        setSourceName(`${next.length} 个屏幕`);
+      }
+      return next;
+    });
+  }, [stopSourceAudio]);
+
+  const startScreen = async () => {
+    if (isAskingRef.current) return;
+    if (screens.length >= MAX_SCREENS) {
+      setError(`最多同时读取 ${MAX_SCREENS} 个屏幕。`);
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setError('当前运行环境不支持屏幕共享。');
+      return;
+    }
+
+    cancelRecording();
+    setError('');
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 2, max: 5 } },
+        audio: true,
+      });
+      const track = stream.getVideoTracks()[0];
+      if (!track) {
+        stream.getTracks().forEach((item) => item.stop());
+        throw new Error('没有获得屏幕画面。');
+      }
+
+      if (source !== 'screen') {
+        releaseSource();
+        releaseScreens();
+      }
+
+      const screenId = typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `screen-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const name = track.label.trim() || `屏幕 ${screens.length + 1}`;
+      screenStreamsRef.current.set(screenId, stream);
+      setScreens((current) => {
+        setSourceName(`${current.length + 1} 个屏幕`);
+        return [...current, { id: screenId, name, stream }];
+      });
+      const hasAudio = attachSourceAudio(screenId, `${name} 系统音频`, stream);
+      setSource('screen');
+      setIsPlaying(true);
+      if (!hasAudio) setError('画面已共享，但没有系统音频；请在共享窗口中勾选“共享音频”。');
+      track.addEventListener('ended', () => removeScreen(screenId), { once: true });
+    } catch (screenError) {
+      if (screenError instanceof DOMException && screenError.name === 'NotAllowedError') {
+        setError('已取消选择屏幕。');
+      } else {
+        setError(screenError instanceof Error ? screenError.message : '无法读取屏幕。');
+      }
+    }
+  };
+
+  const runOmniRequest = async (prompt: string, questionAudioDataUrl?: string) => {
+    if ((!prompt && !questionAudioDataUrl) || isAskingRef.current) return;
     if (framesRef.current.length === 0) {
       setError('请先打开视频并等待画面开始播放。');
       return;
@@ -277,13 +539,20 @@ export function VideoLivePanel() {
       }
     }, REQUEST_TIMEOUT_MS);
     try {
+      const audioInputs = await snapshotSourceAudio();
+      if (questionAudioDataUrl) {
+        audioInputs.push({
+          data_url: questionAudioDataUrl,
+          source_label: '用户麦克风提问',
+        });
+      }
       const result = await webRequest<VideoAskResponse>(
         'video.ask',
         {
           question: prompt,
           source,
           frames: framesRef.current.slice(),
-          ...(audioDataUrl ? { audio_data_url: audioDataUrl } : {}),
+          ...(audioInputs.length > 0 ? { audio_inputs: audioInputs } : {}),
         },
         {
           timeoutMs: REQUEST_TIMEOUT_MS + 1_000,
@@ -295,7 +564,7 @@ export function VideoLivePanel() {
       setFirstTokenMs(result.first_token_ms ?? null);
       if (result.model) setModel(result.model);
       setRequestCount((count) => count + 1);
-      if (!audioDataUrl) setQuestion('');
+      if (!questionAudioDataUrl) setQuestion('');
     } catch (requestError) {
       const abortReason = requestAbortReasonRef.current;
       if (abortReason === 'timeout') {
@@ -350,12 +619,7 @@ export function VideoLivePanel() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       microphoneStreamRef.current = stream;
       audioChunksRef.current = [];
-      const preferredMimeTypes = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/ogg;codecs=opus',
-      ];
-      const mimeType = preferredMimeTypes.find((type) => MediaRecorder.isTypeSupported(type));
+      const mimeType = AUDIO_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type));
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       mediaRecorderRef.current = recorder;
       recorder.ondataavailable = (recordedEvent) => {
@@ -403,7 +667,7 @@ export function VideoLivePanel() {
           <span className="video-live__brand-icon"><Video aria-hidden /></span>
           <div>
             <h1>Jiuwen Omni Live</h1>
-            <p>Qwen3-Omni 实时音视频问答</p>
+            <p>Qwen3-Omni 多屏音视频问答</p>
           </div>
         </div>
         <div className={`video-live__status ${isPlaying ? 'is-live' : ''}`}>
@@ -417,26 +681,61 @@ export function VideoLivePanel() {
           <div className="video-live__viewer">
             <video
               ref={videoRef}
+              className={source === 'screen' ? 'is-hidden' : ''}
               controls={source === 'file'}
               playsInline
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
               onEnded={() => setIsPlaying(false)}
             />
+            {source === 'screen' && (
+              <div className={`video-live__screen-grid video-live__screen-grid--${Math.min(screens.length, 4)}`}>
+                {screens.map((screen) => (
+                  <div className="video-live__screen-tile" key={screen.id}>
+                    <video
+                      ref={(node) => {
+                        if (!node) {
+                          screenVideoRefs.current.delete(screen.id);
+                          return;
+                        }
+                        screenVideoRefs.current.set(screen.id, node);
+                        if (node.srcObject !== screen.stream) node.srcObject = screen.stream;
+                        void node.play().catch(() => undefined);
+                      }}
+                      autoPlay
+                      muted
+                      playsInline
+                    />
+                    <div className="video-live__screen-label">
+                      <span className="is-live" />
+                      {screen.name}
+                    </div>
+                    <button
+                      className="video-live__screen-close"
+                      type="button"
+                      onClick={() => removeScreen(screen.id)}
+                      aria-label={`关闭${screen.name}`}
+                    >
+                      <X aria-hidden />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             {!source && (
               <div className="video-live__empty">
                 <span className="video-live__empty-icon"><Video aria-hidden /></span>
                 <strong>打开一个实时画面</strong>
-                <p>使用摄像头，或选择本地视频文件</p>
+                <p>使用摄像头、本地视频，或添加多个屏幕</p>
               </div>
             )}
-            {source && (
+            {source && source !== 'screen' && (
               <div className="video-live__source-chip">
                 <span className={isPlaying ? 'is-live' : ''} />
                 {sourceName}
               </div>
             )}
-            {source && (
+            {source && source !== 'screen' && (
               <button className="video-live__close" type="button" onClick={closeSource} aria-label="关闭视频">
                 <X aria-hidden />
               </button>
@@ -453,13 +752,26 @@ export function VideoLivePanel() {
               本地视频
               <input type="file" accept="video/*" onChange={(event) => void openFile(event)} />
             </label>
+            <button
+              type="button"
+              className="video-live__source-button"
+              disabled={source === 'screen' && screens.length >= MAX_SCREENS}
+              onClick={() => void startScreen()}
+            >
+              <Monitor aria-hidden />
+              {source === 'screen' ? '添加屏幕' : '共享屏幕'}
+            </button>
             {source && (
               <button type="button" className="video-live__source-button video-live__source-button--stop" onClick={closeSource}>
                 <X aria-hidden />
-                {source === 'camera' ? '停止摄像头' : '关闭视频'}
+                {source === 'camera' ? '停止摄像头' : source === 'screen' ? '停止全部屏幕' : '关闭视频'}
               </button>
             )}
-            <span className="video-live__frame-count">滚动窗口：{frameCount}/{MAX_FRAMES} 帧</span>
+            <span className="video-live__frame-count">
+              滚动窗口：{frameCount}/{MAX_FRAMES} 帧
+              {source === 'screen' ? ` · ${screens.length}/${MAX_SCREENS} 屏` : ''}
+              {` · 音频 ${audioSourceCount} 路`}
+            </span>
           </div>
         </div>
 
@@ -478,7 +790,9 @@ export function VideoLivePanel() {
 
           <div className="video-live__prompt-banner">
             <span>当前模式</span>
-            {isRecording ? '正在录音，再点麦克风结束并提问' : '最近 3 秒画面 + 语音/文字问答'}
+            {isRecording
+              ? '正在录音，再点麦克风结束并提问'
+              : `最近 3 秒${source === 'screen' ? ` · ${screens.length} 个屏幕` : '画面'} + ${audioSourceCount} 路来源音频`}
           </div>
 
           <div className="video-live__answer">
