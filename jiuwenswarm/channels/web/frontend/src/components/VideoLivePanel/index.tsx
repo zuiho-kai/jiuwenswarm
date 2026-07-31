@@ -44,10 +44,11 @@ interface VideoAskResponse {
 }
 
 const FRAME_INTERVAL_MS = 500;
+const MEMORY_INTERVAL_MS = 1_000;
 const MAX_FRAMES = 6;
 const MAX_SCREENS = 4;
 const MAX_FRAME_WIDTH = 768;
-const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 45_000;
 const RECORDING_LIMIT_MS = 15_000;
 const SOURCE_AUDIO_SEGMENT_MS = 3_000;
 const AUDIO_MIME_TYPES = [
@@ -75,6 +76,9 @@ export function VideoLivePanel() {
   const fileCaptureStreamRef = useRef<MediaStream | null>(null);
   const sourceAudioCapturesRef = useRef<Map<string, SourceAudioCapture>>(new Map());
   const framesRef = useRef<CapturedFrame[]>([]);
+  const memoryFramesRef = useRef<Map<string, CapturedFrame>>(new Map());
+  const memoryRequestRef = useRef<Promise<void> | null>(null);
+  const lastMemoryFlushAtRef = useRef(0);
   const requestAbortRef = useRef<AbortController | null>(null);
   const requestStartedAtRef = useRef(0);
   const requestAbortReasonRef = useRef<AbortReason | null>(null);
@@ -218,6 +222,8 @@ export function VideoLivePanel() {
       video.load();
     }
     framesRef.current = [];
+    memoryFramesRef.current.clear();
+    lastMemoryFlushAtRef.current = 0;
     setFrameCount(0);
     setIsPlaying(false);
   }, [stopSourceAudio]);
@@ -311,6 +317,24 @@ export function VideoLivePanel() {
     return () => window.clearInterval(timer);
   }, [isAsking]);
 
+  const flushMemoryFrames = useCallback(async () => {
+    if (memoryRequestRef.current) {
+      await memoryRequestRef.current;
+    }
+    const frames = Array.from(memoryFramesRef.current.values());
+    if (frames.length === 0) return;
+    memoryFramesRef.current.clear();
+    const request = webRequest('video.memory.observe', { frames }, { timeoutMs: 10_000 }).then(() => undefined);
+    memoryRequestRef.current = request;
+    try {
+      await request;
+    } finally {
+      if (memoryRequestRef.current === request) {
+        memoryRequestRef.current = null;
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (!isPlaying) return;
 
@@ -326,12 +350,14 @@ export function VideoLivePanel() {
       if (!context) return;
 
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      framesRef.current.push({
+      const frame = {
         data_url: canvas.toDataURL('image/jpeg', 0.72),
         captured_at: Date.now(),
         source_id: sourceId,
         source_label: sourceLabel,
-      });
+      };
+      framesRef.current.push(frame);
+      memoryFramesRef.current.set(sourceId, frame);
     };
 
     const capture = () => {
@@ -354,12 +380,17 @@ export function VideoLivePanel() {
         framesRef.current.splice(0, framesRef.current.length - MAX_FRAMES);
       }
       setFrameCount(framesRef.current.length);
+      const now = Date.now();
+      if (now - lastMemoryFlushAtRef.current >= MEMORY_INTERVAL_MS) {
+        lastMemoryFlushAtRef.current = now;
+        void flushMemoryFrames().catch(() => undefined);
+      }
     };
 
     capture();
     const timer = window.setInterval(capture, FRAME_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [isPlaying, screens, source, sourceName]);
+  }, [flushMemoryFrames, isPlaying, screens, source, sourceName]);
 
   const startCamera = async () => {
     cancelRecording();
@@ -449,6 +480,7 @@ export function VideoLivePanel() {
     screenStreamsRef.current.delete(screenId);
     screenVideoRefs.current.delete(screenId);
     framesRef.current = framesRef.current.filter((frame) => frame.source_id !== screenId);
+    memoryFramesRef.current.delete(screenId);
     setFrameCount(framesRef.current.length);
     setScreens((current) => {
       const next = current.filter((screen) => screen.id !== screenId);
@@ -568,7 +600,7 @@ export function VideoLivePanel() {
     } catch (requestError) {
       const abortReason = requestAbortReasonRef.current;
       if (abortReason === 'timeout') {
-        setError('超过 15 秒仍未收到结果，已停止等待，请重试。');
+        setError('超过 45 秒仍未收到结果，已停止等待，请重试。');
       } else if (abortReason === 'manual') {
         setError('已取消本次问答。');
       } else if (abortReason !== 'source') {
@@ -802,7 +834,7 @@ export function VideoLivePanel() {
               <div className="video-live__answer-empty">
                 <LoaderCircle className="is-spinning" aria-hidden />
                 <strong>正在分析最近 3 秒画面</strong>
-                <span>{(elapsedMs / 1000).toFixed(1)} 秒 · 最长等待 15 秒</span>
+                <span>{(elapsedMs / 1000).toFixed(1)} 秒 · 最长等待 45 秒</span>
               </div>
             ) : (
               <div className="video-live__answer-empty">
