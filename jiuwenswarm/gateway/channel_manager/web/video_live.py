@@ -12,19 +12,31 @@ _MAX_FRAMES = 8
 _MAX_FRAME_CHARS = 1_500_000
 _MAX_TOTAL_FRAME_CHARS = 6_500_000
 _MAX_AUDIO_CHARS = 2_000_000
+_MAX_AUDIO_INPUTS = 6
 _MAX_TOTAL_REQUEST_CHARS = 7_500_000
 _ALLOWED_DATA_URL_PREFIXES = (
     "data:image/jpeg;base64,",
     "data:image/png;base64,",
     "data:image/webp;base64,",
 )
-_ALLOWED_AUDIO_DATA_URL_PREFIXES = (
-    "data:audio/webm;base64,",
-    "data:audio/ogg;base64,",
-    "data:audio/wav;base64,",
-    "data:audio/mp4;base64,",
-    "data:audio/mpeg;base64,",
+_ALLOWED_AUDIO_MIME_TYPES = (
+    "audio/webm",
+    "audio/ogg",
+    "audio/wav",
+    "audio/mp4",
+    "audio/mpeg",
 )
+
+
+def _is_allowed_audio_data_url(value: str) -> bool:
+    header, separator, _ = value.partition(",")
+    if not separator or not header.lower().startswith("data:"):
+        return False
+    parts = header[5:].lower().split(";")
+    return (
+        parts[0] in _ALLOWED_AUDIO_MIME_TYPES
+        and "base64" in parts[1:]
+    )
 
 
 def _configured_video_model() -> tuple[str, str, str]:
@@ -76,7 +88,9 @@ def _omni_model_config() -> tuple[str, str, str]:
     return api_base.rstrip("/"), api_key, model
 
 
-def _normalize_request(params: Any) -> tuple[str, list[str], str | None]:
+def _normalize_request(
+    params: Any,
+) -> tuple[str, list[tuple[str, str]], list[tuple[str, str]]]:
     if not isinstance(params, dict):
         raise ValueError("params must be object")
 
@@ -84,17 +98,33 @@ def _normalize_request(params: Any) -> tuple[str, list[str], str | None]:
     if len(question) > 4_000:
         raise ValueError("question is too long")
 
-    raw_audio = params.get("audio_data_url")
-    audio_data_url: str | None = None
-    if raw_audio is not None:
-        if not isinstance(raw_audio, str) or not raw_audio.startswith(
-            _ALLOWED_AUDIO_DATA_URL_PREFIXES
-        ):
+    raw_audio_inputs = params.get("audio_inputs")
+    if raw_audio_inputs is None:
+        legacy_audio = params.get("audio_data_url")
+        raw_audio_inputs = (
+            [{"data_url": legacy_audio, "source_label": "用户麦克风"}]
+            if legacy_audio is not None
+            else []
+        )
+    if not isinstance(raw_audio_inputs, list):
+        raise ValueError("audio_inputs must be an array")
+    if len(raw_audio_inputs) > _MAX_AUDIO_INPUTS:
+        raise ValueError(f"at most {_MAX_AUDIO_INPUTS} audio inputs are allowed")
+
+    audio_inputs: list[tuple[str, str]] = []
+    total_audio_chars = 0
+    for audio_input in raw_audio_inputs:
+        if not isinstance(audio_input, dict):
+            raise ValueError("each audio input must be an object")
+        data_url = audio_input.get("data_url")
+        if not isinstance(data_url, str) or not _is_allowed_audio_data_url(data_url):
             raise ValueError("audio must be a WebM, OGG, WAV, MP4, or MPEG data URL")
-        if len(raw_audio) > _MAX_AUDIO_CHARS:
-            raise ValueError("audio payload is too large")
-        audio_data_url = raw_audio
-    if not question and not audio_data_url:
+        if len(data_url) > _MAX_AUDIO_CHARS:
+            raise ValueError("an audio payload is too large")
+        total_audio_chars += len(data_url)
+        label = str(audio_input.get("source_label") or "视频音频").strip()[:120]
+        audio_inputs.append((data_url, label or "视频音频"))
+    if not question and not audio_inputs:
         raise ValueError("question or audio is required")
 
     raw_frames = params.get("frames")
@@ -103,7 +133,7 @@ def _normalize_request(params: Any) -> tuple[str, list[str], str | None]:
     if len(raw_frames) > _MAX_FRAMES:
         raise ValueError(f"at most {_MAX_FRAMES} frames are allowed")
 
-    frames: list[str] = []
+    frames: list[tuple[str, str]] = []
     total_chars = 0
     for frame in raw_frames:
         if not isinstance(frame, dict):
@@ -116,18 +146,19 @@ def _normalize_request(params: Any) -> tuple[str, list[str], str | None]:
         total_chars += len(data_url)
         if total_chars > _MAX_TOTAL_FRAME_CHARS:
             raise ValueError("total frame payload is too large")
-        frames.append(data_url)
+        source_label = str(frame.get("source_label") or "视频画面").strip()[:120]
+        frames.append((data_url, source_label or "视频画面"))
 
-    if audio_data_url and total_chars + len(audio_data_url) > _MAX_TOTAL_REQUEST_CHARS:
+    if total_chars + total_audio_chars > _MAX_TOTAL_REQUEST_CHARS:
         raise ValueError("combined audio and frame payload is too large")
 
-    return question, frames, audio_data_url
+    return question, frames, audio_inputs
 
 
 async def _stream_qwen_omni(
     question: str,
-    frames: list[str],
-    audio_data_url: str | None,
+    frames: list[tuple[str, str]],
+    audio_inputs: list[tuple[str, str]],
 ) -> AsyncIterator[str]:
     from openai import AsyncOpenAI
 
@@ -141,17 +172,17 @@ async def _stream_qwen_omni(
         {
             "type": "text",
             "text": (
-                "下面是从实时视频流中按时间顺序抽取的连续画面。"
+                "下面是从一个或多个实时视频源中抽取的连续画面。"
                 "如果包含音频，请理解用户在音频中的问题，并结合画面直接回答。"
                 "不要单独输出语音转写，无法确认时明确说明。"
             ),
         }
     ]
-    content.extend(
-        {"type": "image_url", "image_url": {"url": frame}}
-        for frame in frames
-    )
-    if audio_data_url:
+    for frame, source_label in frames:
+        content.append({"type": "text", "text": f"画面来源：{source_label}"})
+        content.append({"type": "image_url", "image_url": {"url": frame}})
+    for audio_data_url, source_label in audio_inputs:
+        content.append({"type": "text", "text": f"音频来源：{source_label}"})
         content.append(
             {
                 "type": "audio_url",
@@ -192,7 +223,7 @@ def register_video_live_handler(channel: Any) -> None:
     async def _video_ask(ws, req_id, params, session_id):
         del session_id
         try:
-            question, frames, audio_data_url = _normalize_request(params)
+            question, frames, audio_inputs = _normalize_request(params)
         except ValueError as exc:
             await channel.send_response(
                 ws,
@@ -218,7 +249,7 @@ def register_video_live_handler(channel: Any) -> None:
             async for delta in _stream_qwen_omni(
                 question,
                 frames,
-                audio_data_url,
+                audio_inputs,
             ):
                 if first_token_ms is None:
                     first_token_ms = round(
@@ -264,7 +295,8 @@ def register_video_live_handler(channel: Any) -> None:
                 "latency_ms": round((time.perf_counter() - started_at) * 1000),
                 "first_token_ms": first_token_ms,
                 "frame_count": len(frames),
-                "has_audio": audio_data_url is not None,
+                "has_audio": bool(audio_inputs),
+                "audio_count": len(audio_inputs),
             },
         )
 
