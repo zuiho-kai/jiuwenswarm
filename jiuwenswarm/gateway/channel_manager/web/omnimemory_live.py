@@ -155,12 +155,20 @@ class OmniMemoryLiveClient:
         session_id: str,
         frames: list[dict[str, object]],
     ) -> list[str]:
+        observations = await self.observe_detailed(session_id, frames)
+        return [str(item["observation_id"]) for item in observations]
+
+    async def observe_detailed(
+        self,
+        session_id: str,
+        frames: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id is required")
         async with self._ingest_lock, httpx.AsyncClient(
             timeout=30.0
         ) as client:
-            observation_ids: list[str] = []
+            observations: list[dict[str, object]] = []
             for frame in frames:
                 source_id = str(frame["source_id"])
                 await self._ensure_stream(client, session_id, source_id)
@@ -185,8 +193,16 @@ class OmniMemoryLiveClient:
                 if response.status_code != 200:
                     raise self._error(response)
                 self._next_sequence[key] = sequence_no + 1
-                observation_ids.append(str(response.json()["observation_id"]))
-            return observation_ids
+                payload = response.json()
+                observations.append(
+                    {
+                        "observation_id": str(payload["observation_id"]),
+                        "context_version": int(
+                            payload.get("context_version", 0)
+                        ),
+                    }
+                )
+            return observations
 
     async def context(
         self,
