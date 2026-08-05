@@ -46,6 +46,11 @@ MemorySearch = Callable[
     [dict[str, object]],
     Awaitable[dict[str, object]],
 ]
+AssistantTool = Callable[
+    [dict[str, object]],
+    Awaitable[dict[str, object]],
+]
+ToolStatusSink = Callable[[str], Awaitable[None]]
 TranscriptSink = Callable[[str], Awaitable[bool]]
 VoiceDecisionSink = Callable[[str, str], Awaitable[None]]
 
@@ -56,11 +61,15 @@ _TRANSCRIPT_RE = re.compile(
 _ANSWER_OPEN_RE = re.compile(r"<answer\s*>\s*", re.IGNORECASE)
 _ANSWER_CLOSE_RE = re.compile(r"\s*</answer\s*>?", re.IGNORECASE)
 _ROUTE_RE = re.compile(
-    r"<route\s*>\s*(direct|free_search|memory_search)\s*</route\s*>?",
+    r"<route\s*>\s*(direct|free_search|memory_search|deep_reasoning)\s*</route\s*>?",
     re.IGNORECASE,
 )
 _ENTITY_RE = re.compile(
     r"<entity\s*>\s*(.*?)\s*</entity\s*>?",
+    re.DOTALL | re.IGNORECASE,
+)
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call\s*>\s*(\{.*?\})\s*</tool_call\s*>?",
     re.DOTALL | re.IGNORECASE,
 )
 _NO_SPEECH_VALUES = {
@@ -102,21 +111,58 @@ def _accept_voice_transcript(session_id: str, transcript: str) -> bool:
     return True
 
 
-def _voice_route_fallback(transcript: str) -> str:
-    external_keywords = (
-        "介绍", "公司", "品牌", "资料", "背景", "历史", "最新",
-        "新闻", "价格", "官网", "搜索", "查询", "怎么样", "为什么",
-        "recommend", "search", "latest", "history", "about",
-    )
-    history_keywords = (
-        "刚才", "之前", "多久前", "什么时候", "半小时前", "去哪里",
-    )
-    lowered = transcript.casefold()
-    if any(keyword in lowered for keyword in history_keywords):
-        return "memory_search"
-    if any(keyword in lowered for keyword in external_keywords):
-        return "free_search"
-    return "direct"
+def _normalized_tool_calls(message: Any, round_index: int) -> list[dict[str, str]]:
+    """Normalize native calls and Qwen's reasoning_content tool markup."""
+    native_calls = list(getattr(message, "tool_calls", None) or [])
+    if native_calls:
+        return [
+            {
+                "id": str(tool_call.id),
+                "name": str(tool_call.function.name or ""),
+                "arguments": str(tool_call.function.arguments or "{}"),
+            }
+            for tool_call in native_calls
+        ]
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if not isinstance(reasoning_content, str):
+        return []
+    normalized: list[dict[str, str]] = []
+    payloads: list[dict[str, object]] = []
+    for match in _TOOL_CALL_RE.finditer(reasoning_content):
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payloads.append(payload)
+    if not payloads:
+        marker = re.search(r"<tool_call\s*>", reasoning_content, re.IGNORECASE)
+        if marker is not None:
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(
+                    reasoning_content[marker.end():].lstrip()
+                )
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(payload, dict):
+                    payloads.append(payload)
+    for index, payload in enumerate(payloads):
+        name = str(payload.get("name") or "").strip()
+        arguments = payload.get("arguments")
+        if not name or not isinstance(arguments, dict):
+            continue
+        normalized.append(
+            {
+                "id": f"compat-call-{round_index}-{index}",
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            }
+        )
+    return normalized
+
+
 _MEMORY_SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -148,6 +194,73 @@ _MEMORY_SEARCH_TOOL = {
                 },
             },
             "required": ["query"],
+        },
+    },
+}
+
+_RESPOND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "respond",
+        "description": "已有足够信息时，直接回答用户。",
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+}
+
+_SILENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "silent",
+        "description": "没有有效问题、只有环境噪音，或当前无需回应。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+_FREE_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "free_search",
+        "description": (
+            "查询品牌、公司、新闻、股票、价格、财报、行情、官网或其他外部资料。"
+            "适合可以通过一次搜索直接回答的问题。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+_DEEP_REASONING_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "deep_reasoning",
+        "description": (
+            "把复杂、多步、需要研究或存在冲突的问题交给 DSV3.2 子 Agent。"
+            "子 Agent 能自行多次搜索外部资料并综合分析。简单识图、事实复述"
+            "和一次搜索即可回答的问题不要使用。涉及多项约束的规划、实验设计、"
+            "带权重的决策、因果判断、证据冲突或不确定性分析时应使用本工具，"
+            "不要由主模型草率直接回答。用户要求分步骤方案并解释理由、同时权衡"
+            "三项及以上约束、依据多段证据判断并列出不确定性时也必须使用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "problem": {"type": "string"},
+                "known_facts": {
+                    "type": "string",
+                    "description": "从当前画面、记忆或工具结果中确认的事实",
+                },
+                "desired_output": {"type": "string"},
+            },
+            "required": ["problem"],
         },
     },
 }
@@ -355,6 +468,258 @@ def _video_tool_model_config() -> tuple[str, str, str]:
         or "Qwen/Qwen3.5-9B"
     ).strip()
     return api_base, api_key, model
+
+
+def _deep_reasoning_model_config() -> tuple[str, str, str] | None:
+    enabled = os.environ.get("DEEP_REASONING_ENABLED", "true").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+    omni_base, omni_key, _ = _omni_model_config()
+    api_base = (
+        os.environ.get("REASONING_API_BASE") or omni_base
+    ).strip().rstrip("/")
+    api_key = (
+        os.environ.get("REASONING_API_KEY") or omni_key or "EMPTY"
+    ).strip()
+    model = (
+        os.environ.get("REASONING_MODEL_NAME")
+        or "deepseek-ai/DeepSeek-V3.2"
+    ).strip()
+    if not api_base or not model:
+        return None
+    return api_base, api_key, model
+
+
+async def _run_deep_reasoning(
+    arguments: dict[str, object],
+    *,
+    question: str,
+    memory_context: dict[str, object] | None,
+    status_sink: ToolStatusSink | None = None,
+) -> dict[str, object]:
+    """Run DSV3.2 as a bounded research sub-agent with its own search tool."""
+    from openai import AsyncOpenAI
+
+    config = _deep_reasoning_model_config()
+    if config is None:
+        return {"error": "deep reasoning is not configured"}
+    api_base, api_key, model = config
+    problem = str(arguments.get("problem") or question).strip()
+    known_facts = str(arguments.get("known_facts") or "").strip()
+    desired_output = str(arguments.get("desired_output") or "").strip()
+    context_text = json.dumps(
+        _compact_memory_context(memory_context),
+        ensure_ascii=False,
+    )[:12_000]
+    client = AsyncOpenAI(
+        api_key=api_key or "EMPTY",
+        base_url=api_base,
+        timeout=90.0,
+    )
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "你是主助手委派的研究子 Agent。你可以调用 free_search 多次补充"
+                "事实。遇到股票、价格、财报、行情、新闻等时效问题必须主动搜索；"
+                "已有材料足够时可以直接分析。最终只输出结论、关键依据、来源 URL"
+                "和不确定性，不输出内部思维链，不假装看到了未提供的画面。"
+                f"当前日期是 {datetime.now(timezone.utc).date().isoformat()}，"
+                "检索最新信息时必须使用当前年份，不要沿用模型知识截止年份。"
+                "搜索预算最多两次，请把相关信息合并进少量高质量查询；证据足够"
+                "时立即停止搜索并给出结论。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"用户原问题：{question}\n"
+                f"研究任务：{problem}\n"
+                f"已确认事实：{known_facts or '无'}\n"
+                f"期望输出：{desired_output or '简洁、可核验的结论'}\n"
+                f"记忆上下文：{context_text}"
+            ),
+        },
+    ]
+    search_queries: list[str] = []
+    research_evidence: list[str] = []
+    search_backend_failed = False
+    try:
+        for round_index in range(2):
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[_FREE_SEARCH_TOOL],
+                tool_choice="auto",
+                max_tokens=1_200,
+                temperature=0.2,
+                stream=False,
+            )
+            if not response.choices:
+                return {
+                    "error": "reasoning sub-agent returned no choices",
+                    "model": model,
+                }
+            message = response.choices[0].message
+            tool_calls = _normalized_tool_calls(message, round_index)
+            if not tool_calls:
+                answer = message.content
+                if isinstance(answer, str) and answer.strip():
+                    return {
+                        "model": model,
+                        "conclusion": answer.strip()[:8_000],
+                        "search_queries": search_queries,
+                    }
+                return {
+                    "error": "reasoning sub-agent returned no conclusion",
+                    "model": model,
+                    "search_queries": search_queries,
+                }
+
+            serialized_calls: list[dict[str, object]] = []
+            tool_results: list[dict[str, object]] = []
+            for tool_call in tool_calls:
+                name = tool_call["name"]
+                raw_arguments = tool_call["arguments"]
+                try:
+                    parsed = json.loads(raw_arguments)
+                except json.JSONDecodeError as exc:
+                    result: dict[str, object] = {"error": str(exc)}
+                else:
+                    query = (
+                        str(parsed.get("query") or "").strip()
+                        if isinstance(parsed, dict)
+                        else ""
+                    )
+                    if name != "free_search" or not query:
+                        result = {"error": f"unsupported sub-agent tool: {name}"}
+                    else:
+                        search_queries.append(query)
+                        if status_sink is not None:
+                            await status_sink(
+                                f"DSV3.2 正在搜索：{query[:80]}"
+                            )
+                        try:
+                            search_result = await mcp_free_search.invoke(
+                                {
+                                    "query": query,
+                                    "max_results": 5,
+                                    "timeout_seconds": 12,
+                                }
+                            )
+                            search_text = str(search_result).strip()[:12_000]
+                            if search_text.startswith("[ERROR]"):
+                                search_backend_failed = True
+                                result = {
+                                    "query": query,
+                                    "error": search_text,
+                                }
+                                if status_sink is not None:
+                                    await status_sink("外部搜索不可用，正在根据现有证据总结")
+                            else:
+                                result = {
+                                    "query": query,
+                                    "results": search_text,
+                                }
+                        except Exception as exc:  # noqa: BLE001
+                            search_backend_failed = True
+                            result = {
+                                "query": query,
+                                "error": str(exc).strip() or "search failed",
+                            }
+                research_evidence.append(
+                    json.dumps(result, ensure_ascii=False)[:12_500]
+                )
+                serialized_calls.append(
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": raw_arguments,
+                        },
+                    }
+                )
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": serialized_calls,
+                }
+            )
+            messages.extend(tool_results)
+            if search_backend_failed:
+                break
+
+        if status_sink is not None:
+            await status_sink("DSV3.2 正在汇总结论")
+        evidence_text = "\n\n".join(research_evidence)[:24_000]
+        final_response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是研究报告总结器。此阶段没有工具，也不允许请求继续搜索。"
+                        "只根据给定证据回答原问题，输出结论、关键依据、来源 URL"
+                        "和不确定性；不要输出内部思维链。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"原问题：{question}\n研究任务：{problem}\n"
+                        f"已确认事实：{known_facts or '无'}\n"
+                        f"搜索证据：\n{evidence_text or '无可用搜索结果'}"
+                    ),
+                },
+            ],
+            max_tokens=1_600,
+            temperature=0.2,
+            stream=False,
+        )
+        if not final_response.choices:
+            return {
+                "error": "reasoning summarizer returned no choices",
+                "model": model,
+                "search_queries": search_queries,
+            }
+        final_message = final_response.choices[0].message
+        answer = final_message.content
+        if not isinstance(answer, str) or not answer.strip():
+            reasoning_content = getattr(
+                final_message, "reasoning_content", None
+            )
+            if (
+                isinstance(reasoning_content, str)
+                and reasoning_content.strip()
+                and not re.search(
+                    r"<tool_call\s*>",
+                    reasoning_content,
+                    re.IGNORECASE,
+                )
+            ):
+                answer = reasoning_content
+        if not isinstance(answer, str) or not answer.strip():
+            return {
+                "error": "reasoning summarizer returned no conclusion",
+                "model": model,
+                "search_queries": search_queries,
+            }
+        return {
+            "model": model,
+            "conclusion": answer.strip()[:8_000],
+            "search_queries": search_queries,
+        }
+    finally:
+        await client.close()
 
 
 def _normalize_request(
@@ -877,6 +1242,8 @@ async def _stream_qwen_omni(
     *,
     memory_context: dict[str, object] | None = None,
     memory_search: MemorySearch | None = None,
+    free_search: AssistantTool | None = None,
+    deep_reasoning: AssistantTool | None = None,
     transcript_sink: TranscriptSink | None = None,
     voice_decision_sink: VoiceDecisionSink | None = None,
 ) -> AsyncIterator[str]:
@@ -888,15 +1255,22 @@ async def _stream_qwen_omni(
             "请先在“更多 → 配置信息 → 视频模型”中配置 api_base、api_key 和 Qwen3-Omni 模型"
         )
 
-    memory_available = memory_context is not None
     context_payload = _compact_memory_context(memory_context)
     system_prompt = (
         "你是实时视频助手。优先根据当前画面和音频回答当前状态问题。"
         "Memory Context 分为 long_term_memory、mid_term_memories、"
         "current_chunk 和 qa_history。长期和中期内容可能是有损摘要。"
-        "涉及之前、多久前、什么时候、物品去向、具体历史剧情，或者现有"
-        "上下文不足时，必须调用一次 memory_search；不要凭空补全。"
-        "工具失败时明确说历史记忆不可用。"
+        "每轮选择一个动作：信息足够时直接输出回答；没有有效问题或"
+        "无需回应时调用 silent；需要补充信息时调用合适的工具。"
+        "历史细节用 memory_search，外部资料用 free_search，复杂多步判断"
+        "可用 deep_reasoning。工具结果会再次交给你，由你继续选择动作。"
+        "deep_reasoning 是可自行搜索的 DSV3.2 子 Agent，适合需要多步研究"
+        "的问题；一次搜索即可解决的事实问题直接用 free_search。凡是多项约束"
+        "规划、实验设计、带权重决策、因果判断、证据冲突或不确定性分析，必须"
+        "调用 deep_reasoning。用户要求分步骤方案并解释理由、同时权衡三项及"
+        "以上约束、依据多段证据判断并列出不确定性时同样必须调用；不要因为你"
+        "自己能生成一个表面答案就跳过工具。"
+        "不要用关键词机械路由，不要凭空补全；工具失败时明确说明。"
         f"\nMemory Context:\n{json.dumps(context_payload, ensure_ascii=False)}"
     )
     content: list[dict[str, Any]] = [
@@ -926,7 +1300,7 @@ async def _stream_qwen_omni(
             "text": question or (
                 "只转写标记为‘用户麦克风提问’的音频，然后回答这个问题。"
                 "必须严格输出：<transcript>逐字转写</transcript>"
-                "<route>direct或free_search或memory_search</route>"
+                "<route>direct或free_search或memory_search或deep_reasoning</route>"
                 "<entity>当前画面的主要实体</entity><answer>回答</answer>。"
                 "识别、描述当前画面用direct；品牌介绍、公司资料、价格、"
                 "新闻或最新信息用free_search；询问刚才、之前、多久前、"
@@ -1054,73 +1428,117 @@ async def _stream_qwen_omni(
                 if raw_output.strip():
                     yield raw_output
             return
+        request["max_tokens"] = 768
+        tools = [_RESPOND_TOOL, _SILENT_TOOL]
+        runners: dict[str, AssistantTool] = {}
         if memory_search is not None:
-            request["tools"] = [_MEMORY_SEARCH_TOOL]
-            request["tool_choice"] = "auto"
-        response = await client.chat.completions.create(**request)
-        if not response.choices:
-            raise RuntimeError("Qwen3-Omni returned no choices")
-        message = response.choices[0].message
-        tool_calls = list(message.tool_calls or [])
-        if tool_calls and memory_search is not None:
-            tool_call = tool_calls[0]
-            try:
-                arguments = json.loads(tool_call.function.arguments or "{}")
-                if not isinstance(arguments, dict):
-                    raise ValueError("tool arguments must be an object")
-                tool_result = await memory_search(arguments)
-            except Exception as exc:  # noqa: BLE001
-                tool_result = {
-                    "error": str(exc).strip() or "memory search failed"
+            tools.append(_MEMORY_SEARCH_TOOL)
+            runners["memory_search"] = memory_search
+        if free_search is not None:
+            tools.append(_FREE_SEARCH_TOOL)
+            runners["free_search"] = free_search
+        if deep_reasoning is not None:
+            tools.append(_DEEP_REASONING_TOOL)
+            runners["deep_reasoning"] = deep_reasoning
+
+        for _round in range(3):
+            response = await client.chat.completions.create(
+                **{
+                    **request,
+                    "messages": messages,
+                    "tools": tools,
+                    # SiliconFlow currently rejects tool_choice="required".
+                    # With auto, normal content means respond, silent means no
+                    # response, and every other function is a real tool action.
+                    "tool_choice": "auto",
                 }
-            messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "content": message.content,
-                        "tool_calls": [
-                            {
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": "memory_search",
-                                    "arguments": tool_call.function.arguments,
-                                },
+            )
+            if not response.choices:
+                raise RuntimeError("Qwen3-Omni returned no choices")
+            message = response.choices[0].message
+            tool_calls = _normalized_tool_calls(message, _round)
+            if not tool_calls:
+                answer = message.content
+                reasoning_content = getattr(
+                    message, "reasoning_content", None
+                )
+                if (
+                    (not isinstance(answer, str) or not answer.strip())
+                    and "qwen3-omni" in model.casefold()
+                    and isinstance(reasoning_content, str)
+                    and reasoning_content.strip()
+                    and not re.search(
+                        r"<tool_call\s*>",
+                        reasoning_content,
+                        re.IGNORECASE,
+                    )
+                ):
+                    # SiliconFlow sometimes places Qwen3-Omni-Instruct's
+                    # complete final answer in reasoning_content after a tool.
+                    answer = reasoning_content
+                if isinstance(answer, str) and answer.strip():
+                    yield answer.strip()
+                    return
+                raise RuntimeError("Qwen3-Omni returned no action")
+
+            serialized_calls: list[dict[str, object]] = []
+            tool_results: list[dict[str, object]] = []
+            for tool_call in tool_calls:
+                name = tool_call["name"]
+                raw_arguments = tool_call["arguments"]
+                try:
+                    arguments = json.loads(raw_arguments)
+                    if not isinstance(arguments, dict):
+                        raise ValueError("tool arguments must be an object")
+                except Exception as exc:  # noqa: BLE001
+                    arguments = {}
+                    result: dict[str, object] = {
+                        "error": str(exc).strip() or "invalid tool arguments"
+                    }
+                else:
+                    if name == "respond":
+                        text = str(arguments.get("text") or "").strip()
+                        if text:
+                            yield text
+                            return
+                        result = {"error": "respond requires non-empty text"}
+                    elif name == "silent":
+                        return
+                    elif name in runners:
+                        try:
+                            result = await runners[name](arguments)
+                        except Exception as exc:  # noqa: BLE001
+                            result = {
+                                "error": str(exc).strip() or f"{name} failed"
                             }
-                        ],
-                    },
+                    else:
+                        result = {"error": f"unknown tool: {name}"}
+                serialized_calls.append(
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": raw_arguments,
+                        },
+                    }
+                )
+                tool_results.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(
-                            tool_result,
-                            ensure_ascii=False,
-                        ),
-                    },
-                ]
+                        "tool_call_id": tool_call["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": serialized_calls,
+                }
             )
-            streamed = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=256,
-                temperature=0.2,
-                stream=True,
-            )
-            async for chunk in streamed:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta.content
-                if isinstance(delta, str) and delta:
-                    yield delta
-            return
-
-        answer = message.content
-        if isinstance(answer, str) and answer.strip():
-            yield answer
-            return
-        if tool_calls and not memory_available:
-            raise RuntimeError("historical memory is unavailable")
-        raise RuntimeError("Qwen3-Omni returned an empty response")
+            messages.extend(tool_results)
+        raise RuntimeError("Qwen3-Omni exceeded the 3-round action limit")
     finally:
         await client.close()
 
@@ -1650,14 +2068,13 @@ def register_video_live_handler(channel: Any) -> None:
         answer_parts: list[str] = []
         voice_transcript: str | None = None
         voice_accepted = True
-        voice_route = "direct"
-        voice_entity = ""
         sequence = 0
         _, _, model = _omni_model_config()
         memory_client = _omnimemory_client()
         memory_context: dict[str, object] | None = None
         memory_search: MemorySearch | None = None
         memory_trace: dict[str, object] = {}
+        latest_external_evidence = ""
         if memory_client is not None:
             try:
                 memory_context = await memory_client.context(session_id)
@@ -1680,6 +2097,15 @@ def register_video_live_handler(channel: Any) -> None:
                     tool_record
                 )
                 try:
+                    await channel.send_event(
+                        ws,
+                        "video.tool_status",
+                        {
+                            "request_id": req_id,
+                            "status": "正在查询历史记忆：memory_search",
+                        },
+                        stream_id=req_id,
+                    )
                     result = await memory_client.search(
                         session_id,
                         arguments,
@@ -1711,6 +2137,83 @@ def register_video_live_handler(channel: Any) -> None:
 
             memory_search = _search
 
+        async def _free_search(arguments: dict[str, object]):
+            nonlocal latest_external_evidence
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                return {"error": "free_search requires query"}
+            await channel.send_event(
+                ws,
+                "video.tool_status",
+                {"request_id": req_id, "status": "正在搜索资料：free_search"},
+                stream_id=req_id,
+            )
+            result = await mcp_free_search.invoke(
+                {"query": query, "max_results": 5, "timeout_seconds": 12}
+            )
+            result_text = str(result).strip()[:12_000]
+            latest_external_evidence = result_text
+            record = {
+                "name": "free_search",
+                "arguments": {"query": query},
+                "result_summary": result_text[:2_000],
+            }
+            if result_text.startswith("[ERROR]"):
+                record["error"] = result_text[:2_000]
+            memory_trace.setdefault("tool_calls", []).append(record)
+            if result_text.startswith("[ERROR]"):
+                return {"query": query, "error": result_text}
+            return {"query": query, "results": result_text}
+
+        deep_reasoning: AssistantTool | None = None
+        if _deep_reasoning_model_config() is not None:
+            async def _reason(arguments: dict[str, object]):
+                await channel.send_event(
+                    ws,
+                    "video.tool_status",
+                    {
+                        "request_id": req_id,
+                        "status": "DSV3.2 子 Agent 正在研究",
+                    },
+                    stream_id=req_id,
+                )
+                reasoning_arguments = dict(arguments)
+                if latest_external_evidence:
+                    existing_facts = str(
+                        reasoning_arguments.get("known_facts") or ""
+                    ).strip()
+                    reasoning_arguments["known_facts"] = (
+                        f"{existing_facts}\n\n最新搜索结果：\n"
+                        f"{latest_external_evidence[:10_000]}"
+                    ).strip()
+                async def _sub_agent_status(status: str) -> None:
+                    await channel.send_event(
+                        ws,
+                        "video.tool_status",
+                        {"request_id": req_id, "status": status},
+                        stream_id=req_id,
+                    )
+
+                result = await _run_deep_reasoning(
+                    reasoning_arguments,
+                    question=voice_transcript or question,
+                    memory_context=memory_context,
+                    status_sink=_sub_agent_status,
+                )
+                memory_trace.setdefault("tool_calls", []).append(
+                    {
+                        "name": "deep_reasoning",
+                        "arguments": reasoning_arguments,
+                        "model": result.get("model"),
+                        "result_summary": str(
+                            result.get("conclusion") or result.get("error") or ""
+                        )[:2_000],
+                    }
+                )
+                return result
+
+            deep_reasoning = _reason
+
         try:
             await channel.send_event(
                 ws,
@@ -1718,51 +2221,9 @@ def register_video_live_handler(channel: Any) -> None:
                 {"request_id": req_id, "model": model},
                 stream_id=req_id,
             )
-            async def _on_transcript(transcript: str) -> bool:
-                nonlocal voice_transcript, voice_accepted, voice_route
-                voice_transcript = transcript.strip()
-                voice_accepted = _accept_voice_transcript(
-                    session_id,
-                    voice_transcript,
-                )
-                if voice_accepted:
-                    voice_route = _voice_route_fallback(voice_transcript)
-                await channel.send_event(
-                    ws,
-                    "video.transcript",
-                    {
-                        "request_id": req_id,
-                        "text": voice_transcript if voice_accepted else "",
-                        "accepted": voice_accepted,
-                    },
-                    stream_id=req_id,
-                )
-                return voice_accepted
 
-            async def _on_voice_decision(route: str, entity: str) -> None:
-                nonlocal voice_route, voice_entity
-                if route in {"direct", "free_search", "memory_search"}:
-                    # Deterministic fallback wins when it detects an explicit
-                    # search/history request that the model mislabeled direct.
-                    if voice_route == "direct" or route != "direct":
-                        voice_route = route
-                voice_entity = entity.strip()[:200]
-
-            stream_options: dict[str, object] = {
-                "memory_context": memory_context,
-                "memory_search": memory_search,
-            }
-            if audio_inputs and not question:
-                stream_options["transcript_sink"] = _on_transcript
-                stream_options["voice_decision_sink"] = _on_voice_decision
-            async for delta in _stream_qwen_omni(
-                question,
-                frames,
-                audio_inputs,
-                **stream_options,
-            ):
-                if voice_route == "free_search":
-                    continue
+            async def _emit_answer_delta(delta: str) -> None:
+                nonlocal first_token_ms, sequence
                 if first_token_ms is None:
                     first_token_ms = round(
                         (time.perf_counter() - started_at) * 1000
@@ -1777,48 +2238,64 @@ def register_video_live_handler(channel: Any) -> None:
                     stream_id=req_id,
                 )
 
-            if voice_accepted and voice_route == "free_search" and voice_transcript:
-                await channel.send_event(
-                    ws,
-                    "video.tool_status",
-                    {"request_id": req_id, "status": "正在搜索资料：free_search"},
-                    stream_id=req_id,
-                )
-                search_result, deltas = await _stream_external_answer(
+            async def _on_transcript(transcript: str) -> bool:
+                nonlocal voice_transcript, voice_accepted
+                voice_transcript = transcript.strip()
+                voice_accepted = _accept_voice_transcript(
+                    session_id,
                     voice_transcript,
-                    {"primary_entity": voice_entity},
-                )
-                memory_trace.setdefault("tool_calls", []).append(
-                    {
-                        "name": "free_search",
-                        "arguments": {
-                            "query": " ".join(
-                                part for part in (voice_entity, voice_transcript) if part
-                            )
-                        },
-                        "result_summary": search_result[:2_000],
-                    }
                 )
                 await channel.send_event(
                     ws,
-                    "video.tool_status",
-                    {"request_id": req_id, "status": "搜索完成，正在生成答案"},
+                    "video.transcript",
+                    {
+                        "request_id": req_id,
+                        "text": voice_transcript if voice_accepted else "",
+                        "accepted": voice_accepted,
+                    },
                     stream_id=req_id,
                 )
-                async for delta in deltas:
-                    if first_token_ms is None:
-                        first_token_ms = round(
-                            (time.perf_counter() - started_at) * 1000
-                        )
-                    answer_parts.append(delta)
-                    sequence += 1
-                    await channel.send_event(
-                        ws,
-                        "video.delta",
-                        {"request_id": req_id, "content": delta},
-                        seq=sequence,
-                        stream_id=req_id,
-                    )
+                return voice_accepted
+
+            stream_options: dict[str, object] = {
+                "memory_context": memory_context,
+                "memory_search": memory_search,
+                "free_search": _free_search,
+                "deep_reasoning": deep_reasoning,
+            }
+            if audio_inputs and not question:
+                stream_options["transcript_sink"] = _on_transcript
+                # Providers commonly reject audio + native tool calls. This pass
+                # only obtains the transcript; the transcript then enters the
+                # exact same action loop as a typed question.
+                async for delta in _stream_qwen_omni(
+                    "",
+                    frames,
+                    audio_inputs,
+                    **stream_options,
+                ):
+                    del delta
+                if voice_accepted and voice_transcript:
+                    text_options = {
+                        key: value
+                        for key, value in stream_options.items()
+                        if key not in {"transcript_sink", "voice_decision_sink"}
+                    }
+                    async for delta in _stream_qwen_omni(
+                        voice_transcript,
+                        frames,
+                        [],
+                        **text_options,
+                    ):
+                        await _emit_answer_delta(delta)
+            else:
+                async for delta in _stream_qwen_omni(
+                    question,
+                    frames,
+                    audio_inputs,
+                    **stream_options,
+                ):
+                    await _emit_answer_delta(delta)
         except Exception as exc:  # noqa: BLE001
             await channel.send_response(
                 ws,
@@ -1830,28 +2307,19 @@ def register_video_live_handler(channel: Any) -> None:
             return
 
         answer = "".join(answer_parts).strip()
-        if audio_inputs and not question and (not voice_accepted or not answer):
+        if not answer:
             await channel.send_response(
                 ws,
                 req_id,
                 ok=True,
                 payload={
                     "answer": "",
-                    "transcript": "",
+                    "transcript": voice_transcript,
                     "ignored": True,
                     "model": model,
                     "latency_ms": round((time.perf_counter() - started_at) * 1000),
                     "first_token_ms": first_token_ms,
                 },
-            )
-            return
-        if not answer:
-            await channel.send_response(
-                ws,
-                req_id,
-                ok=False,
-                error="Qwen3-Omni returned an empty response",
-                code="VIDEO_MODEL_ERROR",
             )
             return
 
