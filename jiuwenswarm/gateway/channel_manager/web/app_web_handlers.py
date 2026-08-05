@@ -4730,7 +4730,11 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             ws,
             req_id,
             ok=True,
-            payload={"accepted": True, "session_id": session_id},
+            payload={
+                "accepted": True,
+                "session_id": session_id,
+                "request_id": req_id,
+            },
         )
 
     async def _media_persist(ws, req_id, params, session_id):

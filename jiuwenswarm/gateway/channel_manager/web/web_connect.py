@@ -50,6 +50,16 @@ _HANDLER_BEFORE_CALLBACK_METHODS = frozenset({ReqMethod.CHAT_SEND.value})
 
 _STREAM_COALESCE_EVENT_TYPES = frozenset({"chat.delta", "chat.reasoning"})
 _STREAM_COALESCE_MAX_FRAMES = 32
+_WEB_REQUEST_CORRELATION_EVENT_TYPES = frozenset(
+    {
+        "chat.delta",
+        "chat.reasoning",
+        "chat.final",
+        "chat.error",
+        "chat.tool_call",
+        "chat.tool_result",
+    }
+)
 
 _WEB_FULL_PAYLOAD_EVENT_TYPES = frozenset(
     {
@@ -650,6 +660,8 @@ class WebChannel(BaseWsChannel):
                 "session_id": msg.session_id,
                 "content": content,
             }
+            if event_name in _WEB_REQUEST_CORRELATION_EVENT_TYPES and msg.id:
+                payload["request_id"] = msg.id
             for _key in ("role", "member_name", "member_action", "source_channel", "user_id", "display_name"):
                 _val = msg.payload.get(_key)
                 if _val is not None:
@@ -673,10 +685,13 @@ class WebChannel(BaseWsChannel):
             return payload
 
         content = str((msg.params or {}).get("content", "") or "")
-        return {
+        payload = {
             "session_id": msg.session_id,
             "content": content,
         }
+        if event_name in _WEB_REQUEST_CORRELATION_EVENT_TYPES and msg.id:
+            payload["request_id"] = msg.id
+        return payload
 
     async def send(
         self,
@@ -1327,6 +1342,11 @@ class WebChannel(BaseWsChannel):
             payload = {"session_id": getattr(msg, "session_id", None), "content": str(msg.payload)}
         else:
             payload = {"session_id": getattr(msg, "session_id", None), "content": ""}
+        if (
+            event_name in _WEB_REQUEST_CORRELATION_EVENT_TYPES
+            and getattr(msg, "id", None)
+        ):
+            payload.setdefault("request_id", msg.id)
 
         agent_ref = getattr(msg, "agent_ref", None)
         if agent_ref:

@@ -1,12 +1,16 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Camera, FileVideo, LoaderCircle, Mic, Monitor, Send, Square, Video, X } from 'lucide-react';
 import { webClient, webRequest } from '../../services/webClient';
+import { useChatStore } from '../../stores/chatStore';
+import { MarkdownRenderer } from '../MarkdownRenderer';
 import './VideoLivePanel.css';
 
 type VideoSource = 'camera' | 'file' | 'screen' | null;
 type AbortReason = 'manual' | 'timeout' | 'source';
 
 interface CapturedFrame {
+  client_frame_id: string;
+  frame_seq: number;
   data_url: string;
   captured_at: number;
   source_id: string;
@@ -38,16 +42,25 @@ interface SourceAudioCapture {
 
 interface VideoAskResponse {
   answer?: string;
+  transcript?: string;
+  ignored?: boolean;
   latency_ms?: number;
   first_token_ms?: number;
   model?: string;
 }
 
+interface ConversationTurn {
+  id: string;
+  question: string;
+  answer: string;
+}
+
 const FRAME_INTERVAL_MS = 500;
+const MEMORY_INTERVAL_MS = 1_000;
 const MAX_FRAMES = 6;
 const MAX_SCREENS = 4;
 const MAX_FRAME_WIDTH = 768;
-const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 45_000;
 const RECORDING_LIMIT_MS = 15_000;
 const SOURCE_AUDIO_SEGMENT_MS = 3_000;
 const AUDIO_MIME_TYPES = [
@@ -65,7 +78,51 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
+async function audioBlobToWavDataUrl(blob: Blob): Promise<string> {
+  const context = new AudioContext();
+  try {
+    const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+    const sampleRate = 16_000;
+    const frameCount = Math.max(1, Math.ceil(decoded.duration * sampleRate));
+    const offline = new OfflineAudioContext(1, frameCount, sampleRate);
+    const source = offline.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offline.destination);
+    source.start();
+    const rendered = await offline.startRendering();
+    const samples = rendered.getChannelData(0);
+    const wav = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(wav);
+    const writeText = (offset: number, value: string) => {
+      for (let index = 0; index < value.length; index += 1) {
+        view.setUint8(offset + index, value.charCodeAt(index));
+      }
+    };
+    writeText(0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeText(8, 'WAVE');
+    writeText(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeText(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[index]));
+      view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    }
+    return blobToDataUrl(new Blob([wav], { type: 'audio/wav' }));
+  } finally {
+    await context.close();
+  }
+}
+
 export function VideoLivePanel() {
+  const activeSessionId = useChatStore((state) => state.activeSessionId);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
@@ -75,15 +132,26 @@ export function VideoLivePanel() {
   const fileCaptureStreamRef = useRef<MediaStream | null>(null);
   const sourceAudioCapturesRef = useRef<Map<string, SourceAudioCapture>>(new Map());
   const framesRef = useRef<CapturedFrame[]>([]);
+  const memoryFramesRef = useRef<Map<string, CapturedFrame>>(new Map());
+  const memoryRequestRef = useRef<Promise<void> | null>(null);
+  const frameSequencesRef = useRef<Map<string, number>>(new Map());
+  const lastMemoryFlushAtRef = useRef(0);
   const requestAbortRef = useRef<AbortController | null>(null);
   const requestStartedAtRef = useRef(0);
   const requestAbortReasonRef = useRef<AbortReason | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
+  const streamFirstTokenMsRef = useRef<number | null>(null);
+  const activeSessionIdRef = useRef<string | null>(activeSessionId);
   const isAskingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordingTimeoutRef = useRef<number | null>(null);
+  const voiceVadTimerRef = useRef<number | null>(null);
+  const voiceAudioContextRef = useRef<AudioContext | null>(null);
+  const voiceConversationRef = useRef(false);
+  const startVoiceListeningRef = useRef<() => Promise<void>>(async () => undefined);
+  const activeTurnIdRef = useRef<string | null>(null);
 
   const [source, setSource] = useState<VideoSource>(null);
   const [sourceName, setSourceName] = useState('');
@@ -101,6 +169,61 @@ export function VideoLivePanel() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
   const [audioSourceCount, setAudioSourceCount] = useState(0);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [liveSubtitle, setLiveSubtitle] = useState('');
+  const [translationCount, setTranslationCount] = useState(0);
+  const [targetLanguage, setTargetLanguage] = useState('中文');
+  const [toolStatus, setToolStatus] = useState('');
+  const [isVoiceConversation, setIsVoiceConversation] = useState(false);
+  const [conversationTurns, setConversationTurns] = useState<ConversationTurn[]>([]);
+
+  const beginConversationTurn = useCallback((prompt: string) => {
+    const id = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    activeTurnIdRef.current = id;
+    setAnswer('');
+    setConversationTurns((turns) => [
+      ...turns,
+      { id, question: prompt || '🎙️ 语音提问', answer: '' },
+    ].slice(-30));
+  }, []);
+
+  const appendActiveAnswer = useCallback((delta: string) => {
+    if (!delta) return;
+    setAnswer((current) => current + delta);
+    const id = activeTurnIdRef.current;
+    if (!id) return;
+    setConversationTurns((turns) => turns.map((turn) => (
+      turn.id === id ? { ...turn, answer: turn.answer + delta } : turn
+    )));
+  }, []);
+
+  const replaceActiveAnswer = useCallback((value: string) => {
+    setAnswer(value);
+    const id = activeTurnIdRef.current;
+    if (!id) return;
+    setConversationTurns((turns) => turns.map((turn) => (
+      turn.id === id ? { ...turn, answer: value } : turn
+    )));
+  }, []);
+
+  const replaceActiveQuestion = useCallback((value: string) => {
+    const id = activeTurnIdRef.current;
+    if (!id || !value.trim()) return;
+    setConversationTurns((turns) => turns.map((turn) => (
+      turn.id === id ? { ...turn, question: value.trim() } : turn
+    )));
+  }, []);
+
+  const removeActiveTurn = useCallback(() => {
+    const id = activeTurnIdRef.current;
+    if (!id) return;
+    setConversationTurns((turns) => turns.filter((turn) => turn.id !== id));
+    setAnswer('');
+  }, []);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   const stopSourceAudio = useCallback((sourceId: string) => {
     const capture = sourceAudioCapturesRef.current.get(sourceId);
@@ -192,7 +315,7 @@ export function VideoLivePanel() {
     const inputs = await Promise.all(captures.map(async (capture) => {
       if (!capture.latestBlob) return null;
       return {
-        data_url: await blobToDataUrl(capture.latestBlob),
+        data_url: await audioBlobToWavDataUrl(capture.latestBlob),
         source_label: capture.label,
       };
     }));
@@ -218,6 +341,8 @@ export function VideoLivePanel() {
       video.load();
     }
     framesRef.current = [];
+    memoryFramesRef.current.clear();
+    lastMemoryFlushAtRef.current = 0;
     setFrameCount(0);
     setIsPlaying(false);
   }, [stopSourceAudio]);
@@ -237,6 +362,8 @@ export function VideoLivePanel() {
     requestAbortRef.current?.abort();
     requestAbortRef.current = null;
     activeRequestIdRef.current = null;
+    isAskingRef.current = false;
+    setIsAsking(false);
   }, []);
 
   const releaseMicrophone = useCallback(() => {
@@ -244,6 +371,13 @@ export function VideoLivePanel() {
       window.clearTimeout(recordingTimeoutRef.current);
       recordingTimeoutRef.current = null;
     }
+    if (voiceVadTimerRef.current !== null) {
+      window.clearInterval(voiceVadTimerRef.current);
+      voiceVadTimerRef.current = null;
+    }
+    const audioContext = voiceAudioContextRef.current;
+    voiceAudioContextRef.current = null;
+    if (audioContext) void audioContext.close().catch(() => undefined);
     microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
     microphoneStreamRef.current = null;
   }, []);
@@ -261,6 +395,8 @@ export function VideoLivePanel() {
   }, [releaseMicrophone]);
 
   const closeSource = () => {
+    voiceConversationRef.current = false;
+    setIsVoiceConversation(false);
     if (isAskingRef.current) abortQuestion('source');
     cancelRecording();
     releaseScreens();
@@ -269,10 +405,19 @@ export function VideoLivePanel() {
     setSourceName('');
     setAnswer('');
     setError('');
+    setIsTranslating(false);
+    setLiveSubtitle('');
+    void webRequest('video.task.stop', {
+      ...(activeSessionId ? { session_id: activeSessionId } : {}),
+    }).catch(() => undefined);
   };
 
   useEffect(() => () => {
     requestAbortRef.current?.abort();
+    const sessionId = activeSessionIdRef.current;
+    void webRequest('video.task.stop', {
+      ...(sessionId ? { session_id: sessionId } : {}),
+    }).catch(() => undefined);
     cancelRecording(false);
     releaseScreens(false);
     releaseSource();
@@ -289,14 +434,64 @@ export function VideoLivePanel() {
       if (event.payload.request_id !== activeRequestIdRef.current) return;
       const content = event.payload.content;
       if (typeof content === 'string' && content) {
-        setAnswer((current) => current + content);
+        if (streamFirstTokenMsRef.current === null) {
+          streamFirstTokenMsRef.current = Math.round(
+            performance.now() - requestStartedAtRef.current,
+          );
+          setFirstTokenMs(streamFirstTokenMsRef.current);
+        }
+        appendActiveAnswer(content);
       }
+    });
+    const offTranscript = webClient.on<{
+      request_id?: unknown;
+      text?: unknown;
+      accepted?: unknown;
+    }>('video.transcript', (event) => {
+      if (event.payload.request_id !== activeRequestIdRef.current) return;
+      if (event.payload.accepted !== true) return;
+      if (typeof event.payload.text === 'string') {
+        replaceActiveQuestion(event.payload.text);
+      }
+    });
+    const offVideoToolStatus = webClient.on<{
+      request_id?: unknown;
+      status?: unknown;
+    }>('video.tool_status', (event) => {
+      if (event.payload.request_id !== activeRequestIdRef.current) return;
+      if (typeof event.payload.status === 'string') {
+        setToolStatus(event.payload.status);
+      }
+    });
+    const offTaskResponse = webClient.on<{
+      text?: unknown;
+      source_id?: unknown;
+      frame_seq?: unknown;
+    }>('video.task.response', (event) => {
+      const text = event.payload.text;
+      if (typeof text !== 'string' || !text.trim()) return;
+      setLiveSubtitle(text.trim());
+      setAnswer(text.trim());
+      setTranslationCount((count) => count + 1);
+    });
+    const offTaskError = webClient.on<{ error?: unknown }>('video.task.error', (event) => {
+      const taskError = event.payload.error;
+      if (typeof taskError === 'string' && taskError) setError(taskError);
+    });
+    const offMemoryError = webClient.on<{ error?: unknown }>('video.memory.error', (event) => {
+      const memoryError = event.payload.error;
+      if (typeof memoryError === 'string' && memoryError) setError(memoryError);
     });
     return () => {
       offStarted();
       offDelta();
+      offTranscript();
+      offVideoToolStatus();
+      offTaskResponse();
+      offTaskError();
+      offMemoryError();
     };
-  }, []);
+  }, [appendActiveAnswer, replaceActiveAnswer, replaceActiveQuestion]);
 
   useEffect(() => {
     if (!isAsking) {
@@ -310,6 +505,29 @@ export function VideoLivePanel() {
     const timer = window.setInterval(updateElapsed, 100);
     return () => window.clearInterval(timer);
   }, [isAsking]);
+
+  const flushMemoryFrames = useCallback(async () => {
+    if (!activeSessionId) return;
+    if (memoryRequestRef.current) await memoryRequestRef.current;
+    if (memoryFramesRef.current.size === 0) return;
+    const drain = (async () => {
+      while (memoryFramesRef.current.size > 0) {
+        const frames = Array.from(memoryFramesRef.current.values());
+        memoryFramesRef.current.clear();
+        await webRequest(
+          'video.observe',
+          { session_id: activeSessionId, frames },
+          { timeoutMs: 30_000 },
+        );
+      }
+    })();
+    memoryRequestRef.current = drain;
+    try {
+      await drain;
+    } finally {
+      if (memoryRequestRef.current === drain) memoryRequestRef.current = null;
+    }
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -326,12 +544,20 @@ export function VideoLivePanel() {
       if (!context) return;
 
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      framesRef.current.push({
+      const nextFrameSeq = frameSequencesRef.current.get(sourceId) ?? 0;
+      frameSequencesRef.current.set(sourceId, nextFrameSeq + 1);
+      const frame: CapturedFrame = {
+        client_frame_id: typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${sourceId}-${Date.now()}-${nextFrameSeq}`,
+        frame_seq: nextFrameSeq,
         data_url: canvas.toDataURL('image/jpeg', 0.72),
         captured_at: Date.now(),
         source_id: sourceId,
         source_label: sourceLabel,
-      });
+      };
+      framesRef.current.push(frame);
+      memoryFramesRef.current.set(sourceId, frame);
     };
 
     const capture = () => {
@@ -354,14 +580,25 @@ export function VideoLivePanel() {
         framesRef.current.splice(0, framesRef.current.length - MAX_FRAMES);
       }
       setFrameCount(framesRef.current.length);
+      const now = Date.now();
+      if (now - lastMemoryFlushAtRef.current >= MEMORY_INTERVAL_MS) {
+        lastMemoryFlushAtRef.current = now;
+        void flushMemoryFrames().catch(() => undefined);
+      }
     };
 
     capture();
     const timer = window.setInterval(capture, FRAME_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [isPlaying, screens, source, sourceName]);
+  }, [flushMemoryFrames, isPlaying, screens, source, sourceName]);
 
   const startCamera = async () => {
+    if (isTranslating) {
+      await webRequest('video.task.stop', {
+        ...(activeSessionId ? { session_id: activeSessionId } : {}),
+      }).catch(() => undefined);
+      setIsTranslating(false);
+    }
     cancelRecording();
     releaseScreens();
     releaseSource();
@@ -408,10 +645,40 @@ export function VideoLivePanel() {
     }
   };
 
+  const toggleTranslation = async () => {
+    if (isTranslating) {
+      await webRequest('video.task.stop', {
+        ...(activeSessionId ? { session_id: activeSessionId } : {}),
+      });
+      setIsTranslating(false);
+      return;
+    }
+    const sourceId = source === 'screen' ? screens[0]?.id : source;
+    if (!sourceId || (source === 'screen' && screens.length !== 1)) {
+      setError('实时翻译 MVP 目前只支持单路视频源。');
+      return;
+    }
+    setError('');
+    setLiveSubtitle('');
+    await webRequest('video.task.start', {
+      ...(activeSessionId ? { session_id: activeSessionId } : {}),
+      source_id: sourceId,
+      target_language: targetLanguage,
+    });
+    setIsTranslating(true);
+  };
+
   const openFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file) return;
+
+    if (isTranslating) {
+      await webRequest('video.task.stop', {
+        ...(activeSessionId ? { session_id: activeSessionId } : {}),
+      }).catch(() => undefined);
+      setIsTranslating(false);
+    }
 
     cancelRecording();
     releaseScreens();
@@ -449,6 +716,7 @@ export function VideoLivePanel() {
     screenStreamsRef.current.delete(screenId);
     screenVideoRefs.current.delete(screenId);
     framesRef.current = framesRef.current.filter((frame) => frame.source_id !== screenId);
+    memoryFramesRef.current.delete(screenId);
     setFrameCount(framesRef.current.length);
     setScreens((current) => {
       const next = current.filter((screen) => screen.id !== screenId);
@@ -472,6 +740,13 @@ export function VideoLivePanel() {
     if (!navigator.mediaDevices?.getDisplayMedia) {
       setError('当前运行环境不支持屏幕共享。');
       return;
+    }
+
+    if (isTranslating) {
+      await webRequest('video.task.stop', {
+        ...(activeSessionId ? { session_id: activeSessionId } : {}),
+      }).catch(() => undefined);
+      setIsTranslating(false);
     }
 
     cancelRecording();
@@ -524,13 +799,15 @@ export function VideoLivePanel() {
 
     setIsAsking(true);
     isAskingRef.current = true;
-    setAnswer('');
+    beginConversationTurn(prompt || '🎙️ 语音提问');
     setError('');
+    setToolStatus('');
     setElapsedMs(0);
     const startedAt = performance.now();
     requestStartedAtRef.current = startedAt;
     requestAbortReasonRef.current = null;
     activeRequestIdRef.current = null;
+    streamFirstTokenMsRef.current = null;
     const controller = new AbortController();
     requestAbortRef.current = controller;
     const timeoutId = window.setTimeout(() => {
@@ -539,7 +816,8 @@ export function VideoLivePanel() {
       }
     }, REQUEST_TIMEOUT_MS);
     try {
-      const audioInputs = await snapshotSourceAudio();
+      // A microphone question must not be polluted by screen/video audio.
+      const audioInputs = questionAudioDataUrl ? [] : await snapshotSourceAudio();
       if (questionAudioDataUrl) {
         audioInputs.push({
           data_url: questionAudioDataUrl,
@@ -549,9 +827,10 @@ export function VideoLivePanel() {
       const result = await webRequest<VideoAskResponse>(
         'video.ask',
         {
+          ...(activeSessionId ? { session_id: activeSessionId } : {}),
           question: prompt,
           source,
-          frames: framesRef.current.slice(),
+          frames: framesRef.current.slice(-MAX_FRAMES),
           ...(audioInputs.length > 0 ? { audio_inputs: audioInputs } : {}),
         },
         {
@@ -559,7 +838,12 @@ export function VideoLivePanel() {
           signal: controller.signal,
         },
       );
-      setAnswer(result.answer?.trim() || '模型没有返回文本。');
+      if (result.ignored) {
+        removeActiveTurn();
+      } else {
+        if (result.transcript) replaceActiveQuestion(result.transcript);
+        replaceActiveAnswer(result.answer?.trim() || '模型没有返回文本。');
+      }
       setLatencyMs(result.latency_ms ?? Math.round(performance.now() - startedAt));
       setFirstTokenMs(result.first_token_ms ?? null);
       if (result.model) setModel(result.model);
@@ -568,7 +852,7 @@ export function VideoLivePanel() {
     } catch (requestError) {
       const abortReason = requestAbortReasonRef.current;
       if (abortReason === 'timeout') {
-        setError('超过 15 秒仍未收到结果，已停止等待，请重试。');
+        setError('超过 45 秒仍未收到结果，已停止等待，请重试。');
       } else if (abortReason === 'manual') {
         setError('已取消本次问答。');
       } else if (abortReason !== 'source') {
@@ -587,11 +871,17 @@ export function VideoLivePanel() {
         requestAbortRef.current = null;
       }
       activeRequestIdRef.current = null;
+      activeTurnIdRef.current = null;
       requestAbortReasonRef.current = null;
       isAskingRef.current = false;
       setIsAsking(false);
+      setToolStatus('');
+      if (voiceConversationRef.current) {
+        window.setTimeout(() => void startVoiceListeningRef.current(), 600);
+      }
     }
   };
+
 
   const askVideo = async (event: FormEvent) => {
     event.preventDefault();
@@ -616,11 +906,24 @@ export function VideoLivePanel() {
 
     setError('');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
       microphoneStreamRef.current = stream;
       audioChunksRef.current = [];
       const mimeType = AUDIO_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type));
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      let heardSpeech = false;
+      let consecutiveSpeechFrames = 0;
+      let voicedFrames = 0;
+      let noiseFloor = 0.006;
+      const calibrationStartedAt = performance.now();
+      let lastSpeechAt = performance.now();
       mediaRecorderRef.current = recorder;
       recorder.ondataavailable = (recordedEvent) => {
         if (recordedEvent.data.size > 0) audioChunksRef.current.push(recordedEvent.data);
@@ -636,19 +939,58 @@ export function VideoLivePanel() {
         audioChunksRef.current = [];
         releaseMicrophone();
         setIsRecording(false);
+        if (!heardSpeech || voicedFrames < 4) {
+          if (voiceConversationRef.current) {
+            window.setTimeout(() => void startVoiceListeningRef.current(), 300);
+          }
+          return;
+        }
         const audioBlob = new Blob(chunks, { type: recordedMimeType });
         if (audioBlob.size === 0) {
           setError('没有录到声音，请重试。');
+          if (voiceConversationRef.current) {
+            window.setTimeout(() => void startVoiceListeningRef.current(), 180);
+          }
           return;
         }
-        void blobToDataUrl(audioBlob)
-          .then((audioDataUrl) => runOmniRequest(question.trim(), audioDataUrl))
+        void audioBlobToWavDataUrl(audioBlob)
+          .then((audioDataUrl) => runOmniRequest('', audioDataUrl))
           .catch((recordingError) => {
             setError(recordingError instanceof Error ? recordingError.message : '读取录音失败。');
           });
       };
       recorder.start(250);
       setIsRecording(true);
+      const audioContext = new AudioContext();
+      voiceAudioContextRef.current = audioContext;
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 1024;
+      audioContext.createMediaStreamSource(stream).connect(analyser);
+      const levels = new Float32Array(analyser.fftSize);
+      voiceVadTimerRef.current = window.setInterval(() => {
+        if (recorder.state !== 'recording') return;
+        analyser.getFloatTimeDomainData(levels);
+        let energy = 0;
+        for (const level of levels) energy += level * level;
+        const rms = Math.sqrt(energy / levels.length);
+        const now = performance.now();
+        if (now - calibrationStartedAt < 200 && rms < 0.02) {
+          noiseFloor = noiseFloor * 0.85 + rms * 0.15;
+        }
+        const speechThreshold = Math.max(0.018, noiseFloor * 2.2);
+        if (rms >= speechThreshold) {
+          consecutiveSpeechFrames += 1;
+          voicedFrames += 1;
+          if (consecutiveSpeechFrames >= 2) heardSpeech = true;
+          lastSpeechAt = performance.now();
+        } else {
+          consecutiveSpeechFrames = 0;
+          noiseFloor = noiseFloor * 0.98 + rms * 0.02;
+        }
+        if (heardSpeech && now - lastSpeechAt >= 900) {
+          stopRecording();
+        }
+      }, 80);
       recordingTimeoutRef.current = window.setTimeout(stopRecording, RECORDING_LIMIT_MS);
     } catch (microphoneError) {
       cancelRecording();
@@ -658,6 +1000,21 @@ export function VideoLivePanel() {
           : '无法打开麦克风。',
       );
     }
+  };
+
+  startVoiceListeningRef.current = startRecording;
+
+  const toggleVoiceConversation = () => {
+    if (voiceConversationRef.current) {
+      voiceConversationRef.current = false;
+      setIsVoiceConversation(false);
+      cancelRecording();
+      return;
+    }
+    voiceConversationRef.current = true;
+    setIsVoiceConversation(true);
+    setQuestion('');
+    void startRecording();
   };
 
   return (
@@ -735,6 +1092,9 @@ export function VideoLivePanel() {
                 {sourceName}
               </div>
             )}
+            {liveSubtitle && (
+              <div className="video-live__subtitle">{liveSubtitle}</div>
+            )}
             {source && source !== 'screen' && (
               <button className="video-live__close" type="button" onClick={closeSource} aria-label="关闭视频">
                 <X aria-hidden />
@@ -762,9 +1122,33 @@ export function VideoLivePanel() {
               {source === 'screen' ? '添加屏幕' : '共享屏幕'}
             </button>
             {source && (
+              <select
+                className="video-live__language"
+                value={targetLanguage}
+                disabled={isTranslating}
+                onChange={(event) => setTargetLanguage(event.target.value)}
+                aria-label="翻译目标语言"
+              >
+                <option value="中文">中文</option>
+                <option value="English">English</option>
+                <option value="日本語">日本語</option>
+              </select>
+            )}
+            {source && (
               <button type="button" className="video-live__source-button video-live__source-button--stop" onClick={closeSource}>
                 <X aria-hidden />
                 {source === 'camera' ? '停止摄像头' : source === 'screen' ? '停止全部屏幕' : '关闭视频'}
+              </button>
+            )}
+            {source && (
+              <button
+                type="button"
+                className={`video-live__source-button${isTranslating ? ' video-live__source-button--active' : ''}`}
+                onClick={() => void toggleTranslation().catch((taskError) => {
+                  setError(taskError instanceof Error ? taskError.message : '实时翻译启动失败');
+                })}
+              >
+                {isTranslating ? '停止翻译' : '实时翻译'}
               </button>
             )}
             <span className="video-live__frame-count">
@@ -785,24 +1169,55 @@ export function VideoLivePanel() {
               <span>First <b>{firstTokenMs === null ? '—' : `${firstTokenMs} ms`}</b></span>
               <span>Total <b>{latencyMs === null ? '—' : `${latencyMs} ms`}</b></span>
               <span>Count <b>{requestCount}</b></span>
+              <span>字幕 <b>{translationCount}</b></span>
             </div>
           </div>
 
           <div className="video-live__prompt-banner">
             <span>当前模式</span>
-            {isRecording
-              ? '正在录音，再点麦克风结束并提问'
-              : `最近 3 秒${source === 'screen' ? ` · ${screens.length} 个屏幕` : '画面'} + ${audioSourceCount} 路来源音频`}
+            {isVoiceConversation && isRecording
+              ? '持续语音 · 正在监听，停顿后自动发送'
+              : isVoiceConversation
+                ? '持续语音 · 正在回答，完成后自动继续监听'
+              : toolStatus
+                ? toolStatus
+              : isTranslating
+                ? '实时翻译运行中 · 每秒处理最新画面'
+                : `当前窗口最多 ${MAX_FRAMES} 帧${source === 'screen' ? ` · ${screens.length} 个屏幕` : ''} · 长/中期记忆 · 必要时 memory/free_search`}
           </div>
 
           <div className="video-live__answer">
-            {answer ? (
-              <p>{answer}</p>
+            {conversationTurns.length > 0 ? (
+              <div className="video-live__history">
+                {conversationTurns.map((turn, index) => (
+                  <div className="video-live__turn" key={turn.id}>
+                    <div className="video-live__question">{turn.question}</div>
+                    <div className="video-live__turn-answer">
+                      {turn.answer ? (
+                        <MarkdownRenderer
+                          content={turn.answer}
+                          className="chat-markdown"
+                        />
+                      ) : isAsking && index === conversationTurns.length - 1 ? (
+                        <span className="video-live__turn-loading">
+                          <LoaderCircle className="is-spinning" aria-hidden />
+                          {toolStatus || 'Omni 正在处理'}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : answer ? (
+              <MarkdownRenderer
+                content={answer}
+                className="video-live__answer-content chat-markdown"
+              />
             ) : isAsking ? (
               <div className="video-live__answer-empty">
                 <LoaderCircle className="is-spinning" aria-hidden />
-                <strong>正在分析最近 3 秒画面</strong>
-                <span>{(elapsedMs / 1000).toFixed(1)} 秒 · 最长等待 15 秒</span>
+                <strong>{toolStatus || 'Jiuwen Agent 正在处理'}</strong>
+                <span>{(elapsedMs / 1000).toFixed(1)} 秒 · 最长等待 120 秒</span>
               </div>
             ) : (
               <div className="video-live__answer-empty">
@@ -818,23 +1233,23 @@ export function VideoLivePanel() {
           <form className="video-live__composer" onSubmit={(event) => void askVideo(event)}>
             <button
               type="button"
-              className={`video-live__mic${isRecording ? ' is-recording' : ''}`}
-              disabled={isAsking}
-              onClick={isRecording ? stopRecording : () => void startRecording()}
-              aria-label={isRecording ? '结束录音并提问' : '语音提问'}
-              title={isRecording ? '结束录音并提问' : '语音提问'}
+              className={`video-live__mic${isVoiceConversation ? ' is-recording' : ''}`}
+              disabled={isAsking && !isVoiceConversation}
+              onClick={toggleVoiceConversation}
+              aria-label={isVoiceConversation ? '停止持续语音' : '开始持续语音'}
+              title={isVoiceConversation ? '停止持续语音' : '开始持续语音'}
             >
-              {isRecording ? <Square aria-hidden /> : <Mic aria-hidden />}
+              {isVoiceConversation ? <Square aria-hidden /> : <Mic aria-hidden />}
             </button>
             <input
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
-              placeholder={isRecording ? '正在录音……' : '向 Qwen3-Omni 询问当前视频……'}
-              disabled={isAsking || isRecording}
+              placeholder={isVoiceConversation ? '持续语音已开启……' : '询问当前画面，必要时自动调用工具……'}
+              disabled={isAsking || isVoiceConversation}
             />
             <button
               type={isAsking ? 'button' : 'submit'}
-              disabled={!isAsking && (!question.trim() || isRecording)}
+              disabled={!isAsking && (!question.trim() || isVoiceConversation)}
               onClick={isAsking ? () => abortQuestion('manual') : undefined}
               aria-label={isAsking ? '取消问答' : '发送问题'}
               title={isAsking ? '取消问答' : '发送问题'}

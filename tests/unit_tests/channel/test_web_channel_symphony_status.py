@@ -108,6 +108,25 @@ def test_web_channel_preserves_goal_structured_payloads():
         assert WebChannel._build_event_payload(msg, event_name) == expected
 
 
+def test_web_channel_adds_request_id_to_chat_stream_events():
+    message = Message(
+        id="req-camera-agent",
+        type="event",
+        channel_id="web",
+        session_id="sess-camera",
+        params={},
+        timestamp=0.0,
+        ok=True,
+        payload={"content": "瑞幸咖啡"},
+    )
+
+    assert WebChannel._build_event_payload(message, "chat.delta") == {
+        "session_id": "sess-camera",
+        "content": "瑞幸咖啡",
+        "request_id": "req-camera-agent",
+    }
+
+
 @pytest.mark.asyncio
 async def test_web_channel_preserves_symphony_status_payload():
     channel = WebChannel(WebChannelConfig(enabled=True), RobotMessageRouter())
