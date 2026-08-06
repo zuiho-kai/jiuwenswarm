@@ -644,6 +644,57 @@ def _omni_model_config() -> tuple[str, str, str]:
     return api_base.rstrip("/"), api_key, model
 
 
+def _asr_model_config() -> tuple[str, str, str]:
+    video_base, video_key, _ = _omni_model_config()
+    api_base = (os.environ.get("ASR_API_BASE") or video_base).strip().rstrip("/")
+    api_key = (os.environ.get("ASR_API_KEY") or video_key).strip()
+    model = (
+        os.environ.get("ASR_MODEL_NAME")
+        or "FunAudioLLM/SenseVoiceSmall"
+    ).strip()
+    return api_base, api_key, model
+
+
+async def _transcribe_audio_inputs(
+    audio_inputs: list[tuple[str, str]],
+) -> str:
+    api_base, api_key, model = _asr_model_config()
+    if not api_base or not api_key:
+        raise RuntimeError("ASR 未配置 API 地址或密钥")
+    transcripts: list[str] = []
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        for index, (data_url, _) in enumerate(audio_inputs):
+            header, _, encoded = data_url.partition(",")
+            mime_type = header[5:].split(";", 1)[0]
+            try:
+                audio_bytes = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise RuntimeError("语音数据不是有效的 base64") from exc
+            response = await client.post(
+                f"{api_base}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                data={"model": model},
+                files={
+                    "file": (
+                        f"microphone-{index}.webm",
+                        audio_bytes,
+                        mime_type,
+                    )
+                },
+            )
+            if response.status_code >= 400:
+                detail = response.text.strip()[:500]
+                raise RuntimeError(
+                    f"ASR 请求失败 ({response.status_code})"
+                    + (f"：{detail}" if detail else "")
+                )
+            payload = response.json()
+            text = str(payload.get("text") or "").strip()
+            if text:
+                transcripts.append(text)
+    return " ".join(transcripts).strip()
+
+
 def _video_tool_model_config() -> tuple[str, str, str]:
     api_base, api_key, _ = _omni_model_config()
     model = (
@@ -2513,35 +2564,17 @@ def register_video_live_handler(channel: Any) -> None:
                 "deep_reasoning": deep_reasoning,
             }
             if audio_inputs and not question:
-                stream_options["transcript_sink"] = _on_transcript
-                # Providers commonly reject audio + native tool calls. This pass
-                # only obtains the transcript; the transcript then enters the
-                # exact same action loop as a typed question.
-                transcript_options = {
-                    **stream_options,
-                    "memory_context": None,
-                    "memory_search": None,
-                    "free_search": None,
-                    "deep_reasoning": None,
-                }
-                async for delta in _stream_qwen_omni(
-                    "",
-                    frames,
-                    audio_inputs,
-                    **transcript_options,
-                ):
-                    del delta
+                # Qwen3-VL has no audio input. SenseVoice transcribes the
+                # microphone first, then the text follows the same route as a
+                # typed question.
+                transcript = await _transcribe_audio_inputs(audio_inputs)
+                await _on_transcript(transcript or "NO_SPEECH")
                 if voice_accepted and voice_transcript:
-                    text_options = {
-                        key: value
-                        for key, value in stream_options.items()
-                        if key not in {"transcript_sink", "voice_decision_sink"}
-                    }
                     async for delta in _stream_qwen_omni(
                         voice_transcript,
                         frames,
                         [],
-                        **text_options,
+                        **stream_options,
                     ):
                         await _emit_answer_delta(delta)
             else:
@@ -2557,7 +2590,7 @@ def register_video_live_handler(channel: Any) -> None:
                 ws,
                 req_id,
                 ok=False,
-                error=str(exc).strip() or "Qwen3-Omni request failed",
+                error=str(exc).strip() or "video model request failed",
                 code="VIDEO_MODEL_ERROR",
             )
             return

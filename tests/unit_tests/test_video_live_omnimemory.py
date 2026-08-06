@@ -600,6 +600,12 @@ async def test_voice_history_question_reenters_memory_search_route(
     monkeypatch.setattr(video_live, "_memory_client", memory_client)
     calls: list[tuple[str, bool]] = []
 
+    async def transcribe(audio_inputs):
+        assert audio_inputs
+        return "刚才杯子放在哪里？"
+
+    monkeypatch.setattr(video_live, "_transcribe_audio_inputs", transcribe)
+
     async def stream_answer(
         question,
         frames,
@@ -608,10 +614,7 @@ async def test_voice_history_question_reenters_memory_search_route(
     ):
         del frames
         calls.append((question, bool(audio_inputs)))
-        if audio_inputs:
-            assert await options["transcript_sink"]("刚才杯子放在哪里？")
-            yield "不应显示的音频直答"
-            return
+        assert not audio_inputs
         result = await options["memory_search"](
             {"query": "刚才杯子放在哪里？"}
         )
@@ -641,7 +644,7 @@ async def test_voice_history_question_reenters_memory_search_route(
     payload = channel.responses[-1]["payload"]
     assert payload["answer"] == "刚才杯子被放进柜子里。"
     assert payload["transcript"] == "刚才杯子放在哪里？"
-    assert calls == [("", True), ("刚才杯子放在哪里？", False)]
+    assert calls == [("刚才杯子放在哪里？", False)]
     assert memory_client.interactions[-1][1]["question"] == (
         "刚才杯子放在哪里？"
     )
