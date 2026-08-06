@@ -196,6 +196,20 @@ def _memory_context_for_question(
     }
 
 
+def _requires_external_definition_lookup(question: str) -> bool:
+    user_question = question.split("\n\n当前音频转写：", 1)[0]
+    normalized = re.sub(r"\s+", "", user_question.strip())
+    if not normalized or _is_current_visual_identification(question):
+        return False
+    if any(term in normalized for term in _HISTORICAL_QUESTION_TERMS):
+        return False
+    normalized = normalized.rstrip("？?。！!")
+    return bool(
+        re.fullmatch(r".{2,80}(?:是什么|是谁|是什么意思|什么来头)", normalized)
+        or re.fullmatch(r"什么是.{2,80}", normalized)
+    )
+
+
 def _normalized_tool_calls(message: Any, round_index: int) -> list[dict[str, str]]:
     """Normalize native calls and Qwen's reasoning_content tool markup."""
     native_calls = list(getattr(message, "tool_calls", None) or [])
@@ -651,6 +665,15 @@ def _asr_model_config() -> tuple[str, str, str]:
     model = (
         os.environ.get("ASR_MODEL_NAME")
         or "FunAudioLLM/SenseVoiceSmall"
+    ).strip()
+    return api_base, api_key, model
+
+
+def _fallback_video_model_config() -> tuple[str, str, str]:
+    api_base, api_key, _ = _omni_model_config()
+    model = (
+        os.environ.get("VIDEO_FALLBACK_MODEL_NAME")
+        or "Qwen/Qwen3-VL-8B-Instruct"
     ).strip()
     return api_base, api_key, model
 
@@ -1350,6 +1373,59 @@ async def _stream_external_answer(
     return search_text, _generate()
 
 
+async def _answer_from_search_results(
+    question: str,
+    search_result: dict[str, object],
+) -> str:
+    """Answer an external definition using search evidence, not visual guesses."""
+    from openai import AsyncOpenAI
+
+    api_base, api_key, model = _video_tool_model_config()
+    client = AsyncOpenAI(
+        api_key=api_key or "EMPTY",
+        base_url=api_base,
+        timeout=30.0,
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "只依据给定搜索结果回答，不使用模型记忆补充事实。搜索结果"
+                        "可能错误或把同名作品混淆：优先官网、作者页、Steam等一手"
+                        "来源；一手来源与二手摘要冲突时只采用一手来源，不要转述"
+                        "冲突的二手说法，也不要把互相矛盾的设定拼接。证据不足时"
+                        "明确说不确定。"
+                        "答案简洁，并保留支持结论的来源URL。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"问题：{question}\n\n"
+                        "搜索结果：\n"
+                        f"{json.dumps(search_result, ensure_ascii=False)[:12_000]}"
+                    ),
+                },
+            ],
+            max_tokens=500,
+            temperature=0.1,
+            stream=False,
+            extra_body={"enable_thinking": False},
+        )
+        if not response.choices:
+            raise RuntimeError("search summary model returned no choices")
+        message = response.choices[0].message
+        answer = message.content or getattr(message, "reasoning_content", None)
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError("search summary model returned no content")
+        return answer.strip()
+    finally:
+        await client.close()
+
+
 async def _run_translation_action(
     target_language: str,
     frames: list[dict[str, object]],
@@ -1480,10 +1556,11 @@ async def _stream_qwen_omni(
     deep_reasoning: AssistantTool | None = None,
     transcript_sink: TranscriptSink | None = None,
     voice_decision_sink: VoiceDecisionSink | None = None,
+    model_config: tuple[str, str, str] | None = None,
 ) -> AsyncIterator[str]:
     from openai import AsyncOpenAI
 
-    api_base, api_key, model = _omni_model_config()
+    api_base, api_key, model = model_config or _omni_model_config()
     if not api_base:
         raise RuntimeError(
             "请先在“更多 → 配置信息 → 视频模型”中配置 API 地址、密钥和模型"
@@ -1524,6 +1601,11 @@ async def _stream_qwen_omni(
         "不要用关键词机械路由，不要凭空补全；工具失败时明确说明。"
         "对于询问当前画面实体的问题，当前请求中的最新画面是唯一识别依据；"
         "Memory 中的旧实体、旧问答不能用于判断当前物体。"
+        "截图只能证明画面上实际可见的文字和状态；陌生标题、作品、人物或专名"
+        "的含义，以及发布日期、作者、播放量等外部事实，必须依据 free_search"
+        "结果，禁止从截图或模型记忆补全。搜索结果也可能错误或把同名作品混为"
+        "一谈；优先采用官网、作者页、Steam等一手来源，来源冲突时明确说明，"
+        "不要把互相矛盾的设定拼成一个答案。"
         f"\nMemory Context:\n{json.dumps(context_payload, ensure_ascii=False)}"
     )
     content: list[dict[str, Any]] = [
@@ -1694,6 +1776,18 @@ async def _stream_qwen_omni(
             tools.append(_DEEP_REASONING_TOOL)
             runners["deep_reasoning"] = deep_reasoning
 
+        if (
+            free_search is not None
+            and _requires_external_definition_lookup(question)
+        ):
+            lookup_query = question.split("\n\n当前音频转写：", 1)[0].strip()
+            lookup_result = await free_search({"query": lookup_query})
+            yield await _answer_from_search_results(
+                lookup_query,
+                lookup_result,
+            )
+            return
+
         for _round in range(3):
             response = await client.chat.completions.create(
                 **{
@@ -1707,7 +1801,7 @@ async def _stream_qwen_omni(
                 }
             )
             if not response.choices:
-                raise RuntimeError("Qwen3-Omni returned no choices")
+                raise RuntimeError(f"{model} returned no choices")
             message = response.choices[0].message
             tool_calls = _normalized_tool_calls(message, _round)
             if not tool_calls:
@@ -1717,7 +1811,6 @@ async def _stream_qwen_omni(
                 )
                 if (
                     (not isinstance(answer, str) or not answer.strip())
-                    and "qwen3-omni" in model.casefold()
                     and isinstance(reasoning_content, str)
                     and reasoning_content.strip()
                     and not re.search(
@@ -1726,13 +1819,13 @@ async def _stream_qwen_omni(
                         re.IGNORECASE,
                     )
                 ):
-                    # SiliconFlow sometimes places Qwen3-Omni-Instruct's
-                    # complete final answer in reasoning_content after a tool.
+                    # SiliconFlow Qwen models may place the complete final
+                    # answer in reasoning_content after a tool call.
                     answer = reasoning_content
                 if isinstance(answer, str) and answer.strip():
                     yield answer.strip()
                     return
-                raise RuntimeError("Qwen3-Omni returned no action")
+                raise RuntimeError(f"{model} returned no action")
 
             serialized_calls: list[dict[str, object]] = []
             tool_results: list[dict[str, object]] = []
@@ -1794,6 +1887,50 @@ async def _stream_qwen_omni(
         raise RuntimeError("Qwen3-Omni exceeded the 3-round action limit")
     finally:
         await client.close()
+
+
+async def _stream_video_answer(
+    question: str,
+    frames: list[tuple[str, str]],
+    audio_inputs: list[tuple[str, str]],
+    *,
+    fallback_status_sink: ToolStatusSink | None = None,
+    **options: object,
+) -> AsyncIterator[str]:
+    primary_config = _omni_model_config()
+    emitted = False
+    try:
+        async for delta in _stream_qwen_omni(
+            question,
+            frames,
+            audio_inputs,
+            model_config=primary_config,
+            **options,
+        ):
+            emitted = True
+            yield delta
+        return
+    except Exception as primary_error:
+        fallback_config = _fallback_video_model_config()
+        if emitted or fallback_config[2] == primary_config[2]:
+            raise
+        if fallback_status_sink is not None:
+            await fallback_status_sink(
+                f"{primary_config[2]} 不可用，已切换 {fallback_config[2]}"
+            )
+        try:
+            async for delta in _stream_qwen_omni(
+                question,
+                frames,
+                audio_inputs,
+                model_config=fallback_config,
+                **options,
+            ):
+                yield delta
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"主模型失败：{primary_error}；备用模型失败：{fallback_error}"
+            ) from fallback_error
 
 
 def register_video_live_handler(channel: Any) -> None:
@@ -2574,6 +2711,17 @@ def register_video_live_handler(channel: Any) -> None:
                 "free_search": _free_search,
                 "deep_reasoning": deep_reasoning,
             }
+
+            async def _on_model_fallback(status: str) -> None:
+                nonlocal model
+                model = _fallback_video_model_config()[2]
+                await channel.send_event(
+                    ws,
+                    "video.tool_status",
+                    {"request_id": req_id, "status": status},
+                    stream_id=req_id,
+                )
+
             model_question = question
             if audio_inputs:
                 # Qwen3-VL must never receive audio_url. Microphone and shared
@@ -2591,10 +2739,11 @@ def register_video_live_handler(channel: Any) -> None:
                         else ""
                     )
             if model_question:
-                async for delta in _stream_qwen_omni(
+                async for delta in _stream_video_answer(
                     model_question,
                     frames,
                     [],
+                    fallback_status_sink=_on_model_fallback,
                     **stream_options,
                 ):
                     await _emit_answer_delta(delta)

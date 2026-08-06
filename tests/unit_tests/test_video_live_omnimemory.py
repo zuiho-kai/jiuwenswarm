@@ -348,6 +348,63 @@ def test_historical_visual_question_keeps_memory() -> None:
     ) is memory_context
 
 
+def test_named_term_definition_requires_external_lookup() -> None:
+    assert video_live._requires_external_definition_lookup(
+        "烈焰升腾/钢铁雄心 是什么"
+    )
+    assert video_live._requires_external_definition_lookup(
+        "烈焰升腾/钢铁雄心 是什么\n\n当前音频转写：背景音乐。"
+    )
+    assert not video_live._requires_external_definition_lookup("这个是什么？")
+    assert not video_live._requires_external_definition_lookup(
+        "我刚才看到的是什么？"
+    )
+
+
+@pytest.mark.asyncio
+async def test_video_answer_falls_back_when_omni_has_no_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = ("http://model", "key", "Qwen/Qwen3-Omni-30B-A3B-Instruct")
+    fallback = ("http://model", "key", "Qwen/Qwen3-VL-8B-Instruct")
+    monkeypatch.setattr(video_live, "_omni_model_config", lambda: primary)
+    monkeypatch.setattr(
+        video_live,
+        "_fallback_video_model_config",
+        lambda: fallback,
+    )
+    calls: list[str] = []
+    statuses: list[str] = []
+
+    async def stream_model(question, frames, audio_inputs, **options):
+        del question, frames, audio_inputs
+        model = options["model_config"][2]
+        calls.append(model)
+        if model == primary[2]:
+            raise RuntimeError("returned no action")
+        yield "备用模型回答"
+
+    async def status_sink(status: str) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(video_live, "_stream_qwen_omni", stream_model)
+    answer = "".join(
+        [
+            part
+            async for part in video_live._stream_video_answer(
+                "这是什么？",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [],
+                fallback_status_sink=status_sink,
+            )
+        ]
+    )
+
+    assert answer == "备用模型回答"
+    assert calls == [primary[2], fallback[2]]
+    assert statuses and fallback[2] in statuses[0]
+
+
 class _MemoryClient:
     api_base = "http://memory"
 
@@ -1069,6 +1126,66 @@ async def test_qwen_calls_memory_search_once_before_final_answer(
     ] == ["respond", "silent", "memory_search"]
     assert requests[0]["tool_choice"] == "auto"
     assert requests[1]["messages"][-1]["role"] == "tool"
+
+
+@pytest.mark.asyncio
+async def test_named_term_definition_searches_before_model_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            reasoning_content="检索后确认这是一个游戏模组。",
+                            tool_calls=None,
+                        )
+                    )
+                ]
+            )
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("http://model", "key", "Qwen/Qwen3-VL-8B-Instruct"),
+    )
+    searches: list[dict[str, object]] = []
+
+    async def search(arguments):
+        searches.append(arguments)
+        return {"results": "烈焰升腾是钢铁雄心IV的模组。"}
+
+    answer = "".join(
+        [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "烈焰升腾/钢铁雄心 是什么",
+                [("data:image/jpeg;base64,eA==", "screen")],
+                [],
+                free_search=search,
+            )
+        ]
+    )
+
+    assert answer == "检索后确认这是一个游戏模组。"
+    assert searches == [{"query": "烈焰升腾/钢铁雄心 是什么"}]
+    assert "搜索结果" in requests[0]["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio
