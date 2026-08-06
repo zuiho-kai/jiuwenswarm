@@ -6,6 +6,7 @@ import asyncio
 import base64
 from difflib import SequenceMatcher
 import json
+import logging
 import os
 import re
 import time
@@ -20,6 +21,9 @@ import httpx
 from jiuwenswarm.agents.harness.common.tools.search_tools import mcp_free_search
 
 from .video_interaction import VideoInteractionRuntime
+
+
+logger = logging.getLogger(__name__)
 
 
 _MAX_FRAMES = 8
@@ -207,6 +211,29 @@ def _requires_external_definition_lookup(question: str) -> bool:
     return bool(
         re.fullmatch(r".{2,80}(?:是什么|是谁|是什么意思|什么来头)", normalized)
         or re.fullmatch(r"什么是.{2,80}", normalized)
+    )
+
+
+def _should_failover_video_model(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
+    name = type(exc).__name__.casefold()
+    text = str(exc).casefold()
+    return (
+        "timeout" in name
+        or "connection" in name
+        or any(
+            marker in text
+            for marker in (
+                "50507",
+                "timed out",
+                "connection error",
+                "returned no action",
+                "returned no choices",
+                "action limit",
+            )
+        )
     )
 
 
@@ -1652,7 +1679,8 @@ async def _stream_qwen_omni(
     client = AsyncOpenAI(
         api_key=api_key or "EMPTY",
         base_url=api_base,
-        timeout=90.0,
+        timeout=35.0,
+        max_retries=0,
     )
     try:
         messages: list[dict[str, Any]] = [
@@ -1763,6 +1791,22 @@ async def _stream_qwen_omni(
                 if raw_output.strip():
                     yield raw_output
             return
+        if current_visual_identification:
+            response = await client.chat.completions.create(
+                **{
+                    **request,
+                    "max_tokens": 500,
+                    "stream": False,
+                }
+            )
+            if not response.choices:
+                raise RuntimeError(f"{model} returned no choices")
+            message = response.choices[0].message
+            answer = message.content or getattr(message, "reasoning_content", None)
+            if not isinstance(answer, str) or not answer.strip():
+                raise RuntimeError(f"{model} returned no action")
+            yield answer.strip()
+            return
         request["max_tokens"] = 768
         tools = [_RESPOND_TOOL, _SILENT_TOOL]
         runners: dict[str, AssistantTool] = {}
@@ -1775,18 +1819,6 @@ async def _stream_qwen_omni(
         if deep_reasoning is not None:
             tools.append(_DEEP_REASONING_TOOL)
             runners["deep_reasoning"] = deep_reasoning
-
-        if (
-            free_search is not None
-            and _requires_external_definition_lookup(question)
-        ):
-            lookup_query = question.split("\n\n当前音频转写：", 1)[0].strip()
-            lookup_result = await free_search({"query": lookup_query})
-            yield await _answer_from_search_results(
-                lookup_query,
-                lookup_result,
-            )
-            return
 
         for _round in range(3):
             response = await client.chat.completions.create(
@@ -1884,7 +1916,7 @@ async def _stream_qwen_omni(
                 }
             )
             messages.extend(tool_results)
-        raise RuntimeError("Qwen3-Omni exceeded the 3-round action limit")
+        raise RuntimeError(f"{model} exceeded the 3-round action limit")
     finally:
         await client.close()
 
@@ -1898,6 +1930,36 @@ async def _stream_video_answer(
     **options: object,
 ) -> AsyncIterator[str]:
     primary_config = _omni_model_config()
+    wrapped_options = dict(options)
+    for option_name in ("memory_search", "free_search", "deep_reasoning"):
+        tool = wrapped_options.get(option_name)
+        if not callable(tool):
+            continue
+        cache: dict[str, dict[str, object]] = {}
+
+        async def _cached_tool(
+            arguments: dict[str, object],
+            *,
+            _tool=tool,
+            _cache=cache,
+        ) -> dict[str, object]:
+            key = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+            if key not in _cache:
+                _cache[key] = await _tool(arguments)
+            return _cache[key]
+
+        wrapped_options[option_name] = _cached_tool
+
+    free_search = wrapped_options.get("free_search")
+    if (
+        callable(free_search)
+        and _requires_external_definition_lookup(question)
+    ):
+        lookup_query = question.split("\n\n当前音频转写：", 1)[0].strip()
+        lookup_result = await free_search({"query": lookup_query})
+        yield await _answer_from_search_results(lookup_query, lookup_result)
+        return
+
     emitted = False
     try:
         async for delta in _stream_qwen_omni(
@@ -1905,14 +1967,18 @@ async def _stream_video_answer(
             frames,
             audio_inputs,
             model_config=primary_config,
-            **options,
+            **wrapped_options,
         ):
             emitted = True
             yield delta
         return
     except Exception as primary_error:
         fallback_config = _fallback_video_model_config()
-        if emitted or fallback_config[2] == primary_config[2]:
+        if (
+            emitted
+            or fallback_config[2] == primary_config[2]
+            or not _should_failover_video_model(primary_error)
+        ):
             raise
         if fallback_status_sink is not None:
             await fallback_status_sink(
@@ -1924,7 +1990,7 @@ async def _stream_video_answer(
                 frames,
                 audio_inputs,
                 model_config=fallback_config,
-                **options,
+                **wrapped_options,
             ):
                 yield delta
         except Exception as fallback_error:
@@ -2748,6 +2814,12 @@ def register_video_live_handler(channel: Any) -> None:
                 ):
                     await _emit_answer_delta(delta)
         except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "video.ask failed request_id=%s session_id=%s model=%s",
+                req_id,
+                session_id,
+                model,
+            )
             await channel.send_response(
                 ws,
                 req_id,

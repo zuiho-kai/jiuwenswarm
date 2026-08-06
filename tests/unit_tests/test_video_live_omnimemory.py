@@ -375,11 +375,17 @@ async def test_video_answer_falls_back_when_omni_has_no_action(
     )
     calls: list[str] = []
     statuses: list[str] = []
+    tool_calls: list[dict[str, object]] = []
+
+    async def search(arguments):
+        tool_calls.append(arguments)
+        return {"results": "cached"}
 
     async def stream_model(question, frames, audio_inputs, **options):
         del question, frames, audio_inputs
         model = options["model_config"][2]
         calls.append(model)
+        await options["free_search"]({"query": "same query"})
         if model == primary[2]:
             raise RuntimeError("returned no action")
         yield "备用模型回答"
@@ -396,12 +402,14 @@ async def test_video_answer_falls_back_when_omni_has_no_action(
                 [("data:image/jpeg;base64,eA==", "camera")],
                 [],
                 fallback_status_sink=status_sink,
+                free_search=search,
             )
         ]
     )
 
     assert answer == "备用模型回答"
     assert calls == [primary[2], fallback[2]]
+    assert tool_calls == [{"query": "same query"}]
     assert statuses and fallback[2] in statuses[0]
 
 
@@ -1174,7 +1182,7 @@ async def test_named_term_definition_searches_before_model_answer(
     answer = "".join(
         [
             part
-            async for part in video_live._stream_qwen_omni(
+            async for part in video_live._stream_video_answer(
                 "烈焰升腾/钢铁雄心 是什么",
                 [("data:image/jpeg;base64,eA==", "screen")],
                 [],
@@ -1186,6 +1194,59 @@ async def test_named_term_definition_searches_before_model_answer(
     assert answer == "检索后确认这是一个游戏模组。"
     assert searches == [{"query": "烈焰升腾/钢铁雄心 是什么"}]
     assert "搜索结果" in requests[0]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_current_visual_identification_uses_tool_free_omni_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="这是当前画面中的杯子。",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        )
+                    )
+                ]
+            )
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("http://model", "key", "Qwen/Qwen3-Omni-30B-A3B-Instruct"),
+    )
+
+    answer = "".join(
+        [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "这个是什么？",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [],
+            )
+        ]
+    )
+
+    assert answer == "这是当前画面中的杯子。"
+    assert "tools" not in requests[0]
 
 
 @pytest.mark.asyncio

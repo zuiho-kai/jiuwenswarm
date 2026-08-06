@@ -527,10 +527,14 @@ export function VideoLivePanel() {
   }, [cancelRecording, releaseScreens, releaseSource, stopSpeechPlayback]);
 
   useEffect(() => {
-    const offStarted = webClient.on<{ request_id?: unknown }>('video.started', (event) => {
+    const offStarted = webClient.on<{ request_id?: unknown; model?: unknown }>('video.started', (event) => {
       const requestId = event.payload.request_id;
       if (isAskingRef.current && typeof requestId === 'string') {
         activeRequestIdRef.current = requestId;
+        if (typeof event.payload.model === 'string' && event.payload.model) {
+          setModel(event.payload.model);
+        }
+        setToolStatus('');
       }
     });
     const offDelta = webClient.on<{ request_id?: unknown; content?: unknown }>('video.delta', (event) => {
