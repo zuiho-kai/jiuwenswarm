@@ -654,6 +654,59 @@ async def test_voice_history_question_reenters_memory_search_route(
 
 
 @pytest.mark.asyncio
+async def test_typed_question_transcribes_attached_audio_before_vl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIMEMORY_API_BASE", raising=False)
+    monkeypatch.setattr(video_live, "_memory_client", None)
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("http://model", "key", "Qwen/Qwen3-VL-8B-Instruct"),
+    )
+    captured: dict[str, object] = {}
+
+    async def transcribe(audio_inputs):
+        assert audio_inputs
+        return "背景正在播放产品发布会。"
+
+    async def stream_answer(question, frames, audio_inputs, **options):
+        del frames, options
+        captured["question"] = question
+        captured["audio_inputs"] = audio_inputs
+        yield "画面里正在进行产品发布。"
+
+    monkeypatch.setattr(video_live, "_transcribe_audio_inputs", transcribe)
+    monkeypatch.setattr(video_live, "_stream_qwen_omni", stream_answer)
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["video.ask"](
+        object(),
+        "ask-text-with-audio",
+        {
+            "question": "画面里在做什么？",
+            "frames": [_frame()],
+            "audio_inputs": [
+                {
+                    "data_url": "data:audio/webm;base64,eA==",
+                    "source_label": "共享屏幕音频",
+                }
+            ],
+        },
+        "session-text-audio",
+    )
+
+    assert captured["audio_inputs"] == []
+    assert captured["question"] == (
+        "画面里在做什么？\n\n当前音频转写：背景正在播放产品发布会。"
+    )
+    assert channel.responses[-1]["payload"]["answer"] == (
+        "画面里正在进行产品发布。"
+    )
+
+
+@pytest.mark.asyncio
 async def test_text_external_question_uses_same_video_ask_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

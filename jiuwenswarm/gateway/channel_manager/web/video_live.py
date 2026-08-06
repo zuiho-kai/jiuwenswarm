@@ -1486,8 +1486,19 @@ async def _stream_qwen_omni(
     api_base, api_key, model = _omni_model_config()
     if not api_base:
         raise RuntimeError(
-            "请先在“更多 → 配置信息 → 视频模型”中配置 api_base、api_key 和 Qwen3-Omni 模型"
+            "请先在“更多 → 配置信息 → 视频模型”中配置 API 地址、密钥和模型"
         )
+    if audio_inputs and "omni" not in model.casefold():
+        transcript = await _transcribe_audio_inputs(audio_inputs)
+        audio_inputs = []
+        if not question:
+            if transcript_sink is not None and not await transcript_sink(
+                transcript or "NO_SPEECH"
+            ):
+                return
+            question = transcript
+        elif transcript:
+            question = f"{question}\n\n当前音频转写：{transcript}"
 
     current_visual_identification = _is_current_visual_identification(question)
     scoped_memory_context = _memory_context_for_question(memory_context, question)
@@ -2563,25 +2574,27 @@ def register_video_live_handler(channel: Any) -> None:
                 "free_search": _free_search,
                 "deep_reasoning": deep_reasoning,
             }
-            if audio_inputs and not question:
-                # Qwen3-VL has no audio input. SenseVoice transcribes the
-                # microphone first, then the text follows the same route as a
-                # typed question.
+            model_question = question
+            if audio_inputs:
+                # Qwen3-VL must never receive audio_url. Microphone and shared
+                # media audio are always converted to text first.
                 transcript = await _transcribe_audio_inputs(audio_inputs)
-                await _on_transcript(transcript or "NO_SPEECH")
-                if voice_accepted and voice_transcript:
-                    async for delta in _stream_qwen_omni(
-                        voice_transcript,
-                        frames,
-                        [],
-                        **stream_options,
-                    ):
-                        await _emit_answer_delta(delta)
-            else:
+                if question and transcript:
+                    model_question = (
+                        f"{question}\n\n当前音频转写：{transcript}"
+                    )
+                elif not question:
+                    await _on_transcript(transcript or "NO_SPEECH")
+                    model_question = (
+                        voice_transcript
+                        if voice_accepted and voice_transcript
+                        else ""
+                    )
+            if model_question:
                 async for delta in _stream_qwen_omni(
-                    question,
+                    model_question,
                     frames,
-                    audio_inputs,
+                    [],
                     **stream_options,
                 ):
                     await _emit_answer_delta(delta)
