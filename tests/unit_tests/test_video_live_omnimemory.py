@@ -248,6 +248,60 @@ class _Channel:
         )
 
 
+def test_tts_config_reuses_omni_credentials_when_audio_is_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        video_live,
+        "_configured_audio_model",
+        lambda: ("", "your-api-key", "your-audio-model-name"),
+    )
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("https://api.siliconflow.cn/v1", "secret", "omni"),
+    )
+    monkeypatch.delenv("TTS_MODEL_NAME", raising=False)
+    monkeypatch.delenv("TTS_VOICE", raising=False)
+
+    assert video_live._tts_model_config() == (
+        "https://api.siliconflow.cn/v1",
+        "secret",
+        "fnlp/MOSS-TTSD-v0.5",
+        "fnlp/MOSS-TTSD-v0.5:alex",
+    )
+
+
+@pytest.mark.asyncio
+async def test_tts_handler_returns_generated_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def synthesize(text: str):
+        assert text == "你好"
+        return b"mp3-bytes", "audio/mpeg", "tts-model"
+
+    monkeypatch.setattr(video_live, "_synthesize_speech", synthesize)
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["tts.synthesize"](
+        object(), "tts-1", {"text": "你好"}, "session-a"
+    )
+
+    assert channel.responses == [
+        {
+            "id": "tts-1",
+            "ok": True,
+            "payload": {
+                "success": True,
+                "audio_base64": base64.b64encode(b"mp3-bytes").decode(),
+                "audio_mime": "audio/mpeg",
+                "model": "tts-model",
+            },
+        }
+    ]
+
+
 class _MemoryClient:
     api_base = "http://memory"
 

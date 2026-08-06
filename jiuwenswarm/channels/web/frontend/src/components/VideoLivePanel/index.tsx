@@ -1,12 +1,13 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { Camera, FileVideo, LoaderCircle, Mic, Monitor, Send, Square, Video, X } from 'lucide-react';
+import { Camera, FileVideo, LoaderCircle, Mic, Monitor, Send, Square, Video, Volume2, VolumeX, X } from 'lucide-react';
 import { webClient, webRequest } from '../../services/webClient';
 import { useChatStore } from '../../stores/chatStore';
+import { fetchTtsAudio, sanitizeTtsText } from '../../utils';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 import './VideoLivePanel.css';
 
 type VideoSource = 'camera' | 'file' | 'screen' | null;
-type AbortReason = 'manual' | 'timeout' | 'source';
+type AbortReason = 'manual' | 'timeout' | 'source' | 'barge-in';
 
 interface CapturedFrame {
   client_frame_id: string;
@@ -152,6 +153,12 @@ export function VideoLivePanel() {
   const voiceConversationRef = useRef(false);
   const startVoiceListeningRef = useRef<() => Promise<void>>(async () => undefined);
   const activeTurnIdRef = useRef<string | null>(null);
+  const assistantAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const ttsGenerationRef = useRef(0);
+  const ttsBufferRef = useRef('');
+  const streamedAnswerRef = useRef('');
+  const ttsAbortControllersRef = useRef<Set<AbortController>>(new Set());
 
   const [source, setSource] = useState<VideoSource>(null);
   const [sourceName, setSourceName] = useState('');
@@ -176,6 +183,8 @@ export function VideoLivePanel() {
   const [toolStatus, setToolStatus] = useState('');
   const [isVoiceConversation, setIsVoiceConversation] = useState(false);
   const [conversationTurns, setConversationTurns] = useState<ConversationTurn[]>([]);
+  const [isSpeechEnabled, setIsSpeechEnabled] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   const beginConversationTurn = useCallback((prompt: string) => {
     const id = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -213,6 +222,96 @@ export function VideoLivePanel() {
       turn.id === id ? { ...turn, question: value.trim() } : turn
     )));
   }, []);
+
+  const stopSpeechPlayback = useCallback(() => {
+    ttsGenerationRef.current += 1;
+    ttsBufferRef.current = '';
+    ttsAbortControllersRef.current.forEach((controller) => controller.abort());
+    ttsAbortControllersRef.current.clear();
+    const audio = assistantAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+      assistantAudioRef.current = null;
+    }
+    ttsQueueRef.current = Promise.resolve();
+    setIsSpeaking(false);
+  }, []);
+
+  const playAssistantAudio = useCallback((audioBase64: string, mime: string) => (
+    new Promise<void>((resolve) => {
+      const audio = new Audio(`data:${mime};base64,${audioBase64}`);
+      assistantAudioRef.current = audio;
+      const finish = () => {
+        if (assistantAudioRef.current === audio) assistantAudioRef.current = null;
+        setIsSpeaking(false);
+        resolve();
+      };
+      audio.onended = finish;
+      audio.onerror = finish;
+      setIsSpeaking(true);
+      void audio.play().then(() => {
+        if (voiceConversationRef.current) {
+          void startVoiceListeningRef.current();
+        }
+      }).catch(finish);
+    })
+  ), []);
+
+  const enqueueSpeechSegment = useCallback((rawText: string) => {
+    if (!isSpeechEnabled) return;
+    const text = sanitizeTtsText(rawText, 300);
+    if (!text) return;
+    const generation = ttsGenerationRef.current;
+    const controller = new AbortController();
+    ttsAbortControllersRef.current.add(controller);
+    // Start synthesis immediately; playback remains ordered by ttsQueueRef.
+    const audioRequest = fetchTtsAudio(
+      text,
+      activeSessionIdRef.current || undefined,
+      controller.signal,
+    ).finally(() => ttsAbortControllersRef.current.delete(controller));
+    ttsQueueRef.current = ttsQueueRef.current.then(async () => {
+      const response = await audioRequest;
+      if (
+        generation !== ttsGenerationRef.current
+        || !response?.success
+        || !response.audio_base64
+      ) return;
+      await playAssistantAudio(
+        response.audio_base64,
+        response.audio_mime || 'audio/mpeg',
+      );
+    }).catch(() => undefined);
+  }, [isSpeechEnabled, playAssistantAudio]);
+
+  const queueSpeechText = useCallback((delta: string, flush = false) => {
+    if (!isSpeechEnabled) return;
+    ttsBufferRef.current += delta;
+    let boundary = -1;
+    for (let index = 0; index < ttsBufferRef.current.length; index += 1) {
+      if ('。！？!?；;\n'.includes(ttsBufferRef.current[index])) boundary = index;
+      if (boundary >= 0 && (boundary >= 24 || index >= 150)) break;
+    }
+    while (boundary >= 0) {
+      const segment = ttsBufferRef.current.slice(0, boundary + 1);
+      ttsBufferRef.current = ttsBufferRef.current.slice(boundary + 1);
+      enqueueSpeechSegment(segment);
+      boundary = -1;
+      for (let index = 0; index < ttsBufferRef.current.length; index += 1) {
+        if ('。！？!?；;\n'.includes(ttsBufferRef.current[index])) boundary = index;
+        if (boundary >= 0 && (boundary >= 24 || index >= 150)) break;
+      }
+    }
+    if (ttsBufferRef.current.length >= 180) {
+      enqueueSpeechSegment(ttsBufferRef.current.slice(0, 180));
+      ttsBufferRef.current = ttsBufferRef.current.slice(180);
+    }
+    if (flush && ttsBufferRef.current.trim()) {
+      enqueueSpeechSegment(ttsBufferRef.current);
+      ttsBufferRef.current = '';
+    }
+  }, [enqueueSpeechSegment, isSpeechEnabled]);
 
   const removeActiveTurn = useCallback(() => {
     const id = activeTurnIdRef.current;
@@ -364,7 +463,8 @@ export function VideoLivePanel() {
     activeRequestIdRef.current = null;
     isAskingRef.current = false;
     setIsAsking(false);
-  }, []);
+    stopSpeechPlayback();
+  }, [stopSpeechPlayback]);
 
   const releaseMicrophone = useCallback(() => {
     if (recordingTimeoutRef.current !== null) {
@@ -399,6 +499,7 @@ export function VideoLivePanel() {
     setIsVoiceConversation(false);
     if (isAskingRef.current) abortQuestion('source');
     cancelRecording();
+    stopSpeechPlayback();
     releaseScreens();
     releaseSource();
     setSource(null);
@@ -419,9 +520,10 @@ export function VideoLivePanel() {
       ...(sessionId ? { session_id: sessionId } : {}),
     }).catch(() => undefined);
     cancelRecording(false);
+    stopSpeechPlayback();
     releaseScreens(false);
     releaseSource();
-  }, [cancelRecording, releaseScreens, releaseSource]);
+  }, [cancelRecording, releaseScreens, releaseSource, stopSpeechPlayback]);
 
   useEffect(() => {
     const offStarted = webClient.on<{ request_id?: unknown }>('video.started', (event) => {
@@ -440,6 +542,8 @@ export function VideoLivePanel() {
           );
           setFirstTokenMs(streamFirstTokenMsRef.current);
         }
+        streamedAnswerRef.current += content;
+        queueSpeechText(content);
         appendActiveAnswer(content);
       }
     });
@@ -491,7 +595,7 @@ export function VideoLivePanel() {
       offTaskError();
       offMemoryError();
     };
-  }, [appendActiveAnswer, replaceActiveAnswer, replaceActiveQuestion]);
+  }, [appendActiveAnswer, queueSpeechText, replaceActiveAnswer, replaceActiveQuestion]);
 
   useEffect(() => {
     if (!isAsking) {
@@ -799,6 +903,8 @@ export function VideoLivePanel() {
 
     setIsAsking(true);
     isAskingRef.current = true;
+    stopSpeechPlayback();
+    streamedAnswerRef.current = '';
     beginConversationTurn(prompt || '🎙️ 语音提问');
     setError('');
     setToolStatus('');
@@ -824,7 +930,7 @@ export function VideoLivePanel() {
           source_label: '用户麦克风提问',
         });
       }
-      const result = await webRequest<VideoAskResponse>(
+      const request = webRequest<VideoAskResponse>(
         'video.ask',
         {
           ...(activeSessionId ? { session_id: activeSessionId } : {}),
@@ -838,11 +944,23 @@ export function VideoLivePanel() {
           signal: controller.signal,
         },
       );
+      // Full duplex: immediately reopen the microphone while the model is
+      // thinking and speaking. A new utterance interrupts this request.
+      if (voiceConversationRef.current) {
+        window.setTimeout(() => void startVoiceListeningRef.current(), 120);
+      }
+      const result = await request;
+      // The model request is complete. Audio playback may be longer than the
+      // request timeout and must not be mistaken for a hung model call.
+      window.clearTimeout(timeoutId);
       if (result.ignored) {
         removeActiveTurn();
       } else {
         if (result.transcript) replaceActiveQuestion(result.transcript);
-        replaceActiveAnswer(result.answer?.trim() || '模型没有返回文本。');
+        const finalAnswer = result.answer?.trim() || '模型没有返回文本。';
+        replaceActiveAnswer(finalAnswer);
+        if (!streamedAnswerRef.current) queueSpeechText(finalAnswer);
+        queueSpeechText('', true);
       }
       setLatencyMs(result.latency_ms ?? Math.round(performance.now() - startedAt));
       setFirstTokenMs(result.first_token_ms ?? null);
@@ -855,7 +973,7 @@ export function VideoLivePanel() {
         setError('超过 45 秒仍未收到结果，已停止等待，请重试。');
       } else if (abortReason === 'manual') {
         setError('已取消本次问答。');
-      } else if (abortReason !== 'source') {
+      } else if (abortReason !== 'source' && abortReason !== 'barge-in') {
         const code = (requestError as { code?: unknown })?.code;
         setError(
           code === 'WS_DISCONNECTED' || code === 'WS_CLOSED'
@@ -877,7 +995,7 @@ export function VideoLivePanel() {
       setIsAsking(false);
       setToolStatus('');
       if (voiceConversationRef.current) {
-        window.setTimeout(() => void startVoiceListeningRef.current(), 600);
+        window.setTimeout(() => void startVoiceListeningRef.current(), 120);
       }
     }
   };
@@ -894,7 +1012,10 @@ export function VideoLivePanel() {
   };
 
   const startRecording = async () => {
-    if (isAskingRef.current || isRecording) return;
+    if (
+      mediaRecorderRef.current
+      || (isAskingRef.current && !voiceConversationRef.current)
+    ) return;
     if (framesRef.current.length === 0) {
       setError('请先打开视频并等待画面开始播放。');
       return;
@@ -977,11 +1098,19 @@ export function VideoLivePanel() {
         if (now - calibrationStartedAt < 200 && rms < 0.02) {
           noiseFloor = noiseFloor * 0.85 + rms * 0.15;
         }
-        const speechThreshold = Math.max(0.018, noiseFloor * 2.2);
+        const outputIsPlaying = assistantAudioRef.current !== null;
+        const speechThreshold = Math.max(
+          outputIsPlaying ? 0.032 : 0.018,
+          noiseFloor * (outputIsPlaying ? 3.2 : 2.2),
+        );
         if (rms >= speechThreshold) {
           consecutiveSpeechFrames += 1;
           voicedFrames += 1;
-          if (consecutiveSpeechFrames >= 2) heardSpeech = true;
+          const requiredFrames = outputIsPlaying ? 4 : 2;
+          if (!heardSpeech && consecutiveSpeechFrames >= requiredFrames) {
+            heardSpeech = true;
+            if (isAskingRef.current) abortQuestion('barge-in');
+          }
           lastSpeechAt = performance.now();
         } else {
           consecutiveSpeechFrames = 0;
@@ -1151,6 +1280,18 @@ export function VideoLivePanel() {
                 {isTranslating ? '停止翻译' : '实时翻译'}
               </button>
             )}
+            <button
+              type="button"
+              className={`video-live__source-button${isSpeechEnabled ? ' video-live__source-button--active' : ''}`}
+              onClick={() => {
+                if (isSpeechEnabled) stopSpeechPlayback();
+                setIsSpeechEnabled((enabled) => !enabled);
+              }}
+              title={isSpeechEnabled ? '关闭模型语音' : '开启模型语音'}
+            >
+              {isSpeechEnabled ? <Volume2 aria-hidden /> : <VolumeX aria-hidden />}
+              {isSpeaking ? '正在播报' : '语音播报'}
+            </button>
             <span className="video-live__frame-count">
               滚动窗口：{frameCount}/{MAX_FRAMES} 帧
               {source === 'screen' ? ` · ${screens.length}/${MAX_SCREENS} 屏` : ''}
@@ -1176,14 +1317,16 @@ export function VideoLivePanel() {
           <div className="video-live__prompt-banner">
             <span>当前模式</span>
             {isVoiceConversation && isRecording
-              ? '持续语音 · 正在监听，停顿后自动发送'
+              ? isSpeaking
+                ? '持续语音 · 正在播报并监听，可随时打断'
+                : '持续语音 · 正在监听，停顿后自动发送'
               : isVoiceConversation
-                ? '持续语音 · 正在回答，完成后自动继续监听'
+                ? '持续语音 · 正在恢复监听'
               : toolStatus
                 ? toolStatus
               : isTranslating
                 ? '实时翻译运行中 · 每秒处理最新画面'
-                : `当前窗口最多 ${MAX_FRAMES} 帧${source === 'screen' ? ` · ${screens.length} 个屏幕` : ''} · 长/中期记忆 · 必要时 memory/free_search`}
+                : `当前窗口最多 ${MAX_FRAMES} 帧${source === 'screen' ? ` · ${screens.length} 个屏幕` : ''} · 长/中期记忆 · 必要时 memory/free_search${isSpeechEnabled ? ' · 语音播报' : ''}`}
           </div>
 
           <div className="video-live__answer">

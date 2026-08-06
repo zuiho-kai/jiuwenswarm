@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from jiuwenswarm.agents.harness.common.tools.search_tools import mcp_free_search
 
 from .video_interaction import VideoInteractionRuntime
@@ -27,6 +29,7 @@ _MAX_AUDIO_INPUTS = 6
 _MAX_TOTAL_REQUEST_CHARS = 7_500_000
 _MAX_CURRENT_CHUNK_FRAMES = 100
 _MAX_CURRENT_CHUNK_BYTES = 25 * 1024 * 1024
+_MAX_TTS_TEXT_CHARS = 800
 _ALLOWED_DATA_URL_PREFIXES = (
     "data:image/jpeg;base64,",
     "data:image/png;base64,",
@@ -434,6 +437,101 @@ def _configured_video_model() -> tuple[str, str, str]:
     except Exception:
         pass
     return "", "", ""
+
+
+def _configured_audio_model() -> tuple[str, str, str]:
+    """Read Jiuwen's existing models.audio configuration."""
+    try:
+        from jiuwenswarm.common.config import get_config
+
+        config = get_config()
+        models = config.get("models") if isinstance(config, dict) else None
+        audio = models.get("audio") if isinstance(models, dict) else None
+        client = (
+            audio.get("model_client_config")
+            if isinstance(audio, dict)
+            else None
+        )
+        if isinstance(client, dict):
+            return (
+                str(client.get("api_base") or "").strip().rstrip("/"),
+                str(client.get("api_key") or "").strip(),
+                str(client.get("model_name") or "").strip(),
+            )
+    except Exception:
+        pass
+    return "", "", ""
+
+
+def _usable_tts_config(value: str) -> bool:
+    normalized = value.strip().lower()
+    return bool(
+        normalized
+        and "${" not in normalized
+        and not normalized.startswith("your-")
+    )
+
+
+def _tts_model_config() -> tuple[str, str, str, str]:
+    """Resolve TTS config, reusing the Omni endpoint credentials when unset."""
+    audio_base, audio_key, audio_model = _configured_audio_model()
+    omni_base, omni_key, _ = _omni_model_config()
+    explicit_model = os.environ.get("TTS_MODEL_NAME", "").strip()
+    audio_is_tts = _usable_tts_config(audio_model) and any(
+        marker in audio_model.casefold()
+        for marker in ("tts", "cosyvoice", "fish-speech")
+    )
+    model = (
+        explicit_model
+        if _usable_tts_config(explicit_model)
+        else audio_model
+        if audio_is_tts
+        else "fnlp/MOSS-TTSD-v0.5"
+    )
+    api_base = (
+        audio_base
+        if audio_is_tts and _usable_tts_config(audio_base)
+        else omni_base
+    )
+    api_key = (
+        audio_key
+        if audio_is_tts and _usable_tts_config(audio_key)
+        else omni_key
+    )
+    voice = os.environ.get("TTS_VOICE", "").strip()
+    if not voice and model.startswith("fnlp/MOSS-TTSD"):
+        voice = f"{model}:alex"
+    return api_base.rstrip("/"), api_key, model, voice
+
+
+async def _synthesize_speech(text: str) -> tuple[bytes, str, str]:
+    api_base, api_key, model, voice = _tts_model_config()
+    if not api_base or not api_key:
+        raise RuntimeError("TTS 未配置 API 地址或密钥")
+    request: dict[str, object] = {
+        "model": model,
+        "input": text,
+        "response_format": "mp3",
+        "stream": False,
+        "speed": 1.05,
+    }
+    if voice:
+        request["voice"] = voice
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        response = await client.post(
+            f"{api_base}/audio/speech",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=request,
+        )
+    if response.status_code >= 400:
+        detail = response.text.strip()[:500]
+        raise RuntimeError(
+            f"TTS 请求失败 ({response.status_code})"
+            + (f"：{detail}" if detail else "")
+        )
+    if not response.content:
+        raise RuntimeError("TTS 没有返回音频")
+    return response.content, "audio/mpeg", model
 
 
 def _omni_model_config() -> tuple[str, str, str]:
@@ -1553,6 +1651,54 @@ def register_video_live_handler(channel: Any) -> None:
     ] = {}
     memory_ingest_workers: dict[str, asyncio.Task[None]] = {}
 
+    async def _tts_synthesize(ws, req_id, params, session_id):
+        del session_id
+        text = (
+            str(params.get("text") or "").strip()
+            if isinstance(params, dict)
+            else ""
+        )
+        if not text:
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error="text is required",
+                code="BAD_REQUEST",
+            )
+            return
+        if len(text) > _MAX_TTS_TEXT_CHARS:
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error=f"text exceeds {_MAX_TTS_TEXT_CHARS} characters",
+                code="BAD_REQUEST",
+            )
+            return
+        try:
+            audio, mime, model = await _synthesize_speech(text)
+        except Exception as exc:  # noqa: BLE001
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error=str(exc).strip() or "TTS failed",
+                code="TTS_ERROR",
+            )
+            return
+        await channel.send_response(
+            ws,
+            req_id,
+            ok=True,
+            payload={
+                "success": True,
+                "audio_base64": base64.b64encode(audio).decode("ascii"),
+                "audio_mime": mime,
+                "model": model,
+            },
+        )
+
     def schedule_memory_ingest(
         *,
         session_id: str,
@@ -2425,3 +2571,4 @@ def register_video_live_handler(channel: Any) -> None:
     )
     channel.register_method("video.external.ask", _video_external_ask)
     channel.register_method("video.ask", _video_ask)
+    channel.register_method("tts.synthesize", _tts_synthesize)
