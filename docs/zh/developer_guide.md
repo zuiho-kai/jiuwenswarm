@@ -133,6 +133,13 @@ uv run jiuwenswarm-start
 npm run build
 ```
 
+Windows 本地联调建议直接使用统一重启脚本。它会构建前端、重启 Web 与
+Gateway，并校验 5173 实际提供的资源版本，避免页面继续使用旧包：
+
+```powershell
+.\scripts\restart_local_dev.ps1
+```
+
 #### TUI 修改
 
 修改 TUI（终端用户界面）相关代码后，运行开发模式进行调试：
