@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -112,6 +113,16 @@ def _accept_voice_transcript(session_id: str, transcript: str) -> bool:
         return False
     recent.append((now, key))
     return True
+
+
+def _looks_like_assistant_echo(transcript: str, assistant_text: str) -> bool:
+    transcript_key = _voice_transcript_key(transcript)
+    assistant_key = _voice_transcript_key(assistant_text)
+    if len(transcript_key) < 4 or len(assistant_key) < 4:
+        return False
+    if transcript_key in assistant_key:
+        return True
+    return SequenceMatcher(None, transcript_key, assistant_key).ratio() >= 0.72
 
 
 def _normalized_tool_calls(message: Any, round_index: int) -> list[dict[str, str]]:
@@ -486,7 +497,7 @@ def _tts_model_config() -> tuple[str, str, str, str]:
         if _usable_tts_config(explicit_model)
         else audio_model
         if audio_is_tts
-        else "fnlp/MOSS-TTSD-v0.5"
+        else "FunAudioLLM/CosyVoice2-0.5B"
     )
     api_base = (
         audio_base
@@ -499,8 +510,11 @@ def _tts_model_config() -> tuple[str, str, str, str]:
         else omni_key
     )
     voice = os.environ.get("TTS_VOICE", "").strip()
-    if not voice and model.startswith("fnlp/MOSS-TTSD"):
-        voice = f"{model}:alex"
+    if not voice:
+        if model.startswith("FunAudioLLM/CosyVoice2"):
+            voice = f"{model}:claire"
+        elif model.startswith("fnlp/MOSS-TTSD"):
+            voice = f"{model}:alex"
     return api_base.rstrip("/"), api_key, model, voice
 
 
@@ -2391,6 +2405,16 @@ def register_video_live_handler(channel: Any) -> None:
                     session_id,
                     voice_transcript,
                 )
+                assistant_speech_text = (
+                    str(params.get("assistant_speech_text") or "").strip()
+                    if isinstance(params, dict)
+                    else ""
+                )
+                if voice_accepted and _looks_like_assistant_echo(
+                    voice_transcript,
+                    assistant_speech_text,
+                ):
+                    voice_accepted = False
                 await channel.send_event(
                     ws,
                     "video.transcript",

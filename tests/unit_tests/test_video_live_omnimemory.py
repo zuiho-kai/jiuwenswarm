@@ -267,8 +267,21 @@ def test_tts_config_reuses_omni_credentials_when_audio_is_placeholder(
     assert video_live._tts_model_config() == (
         "https://api.siliconflow.cn/v1",
         "secret",
-        "fnlp/MOSS-TTSD-v0.5",
-        "fnlp/MOSS-TTSD-v0.5:alex",
+        "FunAudioLLM/CosyVoice2-0.5B",
+        "FunAudioLLM/CosyVoice2-0.5B:claire",
+    )
+
+
+def test_voice_transcript_rejects_assistant_speaker_echo() -> None:
+    assistant_text = "这是一个瑞幸咖啡的纸杯，杯身上有品牌标志。"
+
+    assert video_live._looks_like_assistant_echo(
+        "这是一个瑞幸咖啡的纸杯",
+        assistant_text,
+    )
+    assert not video_live._looks_like_assistant_echo(
+        "那它多少钱？",
+        assistant_text,
     )
 
 

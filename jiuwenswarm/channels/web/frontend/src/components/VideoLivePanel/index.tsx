@@ -7,7 +7,7 @@ import { MarkdownRenderer } from '../MarkdownRenderer';
 import './VideoLivePanel.css';
 
 type VideoSource = 'camera' | 'file' | 'screen' | null;
-type AbortReason = 'manual' | 'timeout' | 'source' | 'barge-in';
+type AbortReason = 'manual' | 'timeout' | 'source';
 
 interface CapturedFrame {
   client_frame_id: string;
@@ -158,6 +158,7 @@ export function VideoLivePanel() {
   const ttsGenerationRef = useRef(0);
   const ttsBufferRef = useRef('');
   const streamedAnswerRef = useRef('');
+  const assistantSpeechTextRef = useRef('');
   const ttsAbortControllersRef = useRef<Set<AbortController>>(new Set());
 
   const [source, setSource] = useState<VideoSource>(null);
@@ -554,6 +555,7 @@ export function VideoLivePanel() {
     }>('video.transcript', (event) => {
       if (event.payload.request_id !== activeRequestIdRef.current) return;
       if (event.payload.accepted !== true) return;
+      stopSpeechPlayback();
       if (typeof event.payload.text === 'string') {
         replaceActiveQuestion(event.payload.text);
       }
@@ -595,7 +597,7 @@ export function VideoLivePanel() {
       offTaskError();
       offMemoryError();
     };
-  }, [appendActiveAnswer, queueSpeechText, replaceActiveAnswer, replaceActiveQuestion]);
+  }, [appendActiveAnswer, queueSpeechText, replaceActiveAnswer, replaceActiveQuestion, stopSpeechPlayback]);
 
   useEffect(() => {
     if (!isAsking) {
@@ -894,7 +896,11 @@ export function VideoLivePanel() {
     }
   };
 
-  const runOmniRequest = async (prompt: string, questionAudioDataUrl?: string) => {
+  const runOmniRequest = async (
+    prompt: string,
+    questionAudioDataUrl?: string,
+    recordedAssistantPlayback = false,
+  ) => {
     if ((!prompt && !questionAudioDataUrl) || isAskingRef.current) return;
     if (framesRef.current.length === 0) {
       setError('请先打开视频并等待画面开始播放。');
@@ -903,7 +909,7 @@ export function VideoLivePanel() {
 
     setIsAsking(true);
     isAskingRef.current = true;
-    stopSpeechPlayback();
+    if (!recordedAssistantPlayback) stopSpeechPlayback();
     streamedAnswerRef.current = '';
     beginConversationTurn(prompt || '🎙️ 语音提问');
     setError('');
@@ -938,6 +944,9 @@ export function VideoLivePanel() {
           source,
           frames: framesRef.current.slice(-MAX_FRAMES),
           ...(audioInputs.length > 0 ? { audio_inputs: audioInputs } : {}),
+          ...(questionAudioDataUrl && assistantSpeechTextRef.current
+            ? { assistant_speech_text: assistantSpeechTextRef.current }
+            : {}),
         },
         {
           timeoutMs: REQUEST_TIMEOUT_MS + 1_000,
@@ -958,6 +967,7 @@ export function VideoLivePanel() {
       } else {
         if (result.transcript) replaceActiveQuestion(result.transcript);
         const finalAnswer = result.answer?.trim() || '模型没有返回文本。';
+        assistantSpeechTextRef.current = finalAnswer;
         replaceActiveAnswer(finalAnswer);
         if (!streamedAnswerRef.current) queueSpeechText(finalAnswer);
         queueSpeechText('', true);
@@ -973,7 +983,7 @@ export function VideoLivePanel() {
         setError('超过 45 秒仍未收到结果，已停止等待，请重试。');
       } else if (abortReason === 'manual') {
         setError('已取消本次问答。');
-      } else if (abortReason !== 'source' && abortReason !== 'barge-in') {
+      } else if (abortReason !== 'source') {
         const code = (requestError as { code?: unknown })?.code;
         setError(
           code === 'WS_DISCONNECTED' || code === 'WS_CLOSED'
@@ -1043,6 +1053,7 @@ export function VideoLivePanel() {
       let consecutiveSpeechFrames = 0;
       let voicedFrames = 0;
       let noiseFloor = 0.006;
+      let assistantPlayedDuringRecording = false;
       const calibrationStartedAt = performance.now();
       let lastSpeechAt = performance.now();
       mediaRecorderRef.current = recorder;
@@ -1075,7 +1086,11 @@ export function VideoLivePanel() {
           return;
         }
         void audioBlobToWavDataUrl(audioBlob)
-          .then((audioDataUrl) => runOmniRequest('', audioDataUrl))
+          .then((audioDataUrl) => runOmniRequest(
+            '',
+            audioDataUrl,
+            assistantPlayedDuringRecording,
+          ))
           .catch((recordingError) => {
             setError(recordingError instanceof Error ? recordingError.message : '读取录音失败。');
           });
@@ -1099,6 +1114,7 @@ export function VideoLivePanel() {
           noiseFloor = noiseFloor * 0.85 + rms * 0.15;
         }
         const outputIsPlaying = assistantAudioRef.current !== null;
+        if (outputIsPlaying) assistantPlayedDuringRecording = true;
         const speechThreshold = Math.max(
           outputIsPlaying ? 0.032 : 0.018,
           noiseFloor * (outputIsPlaying ? 3.2 : 2.2),
@@ -1106,10 +1122,9 @@ export function VideoLivePanel() {
         if (rms >= speechThreshold) {
           consecutiveSpeechFrames += 1;
           voicedFrames += 1;
-          const requiredFrames = outputIsPlaying ? 4 : 2;
+          const requiredFrames = outputIsPlaying ? 6 : 2;
           if (!heardSpeech && consecutiveSpeechFrames >= requiredFrames) {
             heardSpeech = true;
-            if (isAskingRef.current) abortQuestion('barge-in');
           }
           lastSpeechAt = performance.now();
         } else {
@@ -1318,7 +1333,7 @@ export function VideoLivePanel() {
             <span>当前模式</span>
             {isVoiceConversation && isRecording
               ? isSpeaking
-                ? '持续语音 · 正在播报并监听，可随时打断'
+                ? '持续语音 · 正在播报并监听，识别到插话后自动打断'
                 : '持续语音 · 正在监听，停顿后自动发送'
               : isVoiceConversation
                 ? '持续语音 · 正在恢复监听'
