@@ -84,6 +84,48 @@ _NO_SPEECH_VALUES = {
     "无法识别",
 }
 
+_CURRENT_VISUAL_IDENTITY_TERMS = (
+    "是什么",
+    "是啥",
+    "什么东西",
+    "什么物品",
+    "什么牌子",
+    "哪个牌子",
+    "哪个品牌",
+    "识别一下",
+    "认一下",
+)
+_CURRENT_VISUAL_LOCATORS = (
+    "这",
+    "这个",
+    "画面",
+    "镜头",
+    "眼前",
+    "手里",
+    "手上",
+    "拿着",
+    "举着",
+)
+_HISTORICAL_QUESTION_TERMS = (
+    "刚才",
+    "之前",
+    "以前",
+    "多久前",
+    "分钟前",
+    "小时前",
+    "什么时候",
+)
+_NON_VISUAL_IDENTITY_TOPICS = (
+    "公司",
+    "股票",
+    "历史",
+    "新闻",
+    "行情",
+    "资料",
+    "原理",
+    "意思",
+)
+
 
 def _voice_transcript_key(value: str) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.lower())
@@ -123,6 +165,35 @@ def _looks_like_assistant_echo(transcript: str, assistant_text: str) -> bool:
     if transcript_key in assistant_key:
         return True
     return SequenceMatcher(None, transcript_key, assistant_key).ratio() >= 0.72
+
+
+def _is_current_visual_identification(question: str) -> bool:
+    """Whether current frames, rather than historical memory, identify the entity."""
+    normalized = re.sub(r"\s+", "", question.strip().lower())
+    if not normalized or any(term in normalized for term in _HISTORICAL_QUESTION_TERMS):
+        return False
+    if any(term in normalized for term in _NON_VISUAL_IDENTITY_TOPICS):
+        return False
+    return (
+        any(term in normalized for term in _CURRENT_VISUAL_IDENTITY_TERMS)
+        and any(term in normalized for term in _CURRENT_VISUAL_LOCATORS)
+    )
+
+
+def _memory_context_for_question(
+    memory_context: dict[str, object] | None,
+    question: str,
+) -> dict[str, object] | None:
+    if not _is_current_visual_identification(question):
+        return memory_context
+    if not isinstance(memory_context, dict):
+        return memory_context
+    # A previous entity answer is historical evidence, not evidence about the
+    # object currently in front of the camera. Keep only provider availability.
+    return {
+        "available": memory_context.get("available", True),
+        "scope": "current_frames_only",
+    }
 
 
 def _normalized_tool_calls(message: Any, round_index: int) -> list[dict[str, str]]:
@@ -1367,7 +1438,13 @@ async def _stream_qwen_omni(
             "请先在“更多 → 配置信息 → 视频模型”中配置 api_base、api_key 和 Qwen3-Omni 模型"
         )
 
-    context_payload = _compact_memory_context(memory_context)
+    current_visual_identification = _is_current_visual_identification(question)
+    scoped_memory_context = _memory_context_for_question(memory_context, question)
+    context_payload = _compact_memory_context(scoped_memory_context)
+    if current_visual_identification:
+        # The newest frames are authoritative for "what is this". Older frames
+        # in the rolling request can still show the previously held object.
+        frames = frames[-3:]
     system_prompt = (
         "你是实时视频助手。优先根据当前画面和音频回答当前状态问题。"
         "Memory Context 分为 long_term_memory、mid_term_memories、"
@@ -1383,6 +1460,8 @@ async def _stream_qwen_omni(
         "以上约束、依据多段证据判断并列出不确定性时同样必须调用；不要因为你"
         "自己能生成一个表面答案就跳过工具。"
         "不要用关键词机械路由，不要凭空补全；工具失败时明确说明。"
+        "对于询问当前画面实体的问题，当前请求中的最新画面是唯一识别依据；"
+        "Memory 中的旧实体、旧问答不能用于判断当前物体。"
         f"\nMemory Context:\n{json.dumps(context_payload, ensure_ascii=False)}"
     )
     content: list[dict[str, Any]] = [
@@ -1543,7 +1622,7 @@ async def _stream_qwen_omni(
         request["max_tokens"] = 768
         tools = [_RESPOND_TOOL, _SILENT_TOOL]
         runners: dict[str, AssistantTool] = {}
-        if memory_search is not None:
+        if memory_search is not None and not current_visual_identification:
             tools.append(_MEMORY_SEARCH_TOOL)
             runners["memory_search"] = memory_search
         if free_search is not None:
@@ -2438,11 +2517,18 @@ def register_video_live_handler(channel: Any) -> None:
                 # Providers commonly reject audio + native tool calls. This pass
                 # only obtains the transcript; the transcript then enters the
                 # exact same action loop as a typed question.
+                transcript_options = {
+                    **stream_options,
+                    "memory_context": None,
+                    "memory_search": None,
+                    "free_search": None,
+                    "deep_reasoning": None,
+                }
                 async for delta in _stream_qwen_omni(
                     "",
                     frames,
                     audio_inputs,
-                    **stream_options,
+                    **transcript_options,
                 ):
                     del delta
                 if voice_accepted and voice_transcript:

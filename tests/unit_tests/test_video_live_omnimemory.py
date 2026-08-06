@@ -315,6 +315,39 @@ async def test_tts_handler_returns_generated_audio(
     ]
 
 
+def test_current_visual_identification_drops_stale_entity_memory() -> None:
+    memory_context = {
+        "available": True,
+        "qa_history": [
+            {
+                "question": "这是什么？",
+                "answer": "这是一个瑞幸咖啡的纸杯。",
+            }
+        ],
+        "mid_term_memories": [{"summary": "用户一直拿着瑞幸咖啡"}],
+    }
+
+    scoped = video_live._memory_context_for_question(
+        memory_context,
+        "这个是什么？",
+    )
+
+    assert scoped == {"available": True, "scope": "current_frames_only"}
+    assert "瑞幸" not in json.dumps(scoped, ensure_ascii=False)
+
+
+def test_historical_visual_question_keeps_memory() -> None:
+    memory_context = {
+        "available": True,
+        "qa_history": [{"answer": "之前拿着瑞幸咖啡"}],
+    }
+
+    assert video_live._memory_context_for_question(
+        memory_context,
+        "我刚才手里拿的是什么？",
+    ) is memory_context
+
+
 class _MemoryClient:
     api_base = "http://memory"
 
