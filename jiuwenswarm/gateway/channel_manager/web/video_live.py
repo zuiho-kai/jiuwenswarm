@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 from difflib import SequenceMatcher
 import json
 import logging
 import os
 import re
 import time
+import wave
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
@@ -50,10 +52,6 @@ _ALLOWED_AUDIO_MIME_TYPES = (
 _memory_client = None
 _action_protocol_cache: dict[tuple[str, str], bool] = {}
 _recent_voice_transcripts: dict[str, deque[tuple[float, str]]] = {}
-MemorySearch = Callable[
-    [dict[str, object]],
-    Awaitable[dict[str, object]],
-]
 AssistantTool = Callable[
     [dict[str, object]],
     Awaitable[dict[str, object]],
@@ -61,6 +59,7 @@ AssistantTool = Callable[
 ToolStatusSink = Callable[[str], Awaitable[None]]
 TranscriptSink = Callable[[str], Awaitable[bool]]
 VoiceDecisionSink = Callable[[str, str], Awaitable[None]]
+AudioOutputSink = Callable[[str, str], Awaitable[None]]
 
 _TRANSCRIPT_RE = re.compile(
     r"<transcript\s*>\s*(.*?)\s*</transcript\s*>?",
@@ -69,7 +68,7 @@ _TRANSCRIPT_RE = re.compile(
 _ANSWER_OPEN_RE = re.compile(r"<answer\s*>\s*", re.IGNORECASE)
 _ANSWER_CLOSE_RE = re.compile(r"\s*</answer\s*>?", re.IGNORECASE)
 _ROUTE_RE = re.compile(
-    r"<route\s*>\s*(direct|free_search|memory_search|deep_reasoning)\s*</route\s*>?",
+    r"<route\s*>\s*(direct|free_search|deep_reasoning)\s*</route\s*>?",
     re.IGNORECASE,
 )
 _ENTITY_RE = re.compile(
@@ -129,6 +128,18 @@ _NON_VISUAL_IDENTITY_TOPICS = (
     "原理",
     "意思",
 )
+_REFERENTIAL_FOLLOWUP_TERMS = (
+    "这公司",
+    "这家公司",
+    "这个公司",
+    "该公司",
+    "这品牌",
+    "这个品牌",
+    "这个牌子",
+    "该品牌",
+    "它的公司",
+    "它家",
+)
 
 
 def _voice_transcript_key(value: str) -> str:
@@ -138,6 +149,10 @@ def _voice_transcript_key(value: str) -> str:
 def _accept_voice_transcript(session_id: str, transcript: str) -> bool:
     key = _voice_transcript_key(transcript)
     lowered = transcript.strip().lower()
+    short_control_commands = {
+        "停", "停下", "停一下", "暂停", "等等", "等一下",
+        "别说了", "好了", "打住", "闭嘴",
+    }
     short_noise_fragments = {
         "不在", "然后", "这个", "那个", "就是", "好的", "嗯嗯", "啊啊",
         "喂喂", "谢谢", "还好", "可以", "没事", "不知道",
@@ -147,16 +162,32 @@ def _accept_voice_transcript(session_id: str, transcript: str) -> bool:
         or "nospeech" in key
         or "无有效语音" in transcript
         or "没有有效语音" in transcript
-        or len(key) < 2
+        or (len(key) < 4 and key not in short_control_commands)
         or key in short_noise_fragments
     ):
         return False
     now = time.monotonic()
     recent = _recent_voice_transcripts.setdefault(session_id, deque(maxlen=8))
-    while recent and now - recent[0][0] > 12.0:
+    while recent and now - recent[0][0] > 45.0:
         recent.popleft()
-    if any(previous == key for _, previous in recent):
-        return False
+    for _, previous in recent:
+        same_utterance = (
+            previous == key
+            or (
+                min(len(previous), len(key)) >= 6
+                and (
+                    previous in key
+                    or key in previous
+                    or SequenceMatcher(None, previous, key).ratio() >= 0.78
+                )
+            )
+        )
+        if same_utterance:
+            # Refresh suppression while the same acoustic utterance/echo keeps
+            # arriving. Otherwise a looping capture becomes valid again after
+            # the original 12-second entry expires and starts another turn.
+            recent.append((now, key))
+            return False
     recent.append((now, key))
     return True
 
@@ -168,7 +199,14 @@ def _looks_like_assistant_echo(transcript: str, assistant_text: str) -> bool:
         return False
     if transcript_key in assistant_key:
         return True
-    return SequenceMatcher(None, transcript_key, assistant_key).ratio() >= 0.72
+    matcher = SequenceMatcher(None, transcript_key, assistant_key)
+    longest = matcher.find_longest_match(
+        0, len(transcript_key), 0, len(assistant_key)
+    ).size
+    return (
+        matcher.ratio() >= 0.72
+        or longest >= max(4, int(len(transcript_key) * 0.65))
+    )
 
 
 def _is_current_visual_identification(question: str) -> bool:
@@ -198,6 +236,70 @@ def _memory_context_for_question(
         "available": memory_context.get("available", True),
         "scope": "current_frames_only",
     }
+
+
+def _is_referential_followup(question: str) -> bool:
+    normalized = re.sub(r"\s+", "", question.strip().lower())
+    return any(term in normalized for term in _REFERENTIAL_FOLLOWUP_TERMS)
+
+
+def _is_simple_referential_intro(question: str) -> bool:
+    normalized = re.sub(r"\s+", "", question.strip().lower())
+    return (
+        _is_referential_followup(question)
+        and any(term in normalized for term in ("介绍", "说说", "讲讲"))
+        and not any(
+            term in normalized
+            for term in ("最新", "新闻", "股票", "股价", "行情", "来源", "查一下")
+        )
+    )
+
+
+def _latest_interaction_answer(
+    memory_context: dict[str, object] | None,
+) -> str:
+    if not isinstance(memory_context, dict):
+        return ""
+    collections: list[object] = [memory_context.get("qa_history")]
+    current_chunk = memory_context.get("current_chunk")
+    if isinstance(current_chunk, dict):
+        collections.append(current_chunk.get("interactions"))
+    collections.append(memory_context.get("current_interactions"))
+    interactions: list[dict[str, object]] = []
+    for collection in collections:
+        if not isinstance(collection, list):
+            continue
+        interactions.extend(
+            item
+            for item in collection
+            if isinstance(item, dict) and str(item.get("answer") or "").strip()
+        )
+    # A referential brand/company follow-up must bind to the most recent visual
+    # identification, not to a later bad tool answer that may itself be polluted.
+    visual_answers = [
+        str(item.get("answer") or "").strip()
+        for item in interactions
+        if _is_current_visual_identification(str(item.get("question") or ""))
+    ]
+    if visual_answers:
+        return visual_answers[-1]
+    return str(interactions[-1].get("answer") or "").strip() if interactions else ""
+
+
+def _ground_referential_search_query(
+    requested_query: str,
+    question: str,
+    memory_context: dict[str, object] | None,
+) -> str:
+    if not _is_referential_followup(question):
+        return requested_query
+    previous_answer = _latest_interaction_answer(memory_context)
+    if not previous_answer:
+        return requested_query
+    return (
+        f"上一轮识别结果：{previous_answer[:240]} "
+        f"对应品牌和公司 {question}"
+    )
 
 
 def _requires_external_definition_lookup(question: str) -> bool:
@@ -231,7 +333,6 @@ def _should_failover_video_model(exc: Exception) -> bool:
                 "connection error",
                 "returned no action",
                 "returned no choices",
-                "action limit",
             )
         )
     )
@@ -288,41 +389,6 @@ def _normalized_tool_calls(message: Any, round_index: int) -> list[dict[str, str
         )
     return normalized
 
-
-_MEMORY_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "memory_search",
-        "description": (
-            "查询当前视频会话中没有完整出现在中期上下文里的历史事件。"
-            "涉及之前、多久前、什么时候、物品去向或具体剧情时使用。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "start_at": {
-                    "type": "string",
-                    "description": "可选，带时区的 ISO 时间",
-                },
-                "end_at": {
-                    "type": "string",
-                    "description": "可选，带时区的 ISO 时间",
-                },
-                "entities": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "top_k": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-}
 
 _RESPOND_TOOL = {
     "type": "function",
@@ -508,31 +574,46 @@ def _compact_memory_context(
         if isinstance(current_chunk, dict)
         else []
     )
+
+    def _text(value: object, limit: int) -> str:
+        return str(value or "").strip()[:limit]
+
+    def _interaction(item: dict[str, object]) -> dict[str, object]:
+        # Evidence/observation ID arrays stay in OmniMemory. Injecting thousands
+        # of IDs wastes context and contributes no semantic information.
+        return {
+            "id": item.get("id"),
+            "question": _text(item.get("question"), 800),
+            "answer": _text(item.get("answer"), 1_600),
+            "asked_at": item.get("asked_at"),
+            "model": item.get("model"),
+        }
+
     return {
         "available": memory_context.get("available", True),
         "long_term_memory": {
-            "summary": long_term.get("summary", "")
+            "summary": _text(long_term.get("summary", ""), 4_000)
             if isinstance(long_term, dict)
             else "",
         },
         "mid_term_memories": [
             {
                 "id": item.get("id"),
-                "summary": item.get("summary", ""),
+                "summary": _text(item.get("summary", ""), 1_200),
                 "started_at": item.get("started_at"),
                 "ended_at": item.get("ended_at"),
             }
-            for item in (mid_term if isinstance(mid_term, list) else [])[-20:]
+            for item in (mid_term if isinstance(mid_term, list) else [])[-12:]
             if isinstance(item, dict)
         ],
         "qa_history": [
-            item
-            for item in (qa_history if isinstance(qa_history, list) else [])[-10:]
+            _interaction(item)
+            for item in (qa_history if isinstance(qa_history, list) else [])[-8:]
             if isinstance(item, dict)
         ],
         "current_interactions": [
-            item
-            for item in (interactions if isinstance(interactions, list) else [])[-10:]
+            _interaction(item)
+            for item in (interactions if isinstance(interactions, list) else [])[-6:]
             if isinstance(item, dict)
         ],
     }
@@ -595,8 +676,83 @@ def _usable_tts_config(value: str) -> bool:
     )
 
 
+def _native_audio_output_enabled() -> bool:
+    return os.environ.get("VIDEO_NATIVE_AUDIO_OUTPUT", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _merge_wav_payloads(encoded_parts: list[str]) -> str:
+    if not encoded_parts:
+        return ""
+    if len(encoded_parts) == 1:
+        return encoded_parts[0]
+    try:
+        frames: list[bytes] = []
+        expected: tuple[int, int, int, str] | None = None
+        for encoded in encoded_parts:
+            with wave.open(io.BytesIO(base64.b64decode(encoded)), "rb") as source:
+                current = (
+                    source.getnchannels(),
+                    source.getsampwidth(),
+                    source.getframerate(),
+                    source.getcomptype(),
+                )
+                if expected is None:
+                    expected = current
+                elif current != expected:
+                    raise ValueError("WAV segments use different formats")
+                frames.append(source.readframes(source.getnframes()))
+        assert expected is not None
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(expected[0])
+            target.setsampwidth(expected[1])
+            target.setframerate(expected[2])
+            target.setcomptype(expected[3], "not compressed")
+            target.writeframes(b"".join(frames))
+        return base64.b64encode(output.getvalue()).decode()
+    except (ValueError, EOFError, wave.Error, base64.binascii.Error):
+        logger.warning("failed to merge native WAV segments", exc_info=True)
+        return encoded_parts[0]
+
+
+def _split_embedded_wav(value: str) -> tuple[str, str]:
+    """Remove and merge WAV payloads that an Omni server mixed into text."""
+    cursor = 0
+    text_parts: list[str] = []
+    encoded_parts: list[str] = []
+    while True:
+        marker = value.find("UklGR", cursor)
+        if marker < 0:
+            text_parts.append(value[cursor:])
+            break
+        text_parts.append(value[cursor:marker])
+        try:
+            header = base64.b64decode(value[marker:marker + 16], validate=True)
+            if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+                raise ValueError("invalid WAV header")
+            audio_bytes = int.from_bytes(header[4:8], "little") + 8
+            encoded_chars = ((audio_bytes + 2) // 3) * 4
+            encoded = value[marker:marker + encoded_chars]
+            decoded = base64.b64decode(encoded, validate=True)
+            if len(decoded) != audio_bytes:
+                raise ValueError("truncated WAV payload")
+        except (ValueError, base64.binascii.Error):
+            text_parts.append(value[marker:])
+            break
+        encoded_parts.append(encoded)
+        cursor = marker + encoded_chars
+    if not encoded_parts:
+        return value, ""
+    return "".join(text_parts), _merge_wav_payloads(encoded_parts)
+
+
 def _tts_model_config() -> tuple[str, str, str, str]:
-    """Resolve TTS config, reusing the Omni endpoint credentials when unset."""
+    """Resolve TTS independently so switching Omni cannot break speech."""
     audio_base, audio_key, audio_model = _configured_audio_model()
     omni_base, omni_key, _ = _omni_model_config()
     explicit_model = os.environ.get("TTS_MODEL_NAME", "").strip()
@@ -612,14 +768,22 @@ def _tts_model_config() -> tuple[str, str, str, str]:
         else "FunAudioLLM/CosyVoice2-0.5B"
     )
     api_base = (
-        audio_base
+        os.environ.get("TTS_API_BASE", "").strip()
+        or audio_base
         if audio_is_tts and _usable_tts_config(audio_base)
-        else omni_base
+        else os.environ.get("TTS_API_BASE", "").strip()
+        or os.environ.get("ASR_API_BASE", "").strip()
+        or os.environ.get("VISION_API_BASE", "").strip()
+        or omni_base
     )
     api_key = (
-        audio_key
+        os.environ.get("TTS_API_KEY", "").strip()
+        or audio_key
         if audio_is_tts and _usable_tts_config(audio_key)
-        else omni_key
+        else os.environ.get("TTS_API_KEY", "").strip()
+        or os.environ.get("ASR_API_KEY", "").strip()
+        or os.environ.get("VISION_API_KEY", "").strip()
+        or omni_key
     )
     voice = os.environ.get("TTS_VOICE", "").strip()
     if not voice:
@@ -660,6 +824,66 @@ async def _synthesize_speech(text: str) -> tuple[bytes, str, str]:
     return response.content, "audio/mpeg", model
 
 
+async def _synthesize_omni_native_speech(text: str) -> tuple[str, str]:
+    """Ask Omni to speak only the final answer, without routing protocol tags."""
+    from openai import AsyncOpenAI
+
+    api_base, api_key, model = _omni_model_config()
+    if not _native_audio_output_enabled() or "omni" not in model.casefold():
+        raise RuntimeError("Omni native audio is disabled")
+    client = AsyncOpenAI(
+        api_key=api_key or "EMPTY",
+        base_url=api_base,
+        timeout=45.0,
+        max_retries=0,
+    )
+    try:
+        streamed = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是中文语音播报器。只朗读用户提供的正文，"
+                        "不解释，不添加前后缀。"
+                    ),
+                },
+                {"role": "user", "content": text[:_MAX_TTS_TEXT_CHARS]},
+            ],
+            max_tokens=768,
+            temperature=0.1,
+            stream=True,
+            modalities=["text", "audio"],
+        )
+        raw_output = ""
+        structured_audio_parts: list[str] = []
+        async for chunk in streamed:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if isinstance(delta.content, str):
+                raw_output += delta.content
+            audio_delta = getattr(delta, "audio", None)
+            audio_data = (
+                audio_delta.get("data")
+                if isinstance(audio_delta, dict)
+                else getattr(audio_delta, "data", None)
+            )
+            if isinstance(audio_data, str) and audio_data:
+                structured_audio_parts.append(audio_data)
+        _, embedded_audio = _split_embedded_wav(raw_output)
+        audio_base64 = (
+            _merge_wav_payloads(structured_audio_parts)
+            if structured_audio_parts
+            else embedded_audio
+        )
+        if not audio_base64:
+            raise RuntimeError("Omni native audio returned no WAV")
+        return audio_base64, "audio/wav"
+    finally:
+        await client.close()
+
+
 def _omni_model_config() -> tuple[str, str, str]:
     configured_base, configured_key, configured_model = _configured_video_model()
     api_base = (
@@ -687,8 +911,16 @@ def _omni_model_config() -> tuple[str, str, str]:
 
 def _asr_model_config() -> tuple[str, str, str]:
     video_base, video_key, _ = _omni_model_config()
-    api_base = (os.environ.get("ASR_API_BASE") or video_base).strip().rstrip("/")
-    api_key = (os.environ.get("ASR_API_KEY") or video_key).strip()
+    api_base = (
+        os.environ.get("ASR_API_BASE")
+        or os.environ.get("VISION_API_BASE")
+        or video_base
+    ).strip().rstrip("/")
+    api_key = (
+        os.environ.get("ASR_API_KEY")
+        or os.environ.get("VISION_API_KEY")
+        or video_key
+    ).strip()
     model = (
         os.environ.get("ASR_MODEL_NAME")
         or "FunAudioLLM/SenseVoiceSmall"
@@ -697,7 +929,17 @@ def _asr_model_config() -> tuple[str, str, str]:
 
 
 def _fallback_video_model_config() -> tuple[str, str, str]:
-    api_base, api_key, _ = _omni_model_config()
+    primary_base, primary_key, _ = _omni_model_config()
+    api_base = (
+        os.environ.get("VIDEO_FALLBACK_API_BASE")
+        or os.environ.get("VISION_API_BASE")
+        or primary_base
+    ).strip().rstrip("/")
+    api_key = (
+        os.environ.get("VIDEO_FALLBACK_API_KEY")
+        or os.environ.get("VISION_API_KEY")
+        or primary_key
+    ).strip()
     model = (
         os.environ.get("VIDEO_FALLBACK_MODEL_NAME")
         or "Qwen/Qwen3-VL-8B-Instruct"
@@ -746,7 +988,17 @@ async def _transcribe_audio_inputs(
 
 
 def _video_tool_model_config() -> tuple[str, str, str]:
-    api_base, api_key, _ = _omni_model_config()
+    omni_base, omni_key, _ = _omni_model_config()
+    api_base = (
+        os.environ.get("VIDEO_TOOL_API_BASE")
+        or os.environ.get("VISION_API_BASE")
+        or omni_base
+    ).strip().rstrip("/")
+    api_key = (
+        os.environ.get("VIDEO_TOOL_API_KEY")
+        or os.environ.get("VISION_API_KEY")
+        or omni_key
+    ).strip()
     model = (
         os.environ.get("VIDEO_TOOL_MODEL_NAME")
         or "Qwen/Qwen3.5-9B"
@@ -760,10 +1012,15 @@ def _deep_reasoning_model_config() -> tuple[str, str, str] | None:
         return None
     omni_base, omni_key, _ = _omni_model_config()
     api_base = (
-        os.environ.get("REASONING_API_BASE") or omni_base
+        os.environ.get("REASONING_API_BASE")
+        or os.environ.get("VISION_API_BASE")
+        or omni_base
     ).strip().rstrip("/")
     api_key = (
-        os.environ.get("REASONING_API_KEY") or omni_key or "EMPTY"
+        os.environ.get("REASONING_API_KEY")
+        or os.environ.get("VISION_API_KEY")
+        or omni_key
+        or "EMPTY"
     ).strip()
     model = (
         os.environ.get("REASONING_MODEL_NAME")
@@ -1453,6 +1710,59 @@ async def _answer_from_search_results(
         await client.close()
 
 
+async def _answer_simple_referential_intro(
+    question: str,
+    previous_answer: str,
+) -> str:
+    """Fast demo path: keep the previous entity and avoid a slow search chain."""
+    from openai import AsyncOpenAI
+
+    api_base, api_key, model = _omni_model_config()
+    client = AsyncOpenAI(
+        api_key=api_key or "EMPTY",
+        base_url=api_base,
+        timeout=12.0,
+        max_retries=0,
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是实时助手。上一轮回答已经确定了实体。"
+                        "必须沿用该实体，直接用中文简短回答，不看新画面，"
+                        "不调用工具，不替换成其他公司或品牌。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"上一轮回答：{previous_answer[:500]}\n"
+                        f"本轮问题：{question}"
+                    ),
+                },
+            ],
+            max_tokens=300,
+            temperature=0.1,
+            stream=False,
+            modalities=["text"],
+        )
+        if not response.choices:
+            raise RuntimeError("referential intro returned no choices")
+        message = response.choices[0].message
+        answer = message.content or getattr(message, "reasoning_content", None)
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError("referential intro returned no content")
+        return answer.strip()
+    except Exception:
+        logger.exception("Fast referential introduction failed")
+        return f"上一轮识别结果是：{previous_answer[:300]}"
+    finally:
+        await client.close()
+
+
 async def _run_translation_action(
     target_language: str,
     frames: list[dict[str, object]],
@@ -1578,11 +1888,11 @@ async def _stream_qwen_omni(
     audio_inputs: list[tuple[str, str]],
     *,
     memory_context: dict[str, object] | None = None,
-    memory_search: MemorySearch | None = None,
     free_search: AssistantTool | None = None,
     deep_reasoning: AssistantTool | None = None,
     transcript_sink: TranscriptSink | None = None,
     voice_decision_sink: VoiceDecisionSink | None = None,
+    audio_output_sink: AudioOutputSink | None = None,
     model_config: tuple[str, str, str] | None = None,
 ) -> AsyncIterator[str]:
     from openai import AsyncOpenAI
@@ -1607,6 +1917,14 @@ async def _stream_qwen_omni(
     current_visual_identification = _is_current_visual_identification(question)
     scoped_memory_context = _memory_context_for_question(memory_context, question)
     context_payload = _compact_memory_context(scoped_memory_context)
+    previous_answer = _latest_interaction_answer(memory_context)
+    referential_anchor = ""
+    if previous_answer and _is_referential_followup(question):
+        referential_anchor = (
+            "\n本轮存在指代，必须绑定上一轮助手回答中的实体："
+            f"{previous_answer[:400]}。free_search 查询词必须包含该实体，"
+            "不得替换成其他公司或品牌。"
+        )
     if current_visual_identification:
         # The newest frames are authoritative for "what is this". Older frames
         # in the rolling request can still show the previously held object.
@@ -1617,8 +1935,8 @@ async def _stream_qwen_omni(
         "current_chunk 和 qa_history。长期和中期内容可能是有损摘要。"
         "每轮选择一个动作：信息足够时直接输出回答；没有有效问题或"
         "无需回应时调用 silent；需要补充信息时调用合适的工具。"
-        "历史细节用 memory_search，外部资料用 free_search，复杂多步判断"
-        "可用 deep_reasoning。工具结果会再次交给你，由你继续选择动作。"
+        "外部资料用 free_search，复杂多步判断可用 deep_reasoning。"
+        "工具结果会再次交给你，由你继续选择动作。"
         "deep_reasoning 是可自行搜索的 DSV3.2 子 Agent，适合需要多步研究"
         "的问题；一次搜索即可解决的事实问题直接用 free_search。凡是多项约束"
         "规划、实验设计、带权重决策、因果判断、证据冲突或不确定性分析，必须"
@@ -1633,6 +1951,7 @@ async def _stream_qwen_omni(
         "结果，禁止从截图或模型记忆补全。搜索结果也可能错误或把同名作品混为"
         "一谈；优先采用官网、作者页、Steam等一手来源，来源冲突时明确说明，"
         "不要把互相矛盾的设定拼成一个答案。"
+        f"{referential_anchor}"
         f"\nMemory Context:\n{json.dumps(context_payload, ensure_ascii=False)}"
     )
     content: list[dict[str, Any]] = [
@@ -1662,11 +1981,10 @@ async def _stream_qwen_omni(
             "text": question or (
                 "只转写标记为‘用户麦克风提问’的音频，然后回答这个问题。"
                 "必须严格输出：<transcript>逐字转写</transcript>"
-                "<route>direct或free_search或memory_search或deep_reasoning</route>"
+                "<route>direct或free_search或deep_reasoning</route>"
                 "<entity>当前画面的主要实体</entity><answer>回答</answer>。"
                 "识别、描述当前画面用direct；品牌介绍、公司资料、价格、"
-                "新闻或最新信息用free_search；询问刚才、之前、多久前、"
-                "什么时候或物品去向用memory_search。"
+                "新闻或最新信息用free_search；复杂研究用deep_reasoning。"
                 "如果没有清晰、完整的人声问题，"
                 "包括呼吸、吸鼻、咳嗽、哭声、环境声或零碎词语，输出"
                 "<transcript>NO_SPEECH</transcript><route>direct</route>"
@@ -1694,8 +2012,18 @@ async def _stream_qwen_omni(
             "temperature": 0.2,
             "stream": False,
         }
+        if not audio_inputs and model.casefold() == "qwen3-omni":
+            # This server otherwise returns an audio-only message after a tool
+            # result, leaving message.content empty and triggering failover.
+            request["modalities"] = ["text"]
         if audio_inputs:
-            audio_request = {**request, "stream": True}
+            audio_request = {
+                **request,
+                "stream": True,
+                # Routing markup must never enter the native speech channel.
+                # The final plain answer is spoken in a separate request.
+                "modalities": ["text"],
+            }
             streamed = await client.chat.completions.create(
                 **audio_request,
             )
@@ -1703,14 +2031,22 @@ async def _stream_qwen_omni(
             transcript_processed = False
             transcript_accepted = True
             decision_processed = False
-            emitted_answer_chars = 0
-            closing_tag_guard = len("</answer>") + 2
+            selected_route: str | None = None
+            structured_audio_parts: list[str] = []
             async for chunk in streamed:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta.content
                 if isinstance(delta, str) and delta:
                     raw_output += delta
+                audio_delta = getattr(chunk.choices[0].delta, "audio", None)
+                audio_data = (
+                    audio_delta.get("data")
+                    if isinstance(audio_delta, dict)
+                    else getattr(audio_delta, "data", None)
+                )
+                if isinstance(audio_data, str) and audio_data:
+                    structured_audio_parts.append(audio_data)
                 if not transcript_processed:
                     transcript_match = _TRANSCRIPT_RE.search(raw_output)
                     if transcript_match is not None:
@@ -1729,46 +2065,31 @@ async def _stream_qwen_omni(
                         or _ANSWER_OPEN_RE.search(raw_output) is not None
                     ):
                         decision_processed = True
+                        selected_route = route_match.group(1).lower()
                         if voice_decision_sink is not None:
                             await voice_decision_sink(
-                                route_match.group(1).lower(),
+                                selected_route,
                                 entity_match.group(1).strip()
                                 if entity_match is not None
                                 else "",
                             )
-                if transcript_processed:
-                    answer_open = _ANSWER_OPEN_RE.search(raw_output)
-                    if answer_open is None:
-                        continue
-                    answer_close = _ANSWER_CLOSE_RE.search(
-                        raw_output,
-                        answer_open.end(),
-                    )
-                    answer_text = raw_output[
-                        answer_open.end():
-                        answer_close.start() if answer_close else len(raw_output)
-                    ]
-                    safe_length = (
-                        len(answer_text)
-                        if answer_close
-                        else max(0, len(answer_text) - closing_tag_guard)
-                    )
-                    if safe_length > emitted_answer_chars:
-                        yield answer_text[emitted_answer_chars:safe_length]
-                        emitted_answer_chars = safe_length
+            raw_output, audio_base64 = _split_embedded_wav(raw_output)
+            if structured_audio_parts:
+                audio_base64 = _merge_wav_payloads(structured_audio_parts)
             if transcript_processed:
                 if not decision_processed and voice_decision_sink is not None:
                     route_match = _ROUTE_RE.search(raw_output)
                     entity_match = _ENTITY_RE.search(raw_output)
                     if route_match is not None:
+                        selected_route = route_match.group(1).lower()
                         await voice_decision_sink(
-                            route_match.group(1).lower(),
+                            selected_route,
                             entity_match.group(1).strip()
                             if entity_match is not None
                             else "",
                         )
                 answer_open = _ANSWER_OPEN_RE.search(raw_output)
-                if answer_open is not None:
+                if answer_open is not None and selected_route in {None, "direct"}:
                     answer_close = _ANSWER_CLOSE_RE.search(
                         raw_output,
                         answer_open.end(),
@@ -1783,8 +2104,8 @@ async def _stream_qwen_omni(
                         final_answer,
                         flags=re.IGNORECASE,
                     )
-                    if len(final_answer) > emitted_answer_chars:
-                        yield final_answer[emitted_answer_chars:]
+                    if final_answer:
+                        yield final_answer
                 return
             if not transcript_processed:
                 # Compatibility fallback for providers that ignore the tag protocol.
@@ -1807,12 +2128,31 @@ async def _stream_qwen_omni(
                 raise RuntimeError(f"{model} returned no action")
             yield answer.strip()
             return
+        if "joyai" in model.casefold():
+            # The JoyAI vLLM deployment intentionally exposes the interaction
+            # model without vLLM's OpenAI auto-tool parser. Sending `tools` +
+            # `tool_choice=auto` therefore returns HTTP 400 before inference.
+            # JoyAI still handles the injected memory, frames and question;
+            # external lookup routes above remain available deterministically.
+            response = await client.chat.completions.create(
+                **{
+                    **request,
+                    "max_tokens": 768,
+                    "stream": False,
+                }
+            )
+            if not response.choices:
+                raise RuntimeError(f"{model} returned no choices")
+            message = response.choices[0].message
+            answer = message.content or getattr(
+                message, "reasoning_content", None
+            )
+            if isinstance(answer, str) and answer.strip():
+                yield answer.strip()
+            return
         request["max_tokens"] = 768
         tools = [_RESPOND_TOOL, _SILENT_TOOL]
         runners: dict[str, AssistantTool] = {}
-        if memory_search is not None and not current_visual_identification:
-            tools.append(_MEMORY_SEARCH_TOOL)
-            runners["memory_search"] = memory_search
         if free_search is not None:
             tools.append(_FREE_SEARCH_TOOL)
             runners["free_search"] = free_search
@@ -1836,6 +2176,12 @@ async def _stream_qwen_omni(
                 raise RuntimeError(f"{model} returned no choices")
             message = response.choices[0].message
             tool_calls = _normalized_tool_calls(message, _round)
+            logger.info(
+                "Omni action round=%s model=%s actions=%s",
+                _round + 1,
+                model,
+                [tool_call["name"] for tool_call in tool_calls],
+            )
             if not tool_calls:
                 answer = message.content
                 reasoning_content = getattr(
@@ -1916,7 +2262,30 @@ async def _stream_qwen_omni(
                 }
             )
             messages.extend(tool_results)
-        raise RuntimeError(f"{model} exceeded the 3-round action limit")
+        # Some compatible servers keep repeating the same cached tool call.
+        # This is an action-protocol issue, not model unavailability. Force a
+        # plain final answer from the accumulated tool evidence.
+        final_response = await client.chat.completions.create(
+            **{
+                **request,
+                "messages": messages + [{
+                    "role": "system",
+                    "content": "工具阶段已结束。根据已有工具结果直接回答用户，不再调用工具。",
+                }],
+                "stream": False,
+            }
+        )
+        if not final_response.choices:
+            raise RuntimeError(f"{model} returned no final choices")
+        final_message = final_response.choices[0].message
+        final_answer = final_message.content or getattr(
+            final_message,
+            "reasoning_content",
+            None,
+        )
+        if not isinstance(final_answer, str) or not final_answer.strip():
+            raise RuntimeError(f"{model} returned no final answer")
+        yield final_answer.strip()
     finally:
         await client.close()
 
@@ -1931,7 +2300,7 @@ async def _stream_video_answer(
 ) -> AsyncIterator[str]:
     primary_config = _omni_model_config()
     wrapped_options = dict(options)
-    for option_name in ("memory_search", "free_search", "deep_reasoning"):
+    for option_name in ("free_search", "deep_reasoning"):
         tool = wrapped_options.get(option_name)
         if not callable(tool):
             continue
@@ -1951,6 +2320,26 @@ async def _stream_video_answer(
         wrapped_options[option_name] = _cached_tool
 
     free_search = wrapped_options.get("free_search")
+    memory_context = wrapped_options.get("memory_context")
+    previous_answer = _latest_interaction_answer(
+        memory_context if isinstance(memory_context, dict) else None
+    )
+    if previous_answer and _is_simple_referential_intro(question):
+        yield await _answer_simple_referential_intro(question, previous_answer)
+        return
+    if callable(free_search) and _is_referential_followup(question):
+        grounded_query = _ground_referential_search_query(
+            question,
+            question,
+            memory_context if isinstance(memory_context, dict) else None,
+        )
+        if grounded_query != question:
+            lookup_result = await free_search({"query": grounded_query})
+            yield await _answer_from_search_results(
+                grounded_query,
+                lookup_result,
+            )
+            return
     if (
         callable(free_search)
         and _requires_external_definition_lookup(question)
@@ -2055,6 +2444,53 @@ def register_video_live_handler(channel: Any) -> None:
                 "audio_mime": mime,
                 "model": model,
             },
+        )
+
+    async def _video_transcribe(ws, req_id, params, session_id):
+        try:
+            _, _, audio_inputs = _normalize_request(params)
+        except ValueError as exc:
+            await channel.send_response(
+                ws, req_id, ok=False, error=str(exc), code="BAD_REQUEST"
+            )
+            return
+        microphone_inputs = [
+            item for item in audio_inputs if item[1] == "用户麦克风提问"
+        ]
+        try:
+            transcript = await _transcribe_audio_inputs(microphone_inputs)
+        except Exception as exc:  # noqa: BLE001
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error=str(exc).strip() or "ASR verification failed",
+                code="ASR_ERROR",
+            )
+            return
+        accepted = _accept_voice_transcript(session_id, transcript)
+        assistant_text = (
+            str(params.get("assistant_speech_text") or "").strip()
+            if isinstance(params, dict)
+            else ""
+        )
+        is_echo = accepted and _looks_like_assistant_echo(
+            transcript, assistant_text
+        )
+        if is_echo:
+            accepted = False
+        logger.info(
+            "Voice transcription session=%s accepted=%s echo=%s transcript=%r",
+            session_id,
+            accepted,
+            is_echo,
+            transcript[:160],
+        )
+        await channel.send_response(
+            ws,
+            req_id,
+            ok=True,
+            payload={"transcript": transcript, "accepted": accepted},
         )
 
     def schedule_memory_ingest(
@@ -2572,11 +3008,56 @@ def register_video_live_handler(channel: Any) -> None:
         answer_parts: list[str] = []
         voice_transcript: str | None = None
         voice_accepted = True
+        voice_route: str | None = None
+        voice_entity = ""
+        native_audio_emitted = False
+        prefer_native_audio = any(
+            source_label == "用户麦克风提问"
+            for _, source_label in audio_inputs
+        ) or bool(isinstance(params, dict) and params.get("voice_question"))
+        verified_voice_question = bool(
+            isinstance(params, dict) and params.get("voice_question")
+        )
+        if verified_voice_question:
+            voice_transcript = question
+        verified_voice_transcript: str | None = None
+        if prefer_native_audio and audio_inputs:
+            microphone_inputs = [
+                item
+                for item in audio_inputs
+                if item[1] == "用户麦克风提问"
+            ]
+            try:
+                verified_voice_transcript = await _transcribe_audio_inputs(
+                    microphone_inputs
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("voice ASR verification failed", exc_info=True)
+                verified_voice_transcript = ""
+            voice_transcript = verified_voice_transcript.strip()
+            voice_accepted = _accept_voice_transcript(
+                session_id,
+                voice_transcript,
+            )
+            assistant_speech_text = (
+                str(params.get("assistant_speech_text") or "").strip()
+                if isinstance(params, dict)
+                else ""
+            )
+            if voice_accepted and _looks_like_assistant_echo(
+                voice_transcript,
+                assistant_speech_text,
+            ):
+                voice_accepted = False
+            if voice_accepted:
+                # Dedicated ASR is authoritative. Omni receives clean text plus
+                # current frames, preventing audio hallucinations from becoming turns.
+                question = voice_transcript
+            audio_inputs = []
         sequence = 0
         _, _, model = _omni_model_config()
         memory_client = _omnimemory_client()
         memory_context: dict[str, object] | None = None
-        memory_search: MemorySearch | None = None
         memory_trace: dict[str, object] = {}
         latest_external_evidence = ""
         if memory_client is not None:
@@ -2588,64 +3069,17 @@ def register_video_live_handler(channel: Any) -> None:
                     "error": str(exc).strip() or "memory context failed",
                 }
 
-            async def _search(arguments: dict[str, object]):
-                tool_record: dict[str, object] = {
-                    "name": "memory_search",
-                    "arguments": arguments,
-                    "result_memory_ids": [],
-                    "result_summaries": [],
-                    "evidence": [],
-                    "error": None,
-                }
-                memory_trace.setdefault("tool_calls", []).append(
-                    tool_record
-                )
-                try:
-                    await channel.send_event(
-                        ws,
-                        "video.tool_status",
-                        {
-                            "request_id": req_id,
-                            "status": "正在查询历史记忆：memory_search",
-                        },
-                        stream_id=req_id,
-                    )
-                    result = await memory_client.search(
-                        session_id,
-                        arguments,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    tool_record["error"] = (
-                        str(exc).strip() or "memory search failed"
-                    )
-                    raise
-                memories = result.get("memories")
-                if isinstance(memories, list):
-                    tool_record["result_memory_ids"] = [
-                        memory.get("id")
-                        for memory in memories
-                        if isinstance(memory, dict)
-                        and isinstance(memory.get("id"), str)
-                    ]
-                    tool_record["result_summaries"] = [
-                        memory.get("summary")
-                        for memory in memories
-                        if isinstance(memory, dict)
-                        and isinstance(memory.get("summary"), str)
-                    ]
-                evidence = result.get("evidence")
-                if isinstance(evidence, list):
-                    tool_record["evidence"] = evidence
-                memory_trace["search_result"] = result
-                return result
-
-            memory_search = _search
-
         async def _free_search(arguments: dict[str, object]):
             nonlocal latest_external_evidence
-            query = str(arguments.get("query") or "").strip()
-            if not query:
+            requested_query = str(arguments.get("query") or "").strip()
+            if not requested_query:
                 return {"error": "free_search requires query"}
+            active_question = voice_transcript or question
+            query = _ground_referential_search_query(
+                requested_query,
+                active_question,
+                memory_context,
+            )
             await channel.send_event(
                 ws,
                 "video.tool_status",
@@ -2662,6 +3096,8 @@ def register_video_live_handler(channel: Any) -> None:
                 "arguments": {"query": query},
                 "result_summary": result_text[:2_000],
             }
+            if query != requested_query:
+                record["requested_query"] = requested_query
             if result_text.startswith("[ERROR]"):
                 record["error"] = result_text[:2_000]
             memory_trace.setdefault("tool_calls", []).append(record)
@@ -2725,6 +3161,34 @@ def register_video_live_handler(channel: Any) -> None:
                 {"request_id": req_id, "model": model},
                 stream_id=req_id,
             )
+            if verified_voice_transcript is not None:
+                await channel.send_event(
+                    ws,
+                    "video.transcript",
+                    {
+                        "request_id": req_id,
+                        "text": voice_transcript if voice_accepted else "",
+                        "accepted": voice_accepted,
+                    },
+                    stream_id=req_id,
+                )
+                if not voice_accepted:
+                    await channel.send_response(
+                        ws,
+                        req_id,
+                        ok=True,
+                        payload={
+                            "answer": "",
+                            "transcript": voice_transcript,
+                            "ignored": True,
+                            "model": model,
+                            "latency_ms": round(
+                                (time.perf_counter() - started_at) * 1000
+                            ),
+                            "native_audio_emitted": False,
+                        },
+                    )
+                    return
 
             async def _emit_answer_delta(delta: str) -> None:
                 nonlocal first_token_ms, sequence
@@ -2771,11 +3235,34 @@ def register_video_live_handler(channel: Any) -> None:
                 )
                 return voice_accepted
 
+            async def _on_voice_decision(route: str, entity: str) -> None:
+                nonlocal voice_route, voice_entity
+                voice_route = route
+                voice_entity = entity
+
+            async def _on_audio_output(audio_base64: str, mime: str) -> None:
+                nonlocal native_audio_emitted
+                if not prefer_native_audio or not audio_base64:
+                    return
+                native_audio_emitted = True
+                await channel.send_event(
+                    ws,
+                    "video.audio",
+                    {
+                        "request_id": req_id,
+                        "audio_base64": audio_base64,
+                        "audio_mime": mime,
+                    },
+                    stream_id=req_id,
+                )
+
             stream_options: dict[str, object] = {
                 "memory_context": memory_context,
-                "memory_search": memory_search,
                 "free_search": _free_search,
                 "deep_reasoning": deep_reasoning,
+                "transcript_sink": _on_transcript,
+                "voice_decision_sink": _on_voice_decision,
+                "audio_output_sink": _on_audio_output,
             }
 
             async def _on_model_fallback(status: str) -> None:
@@ -2788,29 +3275,43 @@ def register_video_live_handler(channel: Any) -> None:
                     stream_id=req_id,
                 )
 
-            model_question = question
-            if audio_inputs:
-                # Qwen3-VL must never receive audio_url. Microphone and shared
-                # media audio are always converted to text first.
-                transcript = await _transcribe_audio_inputs(audio_inputs)
-                if question and transcript:
-                    model_question = (
-                        f"{question}\n\n当前音频转写：{transcript}"
-                    )
-                elif not question:
-                    await _on_transcript(transcript or "NO_SPEECH")
-                    model_question = (
-                        voice_transcript
-                        if voice_accepted and voice_transcript
-                        else ""
-                    )
-            if model_question:
+            if question or audio_inputs:
                 async for delta in _stream_video_answer(
-                    model_question,
+                    question,
+                    frames,
+                    audio_inputs,
+                    fallback_status_sink=_on_model_fallback,
+                    **stream_options,
+                ):
+                    await _emit_answer_delta(delta)
+            if (
+                audio_inputs
+                and voice_accepted
+                and voice_transcript
+                and voice_route in {
+                    "free_search",
+                    "deep_reasoning",
+                }
+            ):
+                routed_question = (
+                    f"用户语音转写：{voice_transcript}\n"
+                    f"当前画面实体：{voice_entity or '未确认'}\n"
+                    f"请先调用 {voice_route} 工具取得证据，再回答用户。"
+                )
+                async for delta in _stream_video_answer(
+                    routed_question,
                     frames,
                     [],
                     fallback_status_sink=_on_model_fallback,
-                    **stream_options,
+                    **{
+                        key: value
+                        for key, value in stream_options.items()
+                        if key not in {
+                            "transcript_sink",
+                            "voice_decision_sink",
+                            "audio_output_sink",
+                        }
+                    },
                 ):
                     await _emit_answer_delta(delta)
         except Exception as exc:  # noqa: BLE001
@@ -2842,9 +3343,24 @@ def register_video_live_handler(channel: Any) -> None:
                     "model": model,
                     "latency_ms": round((time.perf_counter() - started_at) * 1000),
                     "first_token_ms": first_token_ms,
+                    "native_audio_emitted": native_audio_emitted,
                 },
             )
             return
+
+        if (
+            prefer_native_audio
+            and not native_audio_emitted
+            and "omni" in model.casefold()
+        ):
+            try:
+                audio_base64, audio_mime = await _synthesize_omni_native_speech(
+                    answer
+                )
+                await _on_audio_output(audio_base64, audio_mime)
+            except Exception:  # noqa: BLE001
+                # The frontend falls back to configured TTS when this remains false.
+                logger.warning("Omni native speech failed; using TTS fallback", exc_info=True)
 
         writeback: dict[str, object] | None = None
         if memory_client is not None:
@@ -2928,11 +3444,11 @@ def register_video_live_handler(channel: Any) -> None:
                 "frame_count": len(frames),
                 "has_audio": bool(audio_inputs),
                 "audio_count": len(audio_inputs),
+                "native_audio_emitted": native_audio_emitted,
                 "memory_context_loaded": (
                     memory_context is not None
                     and memory_context.get("available") is not False
                 ),
-                "memory_search_result": memory_trace.get("search_result"),
                 "memory_writeback": writeback,
             },
         )
@@ -2948,4 +3464,5 @@ def register_video_live_handler(channel: Any) -> None:
     )
     channel.register_method("video.external.ask", _video_external_ask)
     channel.register_method("video.ask", _video_ask)
+    channel.register_method("video.transcribe", _video_transcribe)
     channel.register_method("tts.synthesize", _tts_synthesize)

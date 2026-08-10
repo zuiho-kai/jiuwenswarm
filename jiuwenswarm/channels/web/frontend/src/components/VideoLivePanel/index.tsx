@@ -7,7 +7,7 @@ import { MarkdownRenderer } from '../MarkdownRenderer';
 import './VideoLivePanel.css';
 
 type VideoSource = 'camera' | 'file' | 'screen' | null;
-type AbortReason = 'manual' | 'timeout' | 'source';
+type AbortReason = 'manual' | 'timeout' | 'source' | 'barge-in';
 
 interface CapturedFrame {
   client_frame_id: string;
@@ -48,6 +48,7 @@ interface VideoAskResponse {
   latency_ms?: number;
   first_token_ms?: number;
   model?: string;
+  native_audio_emitted?: boolean;
 }
 
 interface ConversationTurn {
@@ -158,6 +159,7 @@ export function VideoLivePanel() {
   const ttsGenerationRef = useRef(0);
   const ttsBufferRef = useRef('');
   const streamedAnswerRef = useRef('');
+  const nativeAudioExpectedRef = useRef(false);
   const assistantSpeechTextRef = useRef('');
   const ttsAbortControllersRef = useRef<Set<AbortController>>(new Set());
 
@@ -172,7 +174,7 @@ export function VideoLivePanel() {
   const [isAsking, setIsAsking] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [firstTokenMs, setFirstTokenMs] = useState<number | null>(null);
-  const [model, setModel] = useState('Qwen3-Omni');
+  const [model, setModel] = useState('等待首次请求');
   const [requestCount, setRequestCount] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
@@ -238,6 +240,25 @@ export function VideoLivePanel() {
     ttsQueueRef.current = Promise.resolve();
     setIsSpeaking(false);
   }, []);
+
+  const pauseSpeechPlayback = useCallback(() => {
+    const audio = assistantAudioRef.current;
+    if (audio && !audio.paused) {
+      audio.pause();
+      setIsSpeaking(false);
+    }
+  }, []);
+
+  const resumeSpeechPlayback = useCallback(() => {
+    const audio = assistantAudioRef.current;
+    if (!audio || !audio.paused || audio.ended) return;
+    setIsSpeaking(true);
+    void audio.play().then(() => {
+      if (voiceConversationRef.current) {
+        void startVoiceListeningRef.current();
+      }
+    }).catch(() => stopSpeechPlayback());
+  }, [stopSpeechPlayback]);
 
   const playAssistantAudio = useCallback((audioBase64: string, mime: string) => (
     new Promise<void>((resolve) => {
@@ -548,9 +569,24 @@ export function VideoLivePanel() {
           setFirstTokenMs(streamFirstTokenMsRef.current);
         }
         streamedAnswerRef.current += content;
-        queueSpeechText(content);
+        if (!nativeAudioExpectedRef.current) queueSpeechText(content);
         appendActiveAnswer(content);
       }
+    });
+    const offAudio = webClient.on<{
+      request_id?: unknown;
+      audio_base64?: unknown;
+      audio_mime?: unknown;
+    }>('video.audio', (event) => {
+      if (event.payload.request_id !== activeRequestIdRef.current) return;
+      const audioBase64 = event.payload.audio_base64;
+      if (typeof audioBase64 !== 'string' || !audioBase64) return;
+      void playAssistantAudio(
+        audioBase64,
+        typeof event.payload.audio_mime === 'string'
+          ? event.payload.audio_mime
+          : 'audio/wav',
+      );
     });
     const offTranscript = webClient.on<{
       request_id?: unknown;
@@ -595,13 +631,14 @@ export function VideoLivePanel() {
     return () => {
       offStarted();
       offDelta();
+      offAudio();
       offTranscript();
       offVideoToolStatus();
       offTaskResponse();
       offTaskError();
       offMemoryError();
     };
-  }, [appendActiveAnswer, queueSpeechText, replaceActiveAnswer, replaceActiveQuestion, stopSpeechPlayback]);
+  }, [appendActiveAnswer, playAssistantAudio, queueSpeechText, replaceActiveAnswer, replaceActiveQuestion, stopSpeechPlayback]);
 
   useEffect(() => {
     if (!isAsking) {
@@ -903,7 +940,7 @@ export function VideoLivePanel() {
   const runOmniRequest = async (
     prompt: string,
     questionAudioDataUrl?: string,
-    recordedAssistantPlayback = false,
+    verifiedVoiceQuestion = false,
   ) => {
     if ((!prompt && !questionAudioDataUrl) || isAskingRef.current) return;
     if (framesRef.current.length === 0) {
@@ -913,8 +950,11 @@ export function VideoLivePanel() {
 
     setIsAsking(true);
     isAskingRef.current = true;
-    if (!recordedAssistantPlayback) stopSpeechPlayback();
+    stopSpeechPlayback();
     streamedAnswerRef.current = '';
+    nativeAudioExpectedRef.current = Boolean(
+      (questionAudioDataUrl || verifiedVoiceQuestion) && isSpeechEnabled,
+    );
     beginConversationTurn(prompt || '🎙️ 语音提问');
     setError('');
     setToolStatus('');
@@ -948,6 +988,7 @@ export function VideoLivePanel() {
           source,
           frames: framesRef.current.slice(-MAX_FRAMES),
           ...(audioInputs.length > 0 ? { audio_inputs: audioInputs } : {}),
+          ...(verifiedVoiceQuestion ? { voice_question: true } : {}),
           ...(questionAudioDataUrl && assistantSpeechTextRef.current
             ? { assistant_speech_text: assistantSpeechTextRef.current }
             : {}),
@@ -973,8 +1014,12 @@ export function VideoLivePanel() {
         const finalAnswer = result.answer?.trim() || '模型没有返回文本。';
         assistantSpeechTextRef.current = finalAnswer;
         replaceActiveAnswer(finalAnswer);
-        if (!streamedAnswerRef.current) queueSpeechText(finalAnswer);
-        queueSpeechText('', true);
+        if (!result.native_audio_emitted) {
+          if (!streamedAnswerRef.current || nativeAudioExpectedRef.current) {
+            queueSpeechText(finalAnswer);
+          }
+          queueSpeechText('', true);
+        }
       }
       setLatencyMs(result.latency_ms ?? Math.round(performance.now() - startedAt));
       setFirstTokenMs(result.first_token_ms ?? null);
@@ -987,7 +1032,7 @@ export function VideoLivePanel() {
         setError('超过 45 秒仍未收到结果，已停止等待，请重试。');
       } else if (abortReason === 'manual') {
         setError('已取消本次问答。');
-      } else if (abortReason !== 'source') {
+      } else if (abortReason !== 'source' && abortReason !== 'barge-in') {
         const code = (requestError as { code?: unknown })?.code;
         setError(
           code === 'WS_DISCONNECTED' || code === 'WS_CLOSED'
@@ -1057,7 +1102,6 @@ export function VideoLivePanel() {
       let consecutiveSpeechFrames = 0;
       let voicedFrames = 0;
       let noiseFloor = 0.006;
-      let assistantPlayedDuringRecording = false;
       const calibrationStartedAt = performance.now();
       let lastSpeechAt = performance.now();
       mediaRecorderRef.current = recorder;
@@ -1090,11 +1134,34 @@ export function VideoLivePanel() {
           return;
         }
         void audioBlobToWavDataUrl(audioBlob)
-          .then((audioDataUrl) => runOmniRequest(
-            '',
-            audioDataUrl,
-            assistantPlayedDuringRecording,
-          ))
+          .then(async (audioDataUrl) => {
+            const verification = await webRequest<{
+              transcript?: string;
+              accepted?: boolean;
+            }>('video.transcribe', {
+              audio_inputs: [{
+                data_url: audioDataUrl,
+                source_label: '用户麦克风提问',
+              }],
+              ...(assistantSpeechTextRef.current
+                ? { assistant_speech_text: assistantSpeechTextRef.current }
+                : {}),
+            }, { timeoutMs: 20_000 });
+            const transcript = verification.transcript?.trim() || '';
+            if (!verification.accepted || !transcript) {
+              resumeSpeechPlayback();
+              if (voiceConversationRef.current && !assistantAudioRef.current) {
+                window.setTimeout(() => void startVoiceListeningRef.current(), 180);
+              }
+              return;
+            }
+            if (isAskingRef.current) {
+              abortQuestion('barge-in');
+              await new Promise((resolve) => window.setTimeout(resolve, 80));
+            }
+            stopSpeechPlayback();
+            await runOmniRequest(transcript, undefined, true);
+          })
           .catch((recordingError) => {
             setError(recordingError instanceof Error ? recordingError.message : '读取录音失败。');
           });
@@ -1118,17 +1185,20 @@ export function VideoLivePanel() {
           noiseFloor = noiseFloor * 0.85 + rms * 0.15;
         }
         const outputIsPlaying = assistantAudioRef.current !== null;
-        if (outputIsPlaying) assistantPlayedDuringRecording = true;
         const speechThreshold = Math.max(
-          outputIsPlaying ? 0.032 : 0.018,
-          noiseFloor * (outputIsPlaying ? 3.2 : 2.2),
+          outputIsPlaying ? 0.024 : 0.018,
+          noiseFloor * (outputIsPlaying ? 2.8 : 2.2),
         );
         if (rms >= speechThreshold) {
           consecutiveSpeechFrames += 1;
           voicedFrames += 1;
-          const requiredFrames = outputIsPlaying ? 6 : 2;
+          const requiredFrames = outputIsPlaying ? 4 : 2;
           if (!heardSpeech && consecutiveSpeechFrames >= requiredFrames) {
             heardSpeech = true;
+            if (outputIsPlaying) {
+              setToolStatus('检测到插话，已停止播报');
+              pauseSpeechPlayback();
+            }
           }
           lastSpeechAt = performance.now();
         } else {
@@ -1172,7 +1242,7 @@ export function VideoLivePanel() {
           <span className="video-live__brand-icon"><Video aria-hidden /></span>
           <div>
             <h1>Jiuwen Omni Live</h1>
-            <p>Qwen3-Omni 多屏音视频问答</p>
+            <p>多屏音视频实时问答</p>
           </div>
         </div>
         <div className={`video-live__status ${isPlaying ? 'is-live' : ''}`}>
