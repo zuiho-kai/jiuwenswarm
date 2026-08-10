@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import io
 import json
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -146,6 +148,32 @@ def test_grounding_routes_brand_introduction_to_agent_tools() -> None:
     assert result["needs_external_tools"] is True
 
 
+def test_referential_company_search_is_grounded_in_previous_answer() -> None:
+    context = {
+        "current_chunk": {
+            "interactions": [
+                {
+                    "question": "这个是什么？",
+                    "answer": "这是一个可口可乐经典美版的红色易拉罐。",
+                },
+                {
+                    "question": "介绍一下这公司",
+                    "answer": "阿里巴巴集团是一家互联网企业。",
+                },
+            ]
+        }
+    }
+
+    query = video_live._ground_referential_search_query(
+        "阿里巴巴集团 公司介绍",
+        "介绍一下这公司",
+        context,
+    )
+
+    assert "可口可乐" in query
+    assert "阿里巴巴" not in query
+
+
 @pytest.mark.asyncio
 async def test_client_creates_stream_then_sends_contiguous_frames(
     monkeypatch: pytest.MonkeyPatch,
@@ -279,9 +307,28 @@ def test_voice_transcript_rejects_assistant_speaker_echo() -> None:
         "这是一个瑞幸咖啡的纸杯",
         assistant_text,
     )
+    assert video_live._looks_like_assistant_echo(
+        "瑞幸咖啡纸杯上有品牌标志",
+        assistant_text,
+    )
     assert not video_live._looks_like_assistant_echo(
         "那它多少钱？",
         assistant_text,
+    )
+
+
+def test_voice_transcript_fuzzy_deduplicates_same_acoustic_utterance() -> None:
+    session_id = "fuzzy-voice-dedup"
+    video_live._recent_voice_transcripts.pop(session_id, None)
+
+    assert video_live._accept_voice_transcript(
+        session_id, "停一下，请告诉我现在画面里是什么。"
+    )
+    assert not video_live._accept_voice_transcript(
+        session_id, "一下请告诉我现在画面里是什么"
+    )
+    assert video_live._accept_voice_transcript(
+        session_id, "那这个品牌是哪家公司生产的"
     )
 
 
@@ -346,6 +393,53 @@ def test_historical_visual_question_keeps_memory() -> None:
         memory_context,
         "我刚才手里拿的是什么？",
     ) is memory_context
+
+
+def test_compact_memory_context_drops_large_evidence_id_arrays() -> None:
+    huge_ids = [f"observation-{index}" for index in range(1_000)]
+    context = {
+        "long_term_memory": {"summary": "长期摘要"},
+        "mid_term_memories": [{"id": "mid-1", "summary": "中期摘要"}],
+        "qa_history": [
+            {
+                "id": "qa-1",
+                "question": "刚才发生了什么？",
+                "answer": "杯子被放进柜子。",
+                "asked_at": "2026-08-06T12:00:00+08:00",
+                "model": "Qwen3-Omni",
+                "current_observation_ids": huge_ids,
+                "evidence_observation_ids": huge_ids,
+            }
+        ],
+        "current_chunk": {"interactions": []},
+    }
+
+    compact = video_live._compact_memory_context(context)
+    serialized = json.dumps(compact, ensure_ascii=False)
+
+    assert "杯子被放进柜子" in serialized
+    assert "observation-999" not in serialized
+    assert len(serialized) < 2_000
+
+
+def test_split_embedded_wav_merges_all_segments() -> None:
+    def wav_payload(samples: bytes) -> str:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(24_000)
+            target.writeframes(samples)
+        return base64.b64encode(output.getvalue()).decode()
+
+    text, encoded = video_live._split_embedded_wav(
+        "回答" + wav_payload(b"\x01\x00" * 4) + wav_payload(b"\x02\x00" * 3)
+    )
+
+    assert text == "回答"
+    with wave.open(io.BytesIO(base64.b64decode(encoded)), "rb") as merged:
+        assert merged.getnframes() == 7
+        assert merged.readframes(7) == b"\x01\x00" * 4 + b"\x02\x00" * 3
 
 
 def test_named_term_definition_requires_external_lookup() -> None:
@@ -577,7 +671,7 @@ async def test_camera_agent_answer_and_tools_write_back_to_memory(
 
 
 @pytest.mark.asyncio
-async def test_video_handlers_give_context_and_search_tool_to_qwen(
+async def test_video_handlers_give_memory_context_to_qwen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     memory_client = _MemoryClient()
@@ -591,14 +685,11 @@ async def test_video_handlers_give_context_and_search_tool_to_qwen(
         audio_inputs,
         *,
         memory_context,
-        memory_search,
         **tools,
     ):
         del tools
         del frames, audio_inputs
         captured["context"] = memory_context
-        result = await memory_search({"query": "杯子放在哪里？"})
-        captured["search"] = result
         yield f"{question}：杯子在柜子里。"
 
     monkeypatch.setattr(video_live, "_stream_qwen_omni", stream_answer)
@@ -635,11 +726,6 @@ async def test_video_handlers_give_context_and_search_tool_to_qwen(
         "memories": [{"id": "memory-0"}],
         "current_observations": [{"id": "observation-0"}],
     }
-    assert captured["search"] == {
-        "query": "杯子放在哪里？",
-        "memories": [{"id": "session-a-memory"}],
-        "evidence": ["frame-0.jpg"],
-    }
     assert memory_client.interactions[0][0] == "session-a"
     assert memory_client.interactions[0][1]["answer"] == (
         "我在干什么？：杯子在柜子里。"
@@ -655,71 +741,8 @@ async def test_video_handlers_give_context_and_search_tool_to_qwen(
         "interaction_id": "interaction-0",
     }
 
-
 @pytest.mark.asyncio
-async def test_voice_history_question_reenters_memory_search_route(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    memory_client = _MemoryClient()
-    monkeypatch.setenv("OMNIMEMORY_API_BASE", memory_client.api_base)
-    monkeypatch.setattr(video_live, "_memory_client", memory_client)
-    calls: list[tuple[str, bool]] = []
-
-    async def transcribe(audio_inputs):
-        assert audio_inputs
-        return "刚才杯子放在哪里？"
-
-    monkeypatch.setattr(video_live, "_transcribe_audio_inputs", transcribe)
-
-    async def stream_answer(
-        question,
-        frames,
-        audio_inputs,
-        **options,
-    ):
-        del frames
-        calls.append((question, bool(audio_inputs)))
-        assert not audio_inputs
-        result = await options["memory_search"](
-            {"query": "刚才杯子放在哪里？"}
-        )
-        assert result["evidence"] == ["frame-0.jpg"]
-        yield "刚才杯子被放进柜子里。"
-
-    monkeypatch.setattr(video_live, "_stream_qwen_omni", stream_answer)
-    channel = _Channel()
-    video_live.register_video_live_handler(channel)
-
-    await channel.methods["video.ask"](
-        object(),
-        "ask-voice-memory",
-        {
-            "question": "",
-            "frames": [_frame()],
-            "audio_inputs": [
-                {
-                    "data_url": "data:audio/wav;base64,eA==",
-                    "source_label": "用户麦克风提问",
-                }
-            ],
-        },
-        "session-voice-memory",
-    )
-
-    payload = channel.responses[-1]["payload"]
-    assert payload["answer"] == "刚才杯子被放进柜子里。"
-    assert payload["transcript"] == "刚才杯子放在哪里？"
-    assert calls == [("刚才杯子放在哪里？", False)]
-    assert memory_client.interactions[-1][1]["question"] == (
-        "刚才杯子放在哪里？"
-    )
-    assert memory_client.interactions[-1][1]["tool_calls"][0]["name"] == (
-        "memory_search"
-    )
-
-
-@pytest.mark.asyncio
-async def test_typed_question_transcribes_attached_audio_before_vl(
+async def test_typed_question_keeps_audio_for_primary_omni(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OMNIMEMORY_API_BASE", raising=False)
@@ -727,13 +750,9 @@ async def test_typed_question_transcribes_attached_audio_before_vl(
     monkeypatch.setattr(
         video_live,
         "_omni_model_config",
-        lambda: ("http://model", "key", "Qwen/Qwen3-VL-8B-Instruct"),
+        lambda: ("http://model", "key", "Qwen3-Omni"),
     )
     captured: dict[str, object] = {}
-
-    async def transcribe(audio_inputs):
-        assert audio_inputs
-        return "背景正在播放产品发布会。"
 
     async def stream_answer(question, frames, audio_inputs, **options):
         del frames, options
@@ -741,7 +760,6 @@ async def test_typed_question_transcribes_attached_audio_before_vl(
         captured["audio_inputs"] = audio_inputs
         yield "画面里正在进行产品发布。"
 
-    monkeypatch.setattr(video_live, "_transcribe_audio_inputs", transcribe)
     monkeypatch.setattr(video_live, "_stream_qwen_omni", stream_answer)
     channel = _Channel()
     video_live.register_video_live_handler(channel)
@@ -762,13 +780,61 @@ async def test_typed_question_transcribes_attached_audio_before_vl(
         "session-text-audio",
     )
 
-    assert captured["audio_inputs"] == []
-    assert captured["question"] == (
-        "画面里在做什么？\n\n当前音频转写：背景正在播放产品发布会。"
-    )
+    assert captured["audio_inputs"]
+    assert captured["question"] == "画面里在做什么？"
     assert channel.responses[-1]["payload"]["answer"] == (
         "画面里正在进行产品发布。"
     )
+
+
+@pytest.mark.asyncio
+async def test_microphone_uses_verified_asr_text_instead_of_omni_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIMEMORY_API_BASE", raising=False)
+    monkeypatch.setattr(video_live, "_memory_client", None)
+    monkeypatch.setattr(
+        video_live,
+        "_transcribe_audio_inputs",
+        lambda inputs: asyncio.sleep(0, result="介绍一下可口可乐"),
+    )
+    monkeypatch.setattr(
+        video_live,
+        "_synthesize_omni_native_speech",
+        lambda text: asyncio.sleep(0, result=("UklGRgQAAABXQVZF", "audio/wav")),
+    )
+    captured: dict[str, object] = {}
+
+    async def stream_answer(question, frames, audio_inputs, **options):
+        del frames, options
+        captured["question"] = question
+        captured["audio_inputs"] = audio_inputs
+        yield "可口可乐是一家饮料公司。"
+
+    monkeypatch.setattr(video_live, "_stream_qwen_omni", stream_answer)
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["video.ask"](
+        object(),
+        "ask-verified-voice",
+        {
+            "question": "",
+            "frames": [_frame()],
+            "audio_inputs": [{
+                "data_url": "data:audio/wav;base64,eA==",
+                "source_label": "用户麦克风提问",
+            }],
+        },
+        "session-verified-voice",
+    )
+
+    assert captured == {
+        "question": "介绍一下可口可乐",
+        "audio_inputs": [],
+    }
+    assert any(event["name"] == "video.transcript" for event in channel.events)
+    assert channel.responses[-1]["payload"]["native_audio_emitted"] is True
 
 
 @pytest.mark.asyncio
@@ -1045,7 +1111,7 @@ async def test_deep_reasoning_stops_after_search_backend_error(
 
 
 @pytest.mark.asyncio
-async def test_qwen_calls_memory_search_once_before_final_answer(
+async def test_qwen_does_not_register_memory_search_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import openai
@@ -1055,26 +1121,8 @@ async def test_qwen_calls_memory_search_once_before_final_answer(
     class _Completions:
         async def create(self, **request):
             requests.append(request)
-            if len(requests) == 1:
-                tool_call = SimpleNamespace(
-                    id="call-1",
-                    function=SimpleNamespace(
-                        name="memory_search",
-                        arguments='{"query":"杯子放在哪里？"}',
-                    ),
-                )
-                return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content=None,
-                                tool_calls=[tool_call],
-                            )
-                        )
-                    ]
-                )
             tool_call = SimpleNamespace(
-                id="call-2",
+                id="call-1",
                 function=SimpleNamespace(
                     name="respond",
                     arguments='{"text":"杯子在柜子里。"}',
@@ -1105,15 +1153,6 @@ async def test_qwen_calls_memory_search_once_before_final_answer(
         "_omni_model_config",
         lambda: ("http://model", "key", "qwen-omni"),
     )
-    searches: list[dict[str, object]] = []
-
-    async def search(arguments):
-        searches.append(arguments)
-        return {
-            "memories": [{"summary": "杯子被放进柜子"}],
-            "evidence": ["frame-120.jpg"],
-        }
-
     answer = "".join(
         [
             part
@@ -1122,18 +1161,15 @@ async def test_qwen_calls_memory_search_once_before_final_answer(
                 [("data:image/jpeg;base64,eA==", "camera")],
                 [],
                 memory_context={"memories": []},
-                memory_search=search,
             )
         ]
     )
 
     assert answer == "杯子在柜子里。"
-    assert searches == [{"query": "杯子放在哪里？"}]
     assert [
         tool["function"]["name"] for tool in requests[0]["tools"]
-    ] == ["respond", "silent", "memory_search"]
+    ] == ["respond", "silent"]
     assert requests[0]["tool_choice"] == "auto"
-    assert requests[1]["messages"][-1]["role"] == "tool"
 
 
 @pytest.mark.asyncio
@@ -1458,7 +1494,7 @@ async def test_qwen_silent_action_emits_no_answer(
 
 
 @pytest.mark.asyncio
-async def test_audio_protocol_stream_hides_split_closing_tag(
+async def test_audio_protocol_defers_tool_route_and_extracts_native_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import openai
@@ -1470,7 +1506,7 @@ async def test_audio_protocol_stream_hides_split_closing_tag(
                     "<transcript>介绍一下可口可乐</transcript>"
                     "<route>free_search</route><entity>可口可乐</entity>"
                     "<answer>这是",
-                    "可口可乐汽水罐。</answer",
+                    "可口可乐汽水罐。</answer>UklGRgQAAABXQVZF",
                 ):
                     yield SimpleNamespace(
                         choices=[
@@ -1503,6 +1539,7 @@ async def test_audio_protocol_stream_hides_split_closing_tag(
     )
     transcripts: list[str] = []
     decisions: list[tuple[str, str]] = []
+    audio_outputs: list[tuple[str, str]] = []
 
     async def accept_transcript(value: str) -> bool:
         transcripts.append(value)
@@ -1510,6 +1547,9 @@ async def test_audio_protocol_stream_hides_split_closing_tag(
 
     async def accept_decision(route: str, entity: str) -> None:
         decisions.append((route, entity))
+
+    async def accept_audio(value: str, mime: str) -> None:
+        audio_outputs.append((value, mime))
 
     answer = "".join(
         [
@@ -1520,14 +1560,87 @@ async def test_audio_protocol_stream_hides_split_closing_tag(
                 [("data:audio/wav;base64,eA==", "用户麦克风提问")],
                 transcript_sink=accept_transcript,
                 voice_decision_sink=accept_decision,
+                audio_output_sink=accept_audio,
             )
         ]
     )
 
     assert transcripts == ["介绍一下可口可乐"]
     assert decisions == [("free_search", "可口可乐")]
-    assert answer == "这是可口可乐汽水罐。"
-    assert "answer" not in answer
+    assert answer == ""
+    assert audio_outputs == []
+
+
+@pytest.mark.asyncio
+async def test_audio_protocol_keeps_routing_markup_out_of_native_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+    requests: list[dict[str, object]] = []
+
+    class _Chunks:
+        def __aiter__(self):
+            async def iterate():
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                content=(
+                                    "<transcript>这是什么</transcript>"
+                                    "<route>direct</route><entity>可口可乐</entity>"
+                                    "<answer>这是可口可乐。</answer>"
+                                ),
+                                audio=SimpleNamespace(data="UklGRgQAAABXQVZF"),
+                            )
+                        )
+                    ]
+                )
+
+            return iterate()
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            return _Chunks()
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("http://model", "key", "qwen-omni"),
+    )
+    audio_outputs: list[tuple[str, str]] = []
+
+    async def accept_transcript(value: str) -> bool:
+        return value == "这是什么"
+
+    async def accept_audio(value: str, mime: str) -> None:
+        audio_outputs.append((value, mime))
+
+    answer = "".join(
+        [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [("data:audio/wav;base64,eA==", "用户麦克风提问")],
+                transcript_sink=accept_transcript,
+                audio_output_sink=accept_audio,
+            )
+        ]
+    )
+
+    assert answer == "这是可口可乐。"
+    assert audio_outputs == []
+    assert requests[0]["modalities"] == ["text"]
 
 
 @pytest.mark.asyncio
