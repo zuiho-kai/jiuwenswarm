@@ -1200,17 +1200,50 @@ async def _transcribe_audio_inputs(
                 audio_bytes = base64.b64decode(encoded, validate=True)
             except ValueError as exc:
                 raise RuntimeError("语音数据不是有效的 base64") from exc
-            response = await client.post(
-                f"{api_base}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                data={"model": model},
-                files={
-                    "file": (
-                        f"microphone-{index}.webm",
-                        audio_bytes,
-                        mime_type,
+            endpoint = f"{api_base}/audio/transcriptions"
+            started_at = time.perf_counter()
+            try:
+                response = await client.post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    data={"model": model},
+                    files={
+                        "file": (
+                            f"microphone-{index}.webm",
+                            audio_bytes,
+                            mime_type,
+                        )
+                    },
+                )
+            except httpx.RequestError as exc:
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                logger.warning(
+                    "ASR request failed endpoint=%s model=%s elapsed_ms=%.1f "
+                    "error_type=%s error=%r",
+                    endpoint,
+                    model,
+                    elapsed_ms,
+                    type(exc).__name__,
+                    str(exc),
+                    exc_info=True,
+                )
+                if isinstance(exc, httpx.ReadError):
+                    message = (
+                        "ASR 服务已连接，但在返回结果前断开；"
+                        f"请检查远端 ASR 服务和 SSH 隧道 ({type(exc).__name__})"
                     )
-                },
+                else:
+                    message = f"无法连接 ASR 服务 ({type(exc).__name__}): {api_base}"
+                raise RuntimeError(message) from exc
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            logger.info(
+                "ASR request completed endpoint=%s model=%s status=%s "
+                "elapsed_ms=%.1f audio_bytes=%s",
+                endpoint,
+                model,
+                response.status_code,
+                elapsed_ms,
+                len(audio_bytes),
             )
             if response.status_code >= 400:
                 detail = response.text.strip()[:500]
@@ -4912,11 +4945,23 @@ def register_video_live_handler(channel: Any) -> None:
         try:
             transcript = await _transcribe_audio_inputs(microphone_inputs)
         except Exception as exc:  # noqa: BLE001
+            api_base, _, model = _asr_model_config()
+            logger.warning(
+                "Voice ASR verification failed session=%s endpoint=%s model=%s "
+                "error_type=%s error=%r",
+                session_id,
+                api_base,
+                model,
+                type(exc).__name__,
+                str(exc),
+                exc_info=True,
+            )
             await channel.send_response(
                 ws,
                 req_id,
                 ok=False,
-                error=str(exc).strip() or "ASR verification failed",
+                error=str(exc).strip()
+                or f"ASR 请求失败 ({type(exc).__name__})",
                 code="ASR_ERROR",
             )
             return

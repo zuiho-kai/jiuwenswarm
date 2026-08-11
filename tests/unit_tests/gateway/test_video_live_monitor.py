@@ -283,6 +283,43 @@ async def test_video_transcribe_accepts_audio_without_frames(
     }
 
 
+@pytest.mark.asyncio
+async def test_video_transcribe_reports_empty_asr_exception_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyAsrError(Exception):
+        pass
+
+    async def transcribe(_inputs: list[tuple[str, str]]) -> str:
+        raise EmptyAsrError
+
+    monkeypatch.setattr(video_live, "_transcribe_audio_inputs", transcribe)
+    monkeypatch.setattr(
+        video_live,
+        "_asr_model_config",
+        lambda: ("http://127.0.0.1:18002/v1", "EMPTY", "whisper"),
+    )
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["video.transcribe"](
+        object(),
+        "transcribe-error",
+        {
+            "audio_inputs": [
+                {
+                    "data_url": "data:audio/wav;base64,eA==",
+                    "source_label": "\u7528\u6237\u9ea6\u514b\u98ce\u63d0\u95ee",
+                }
+            ]
+        },
+        "voice-session",
+    )
+
+    assert channel.responses[-1]["ok"] is False
+    assert channel.responses[-1]["error"] == "ASR \u8bf7\u6c42\u5931\u8d25 (EmptyAsrError)"
+
+
 def test_video_question_still_requires_frames() -> None:
     with pytest.raises(ValueError, match="frames are required"):
         video_live._normalize_request({"question": "show the current frame"})

@@ -112,6 +112,7 @@ const MAX_FRAMES = 6;
 const MAX_SCREENS = 4;
 const MAX_FRAME_WIDTH = 1_024;
 const REQUEST_TIMEOUT_MS = 45_000;
+const ASR_REQUEST_TIMEOUT_MS = 50_000;
 const RECORDING_LIMIT_MS = 15_000;
 const SOURCE_AUDIO_SEGMENT_MS = 3_000;
 const MONITOR_INTERVAL_MS = 1_000;
@@ -1813,7 +1814,7 @@ export function VideoLivePanel() {
               ...(assistantSpeechTextRef.current
                 ? { assistant_speech_text: assistantSpeechTextRef.current }
                 : {}),
-            }, { timeoutMs: 20_000 });
+            }, { timeoutMs: ASR_REQUEST_TIMEOUT_MS });
             const transcript = verification.transcript?.trim() || '';
             if (!verification.accepted || !transcript) {
               resumeSpeechPlayback();
@@ -2061,7 +2062,7 @@ export function VideoLivePanel() {
             <div className="video-live__monitor-title">
               <span>
                 <Radar aria-hidden />
-                监控模式
+                当前任务
               </span>
               <span className={`video-live__monitor-state is-${monitorPhase}`}>
                 {monitorPhase === 'evaluating'
@@ -2136,12 +2137,12 @@ export function VideoLivePanel() {
                   ? toolStatus
                   : isMonitoring
                     ? monitorPhase === 'evaluating'
-                      ? '监控模式 · 模型正在判断最新画面'
+                      ? '当前任务 · 模型正在判断最新画面'
                       : monitorPhase === 'backoff'
-                        ? `监控模式 · 模型服务繁忙，${monitorRetrySeconds} 秒后自动重试`
+                        ? `当前任务 · 模型服务繁忙，${monitorRetrySeconds} 秒后自动重试`
                         : monitorPhase === 'uncertain'
-                          ? '监控模式 · 当前证据不足，继续观察'
-                          : '监控模式 · 等待触发条件'
+                          ? '当前任务 · 当前证据不足，继续观察'
+                          : '当前任务 · 等待触发条件'
                     : isTranslating
                       ? '实时翻译运行中 · 每秒处理最新画面'
                       : `当前窗口最多 ${MAX_FRAMES} 帧${source === 'screen' ? ` · ${screens.length} 个屏幕` : ''} · 长/中期记忆 · 必要时 memory/free_search${isSpeechEnabled ? ' · 语音播报' : ''}`}

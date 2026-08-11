@@ -15,6 +15,7 @@ Multi-instance management commands:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -22,7 +23,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
 from jiuwenswarm.dotenv_early import load_dotenv_runtime, parse_dotenv_early
@@ -431,6 +433,7 @@ def _run_instance_with_pid(commands: list[tuple[str, list[str], Path]],
         logging.info(f"[start_services] Instance '{config.name}' started")
 
         _wait_for_services_ready(config.ports, processes)
+        _wait_for_asr_tunnel_ready(processes)
 
         while True:
             for cmd_name, proc in processes.items():
@@ -608,9 +611,18 @@ def _asr_ssh_tunnel_sidecar_command() -> tuple[str, list[str], Path] | None:
             "ASR_SSH_TUNNEL_LOCAL_PORT must match the ASR_API_BASE port"
         )
     if not is_port_available("127.0.0.1", local_port):
-        logging.info(
-            "[start_services] reusing existing ASR endpoint on port %s",
+        if _asr_endpoint_healthy(api_base):
+            logging.info(
+                "[start_services] reusing healthy ASR endpoint on port %s",
+                local_port,
+            )
+            return None
+        logging.warning(
+            "[start_services] port %s is occupied, but the ASR health check "
+            "failed at %s; the SSH tunnel may be stale or the remote ASR "
+            "service may be stopped",
             local_port,
+            _asr_health_url(api_base),
         )
         return None
 
@@ -639,6 +651,70 @@ def _asr_ssh_tunnel_sidecar_command() -> tuple[str, list[str], Path] | None:
         destination,
     ]
     return "asr-model-tunnel", command, DATA_ROOT
+
+
+def _asr_health_url(api_base: str) -> str:
+    override = os.environ.get("ASR_HEALTH_URL", "").strip()
+    if override:
+        return override
+    parsed = urlsplit(api_base.strip())
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/health", "", ""))
+
+
+def _asr_endpoint_healthy(api_base: str, timeout: float = 1.5) -> bool:
+    try:
+        request = Request(
+            _asr_health_url(api_base),
+            headers={"Accept": "application/json"},
+        )
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310
+            if not 200 <= response.status < 300:
+                return False
+            payload = json.loads(response.read(65_536))
+            return (
+                isinstance(payload, dict)
+                and str(payload.get("status") or "").casefold() in {"ok", "healthy"}
+            )
+    except (OSError, ValueError):
+        return False
+
+
+def _wait_for_asr_tunnel_ready(
+    processes: dict[str, subprocess.Popen[bytes]],
+    *,
+    timeout: float = 15.0,
+) -> bool | None:
+    process = processes.get("asr-model-tunnel")
+    if process is None:
+        return None
+    api_base = os.environ.get("ASR_API_BASE", "").strip()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        code = process.poll()
+        if code is not None:
+            logging.warning(
+                "[start_services] ASR tunnel exited before the endpoint became "
+                "healthy (exit code %s)",
+                code,
+            )
+            return False
+        if _asr_endpoint_healthy(api_base, timeout=1.0):
+            logging.info(
+                "[start_services] ASR endpoint ready (%s)",
+                _asr_health_url(api_base),
+            )
+            return True
+        time.sleep(0.3)
+    logging.warning(
+        "[start_services] ASR tunnel is listening, but %s did not become "
+        "healthy within %.1f seconds; check the remote ASR process",
+        _asr_health_url(api_base),
+        timeout,
+    )
+    return False
 
 
 def _build_commands(mode: str, dotenv_path: Path | None = None) -> list[tuple[str, list[str], Path]]:
@@ -918,6 +994,7 @@ def _run_processes(
             processes[name] = _start_process(name, cmd, cwd, ports=ports)
 
         _wait_for_services_ready(ports, processes)
+        _wait_for_asr_tunnel_ready(processes)
 
         while True:
             for name, proc in processes.items():
