@@ -39,6 +39,8 @@ export type WebMessage = WsRequest | WsResponse | WsEvent;
 export interface WebRequestOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Called synchronously before the request is sent, so stream events can be bound safely. */
+  onRequestId?: (requestId: string) => void;
   /** 对应协议里请求消息的顶层 is_stream 字段（如 command.goal 的 set/resume） */
   isStream?: boolean;
 }

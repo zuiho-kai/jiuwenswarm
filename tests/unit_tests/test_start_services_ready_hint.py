@@ -12,8 +12,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from jiuwenswarm.start_services import (
+    _build_commands,
+    _asr_health_url,
+    _asr_ssh_tunnel_sidecar_command,
+    _wait_for_asr_tunnel_ready,
     _resolve_runtime_ports,
     _start_process,
+    _video_ssh_tunnel_sidecar_command,
     _wait_for_services_ready,
 )
 
@@ -81,6 +86,180 @@ def test_resolve_runtime_ports_out_of_range_env_keeps_default(
     assert ports["frontend"] == 5173
     assert ports["agent_server"] == 18092
     assert ports["web"] == 19000
+
+
+def test_build_commands_adds_configured_local_omnimemory_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.delenv("VIDEO_SSH_TUNNEL_HOST", raising=False)
+    application = tmp_path / "omnimemory" / "application.py"
+    application.parent.mkdir()
+    application.write_text("", encoding="utf-8")
+    monkeypatch.setenv("OMNIMEMORY_API_BASE", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIMEMORY_PROJECT_DIR", str(tmp_path))
+
+    commands = _build_commands("app")
+
+    name, command, cwd = commands[0]
+    assert name == "omnimemory"
+    assert command[-4:] == ["--host", "127.0.0.1", "--port", "8000"]
+    assert cwd == tmp_path.resolve()
+    assert commands[1][0] == "app"
+
+
+def test_build_commands_ignores_remote_omnimemory_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.delenv("VIDEO_SSH_TUNNEL_HOST", raising=False)
+    monkeypatch.setenv("OMNIMEMORY_API_BASE", "https://memory.example.com")
+    monkeypatch.setenv("OMNIMEMORY_PROJECT_DIR", str(tmp_path))
+
+    commands = _build_commands("app")
+
+    assert [name for name, _command, _cwd in commands] == ["app"]
+
+
+def test_video_ssh_tunnel_uses_loopback_video_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VIDEO_API_BASE", "http://127.0.0.1:18000/v1")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_PORT", "31442")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_USER", "worker")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_REMOTE_PORT", "8000")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: True
+    )
+
+    name, command, _cwd = _video_ssh_tunnel_sidecar_command() or (None, [], None)
+
+    assert name == "video-model-tunnel"
+    assert "18000:127.0.0.1:8000" in command
+    assert command[-1] == "worker@model.example.com"
+    assert "ExitOnForwardFailure=yes" in command
+
+
+def test_video_ssh_tunnel_reuses_existing_listener(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VIDEO_API_BASE", "http://127.0.0.1:18000/v1")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_REMOTE_PORT", "8000")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: False
+    )
+
+    assert _video_ssh_tunnel_sidecar_command() is None
+
+
+def test_asr_ssh_tunnel_uses_loopback_asr_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("ASR_API_BASE", "http://127.0.0.1:18002/v1")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_PORT", "31442")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_USER", "worker")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_REMOTE_PORT", "8101")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: True
+    )
+
+    name, command, _cwd = _asr_ssh_tunnel_sidecar_command() or (None, [], None)
+
+    assert name == "asr-model-tunnel"
+    assert "18002:127.0.0.1:8101" in command
+    assert command[-1] == "worker@model.example.com"
+    assert "ExitOnForwardFailure=yes" in command
+
+
+def test_asr_health_url_is_outside_openai_v1_prefix():
+    assert _asr_health_url("http://127.0.0.1:18002/v1") == (
+        "http://127.0.0.1:18002/health"
+    )
+
+
+def test_asr_health_url_allows_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("ASR_HEALTH_URL", "http://127.0.0.1:18002/custom-health")
+
+    assert _asr_health_url("http://127.0.0.1:18002/v1") == (
+        "http://127.0.0.1:18002/custom-health"
+    )
+
+
+def test_asr_ssh_tunnel_reuses_healthy_existing_listener(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("ASR_API_BASE", "http://127.0.0.1:18002/v1")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_REMOTE_PORT", "8101")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: False
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services._asr_endpoint_healthy", lambda _base: True
+    )
+
+    assert _asr_ssh_tunnel_sidecar_command() is None
+
+
+def test_asr_ssh_tunnel_rejects_stale_existing_listener(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("ASR_API_BASE", "http://127.0.0.1:18002/v1")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_REMOTE_PORT", "8101")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: False
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services._asr_endpoint_healthy", lambda _base: False
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert _asr_ssh_tunnel_sidecar_command() is None
+
+    assert "ASR health check failed" in caplog.text
+    assert "remote ASR service may be stopped" in caplog.text
+
+
+def test_wait_for_asr_tunnel_requires_healthy_http_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    process = MagicMock()
+    process.poll.return_value = None
+    checks = iter((False, True))
+    monkeypatch.setenv("ASR_API_BASE", "http://127.0.0.1:18002/v1")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services._asr_endpoint_healthy",
+        lambda _base, timeout: next(checks),
+    )
+    monkeypatch.setattr("jiuwenswarm.start_services.time.sleep", lambda _delay: None)
+
+    assert _wait_for_asr_tunnel_ready(
+        {"asr-model-tunnel": process}, timeout=1.0
+    ) is True
+    assert process.poll.call_count == 2
+
+
+def test_wait_for_asr_tunnel_reports_early_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    process = MagicMock()
+    process.poll.return_value = 255
+    monkeypatch.setenv("ASR_API_BASE", "http://127.0.0.1:18002/v1")
+
+    with caplog.at_level(logging.WARNING):
+        assert _wait_for_asr_tunnel_ready(
+            {"asr-model-tunnel": process}, timeout=1.0
+        ) is False
+
+    assert "ASR tunnel exited" in caplog.text
 
 
 def test_start_process_passes_resolved_ports_to_child(
