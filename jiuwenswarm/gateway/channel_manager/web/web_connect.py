@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 _WEB_CONNECTION_USER_ID_ATTR = "_web_connection_user_id"
 
 _HANDLER_BEFORE_CALLBACK_METHODS = frozenset({ReqMethod.CHAT_SEND.value})
+_LOCAL_ONLY_METHODS = frozenset(
+    {
+        "video.ask",
+        "video.realtime.start",
+        "video.realtime.stop",
+        "video.monitor.intent",
+        "video.monitor.evaluate",
+        "video.monitor.cancel",
+    }
+)
 
 _STREAM_COALESCE_EVENT_TYPES = frozenset({"chat.delta", "chat.reasoning"})
 _STREAM_COALESCE_MAX_FRAMES = 32
@@ -144,6 +154,7 @@ class WebChannel(BaseWsChannel):
         self._method_handlers: dict[str, MethodHandler] = {}
         self._connect_hooks: list[ConnectHook] = []
         self._disconnect_hooks: list[ConnectHook] = []
+        self._video_monitor_tasks: dict[int, asyncio.Task[bool]] = {}
         # ws -> set[session_id]: 追踪每个连接上活跃的 session
         self._ws_sessions: dict[int, set[str]] = {}
         # session_id -> is_processing: 由 chat.processing_status 事件维护,
@@ -467,6 +478,41 @@ class WebChannel(BaseWsChannel):
                     invocation.method, send_err,
                 )
             return False
+
+    def _cancel_video_monitor_task(self, ws: Any) -> bool:
+        task = self._video_monitor_tasks.pop(id(ws), None)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+    def _on_video_monitor_task_done(
+            self,
+            ws_id: int,
+            task: asyncio.Task[bool],
+    ) -> None:
+        if self._video_monitor_tasks.get(ws_id) is task:
+            self._video_monitor_tasks.pop(ws_id, None)
+        if task.cancelled():
+            return
+        # Retrieve a possible BaseException so asyncio does not report an
+        # unobserved background-task failure during connection teardown.
+        task.exception()
+
+    def _start_video_monitor_task(
+            self,
+            invocation: _MethodHandlerInvocation,
+    ) -> None:
+        self._cancel_video_monitor_task(invocation.ws)
+        ws_id = id(invocation.ws)
+        task = asyncio.create_task(
+            self._invoke_method_handler(invocation),
+            name=f"video-monitor-{invocation.req_id}",
+        )
+        self._video_monitor_tasks[ws_id] = task
+        task.add_done_callback(
+            lambda completed: self._on_video_monitor_task_done(ws_id, completed)
+        )
 
     async def broadcast_event(
             self,
@@ -1062,6 +1108,7 @@ class WebChannel(BaseWsChannel):
                 ),
             )
         finally:
+            self._cancel_video_monitor_task(ws)
             await self.unregister_ws(ws)
 
             logger.info(
@@ -1268,6 +1315,46 @@ class WebChannel(BaseWsChannel):
 
         # 发布到 route 或回调
         handler = self._method_handlers.get(method)
+        if method in _LOCAL_ONLY_METHODS:
+            if method == "video.monitor.cancel":
+                cancelled = self._cancel_video_monitor_task(ws)
+                if handler is not None:
+                    handled = await self._invoke_method_handler(
+                        _MethodHandlerInvocation(
+                            ws,
+                            method,
+                            req_id,
+                            params,
+                            session_id,
+                            handler,
+                        ),
+                    )
+                    if not handled:
+                        return
+                await self.send_response(
+                    ws,
+                    req_id,
+                    ok=True,
+                    payload={"cancelled": cancelled},
+                )
+                return
+            if handler is None:
+                await self.send_response(
+                    ws,
+                    req_id,
+                    ok=False,
+                    error=f"unknown method: {method}",
+                    code="METHOD_NOT_FOUND",
+                )
+                return
+            invocation = _MethodHandlerInvocation(
+                ws, method, req_id, params, session_id, handler,
+            )
+            if method == "video.monitor.evaluate":
+                self._start_video_monitor_task(invocation)
+                return
+            await self._invoke_method_handler(invocation)
+            return
         handler_already_called = False
         if method in _HANDLER_BEFORE_CALLBACK_METHODS and handler is not None:
             handler_already_called = await self._invoke_method_handler(

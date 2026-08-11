@@ -12,8 +12,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from jiuwenswarm.start_services import (
+    _build_commands,
+    _asr_ssh_tunnel_sidecar_command,
     _resolve_runtime_ports,
     _start_process,
+    _video_ssh_tunnel_sidecar_command,
     _wait_for_services_ready,
 )
 
@@ -81,6 +84,92 @@ def test_resolve_runtime_ports_out_of_range_env_keeps_default(
     assert ports["frontend"] == 5173
     assert ports["agent_server"] == 18092
     assert ports["web"] == 19000
+
+
+def test_build_commands_adds_configured_local_omnimemory_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.delenv("VIDEO_SSH_TUNNEL_HOST", raising=False)
+    application = tmp_path / "omnimemory" / "application.py"
+    application.parent.mkdir()
+    application.write_text("", encoding="utf-8")
+    monkeypatch.setenv("OMNIMEMORY_API_BASE", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIMEMORY_PROJECT_DIR", str(tmp_path))
+
+    commands = _build_commands("app")
+
+    name, command, cwd = commands[0]
+    assert name == "omnimemory"
+    assert command[-4:] == ["--host", "127.0.0.1", "--port", "8000"]
+    assert cwd == tmp_path.resolve()
+    assert commands[1][0] == "app"
+
+
+def test_build_commands_ignores_remote_omnimemory_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.delenv("VIDEO_SSH_TUNNEL_HOST", raising=False)
+    monkeypatch.setenv("OMNIMEMORY_API_BASE", "https://memory.example.com")
+    monkeypatch.setenv("OMNIMEMORY_PROJECT_DIR", str(tmp_path))
+
+    commands = _build_commands("app")
+
+    assert [name for name, _command, _cwd in commands] == ["app"]
+
+
+def test_video_ssh_tunnel_uses_loopback_video_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VIDEO_API_BASE", "http://127.0.0.1:18000/v1")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_PORT", "31442")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_USER", "worker")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_REMOTE_PORT", "8000")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: True
+    )
+
+    name, command, _cwd = _video_ssh_tunnel_sidecar_command() or (None, [], None)
+
+    assert name == "video-model-tunnel"
+    assert "18000:127.0.0.1:8000" in command
+    assert command[-1] == "worker@model.example.com"
+    assert "ExitOnForwardFailure=yes" in command
+
+
+def test_video_ssh_tunnel_reuses_existing_listener(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VIDEO_API_BASE", "http://127.0.0.1:18000/v1")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("VIDEO_SSH_TUNNEL_REMOTE_PORT", "8000")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: False
+    )
+
+    assert _video_ssh_tunnel_sidecar_command() is None
+
+
+def test_asr_ssh_tunnel_uses_loopback_asr_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("ASR_API_BASE", "http://127.0.0.1:18002/v1")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_HOST", "model.example.com")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_PORT", "31442")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_USER", "worker")
+    monkeypatch.setenv("ASR_SSH_TUNNEL_REMOTE_PORT", "8101")
+    monkeypatch.setattr(
+        "jiuwenswarm.start_services.is_port_available", lambda _host, _port: True
+    )
+
+    name, command, _cwd = _asr_ssh_tunnel_sidecar_command() or (None, [], None)
+
+    assert name == "asr-model-tunnel"
+    assert "18002:127.0.0.1:8101" in command
+    assert command[-1] == "worker@model.example.com"
+    assert "ExitOnForwardFailure=yes" in command
 
 
 def test_start_process_passes_resolved_ports_to_child(

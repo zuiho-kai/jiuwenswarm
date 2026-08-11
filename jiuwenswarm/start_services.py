@@ -22,9 +22,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
-from jiuwenswarm.dotenv_early import parse_dotenv_early
+from jiuwenswarm.dotenv_early import load_dotenv_runtime, parse_dotenv_early
 parse_dotenv_early("jiuwenswarm-start")
 
 # --- Now safe to import jiuwenswarm modules ---
@@ -446,6 +447,200 @@ def _run_instance_with_pid(commands: list[tuple[str, list[str], Path]],
         _terminate_processes(processes)
 
 
+def _omnimemory_sidecar_command(
+    python_cmd: str,
+) -> tuple[str, list[str], Path] | None:
+    api_base = os.environ.get("OMNIMEMORY_API_BASE", "").strip()
+    project_value = os.environ.get("OMNIMEMORY_PROJECT_DIR", "").strip()
+    if not api_base or not project_value:
+        return None
+
+    parsed = urlsplit(api_base)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.path not in {"", "/"}
+    ):
+        return None
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("OMNIMEMORY_API_BASE has an invalid port") from exc
+    if port is None:
+        raise RuntimeError("OMNIMEMORY_API_BASE must include a port")
+
+    project_dir = Path(project_value).expanduser().resolve()
+    if not (project_dir / "omnimemory" / "application.py").is_file():
+        raise RuntimeError(
+            "OMNIMEMORY_PROJECT_DIR does not contain the OmniMemory source"
+        )
+    command = [
+        python_cmd,
+        "-m",
+        "uvicorn",
+        "omnimemory.application:create_app",
+        "--factory",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
+    return "omnimemory", command, project_dir
+
+
+def _video_ssh_tunnel_sidecar_command() -> tuple[str, list[str], Path] | None:
+    """Build an optional SSH tunnel for a loopback video-model endpoint."""
+    ssh_host = os.environ.get("VIDEO_SSH_TUNNEL_HOST", "").strip()
+    if not ssh_host:
+        return None
+
+    api_base = os.environ.get("VIDEO_API_BASE", "").strip()
+    parsed = urlsplit(api_base)
+    if parsed.scheme != "http" or parsed.hostname not in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }:
+        raise RuntimeError(
+            "VIDEO_SSH_TUNNEL_HOST requires a loopback VIDEO_API_BASE"
+        )
+
+    def _port(name: str, default: int | None = None) -> int:
+        raw = os.environ.get(name, "").strip()
+        if not raw and default is not None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be an integer port") from exc
+        if not 1 <= value <= 65535:
+            raise RuntimeError(f"{name} must be between 1 and 65535")
+        return value
+
+    try:
+        api_port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("VIDEO_API_BASE has an invalid port") from exc
+    if api_port is None:
+        raise RuntimeError("VIDEO_API_BASE must include a port for an SSH tunnel")
+
+    local_port = _port("VIDEO_SSH_TUNNEL_LOCAL_PORT", api_port)
+    if local_port != api_port:
+        raise RuntimeError(
+            "VIDEO_SSH_TUNNEL_LOCAL_PORT must match the VIDEO_API_BASE port"
+        )
+
+    # An independently managed tunnel may already be available. Reuse it so
+    # restarting JiuWenSwarm does not fail with an address-in-use error.
+    if not is_port_available("127.0.0.1", local_port):
+        logging.info(
+            "[start_services] reusing existing video model endpoint on port %s",
+            local_port,
+        )
+        return None
+
+    ssh_port = _port("VIDEO_SSH_TUNNEL_PORT", 22)
+    remote_port = _port("VIDEO_SSH_TUNNEL_REMOTE_PORT")
+    remote_host = os.environ.get(
+        "VIDEO_SSH_TUNNEL_REMOTE_HOST", "127.0.0.1"
+    ).strip()
+    ssh_user = os.environ.get("VIDEO_SSH_TUNNEL_USER", "").strip()
+    destination = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
+    command = [
+        "ssh",
+        "-p",
+        str(ssh_port),
+        "-N",
+        "-L",
+        f"{local_port}:{remote_host}:{remote_port}",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        destination,
+    ]
+    return "video-model-tunnel", command, DATA_ROOT
+
+
+def _asr_ssh_tunnel_sidecar_command() -> tuple[str, list[str], Path] | None:
+    """Build an optional SSH tunnel for a loopback ASR endpoint."""
+    ssh_host = os.environ.get("ASR_SSH_TUNNEL_HOST", "").strip()
+    if not ssh_host:
+        return None
+
+    api_base = os.environ.get("ASR_API_BASE", "").strip()
+    parsed = urlsplit(api_base)
+    if parsed.scheme != "http" or parsed.hostname not in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }:
+        raise RuntimeError(
+            "ASR_SSH_TUNNEL_HOST requires a loopback ASR_API_BASE"
+        )
+
+    def _port(name: str, default: int | None = None) -> int:
+        raw = os.environ.get(name, "").strip()
+        if not raw and default is not None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be an integer port") from exc
+        if not 1 <= value <= 65535:
+            raise RuntimeError(f"{name} must be between 1 and 65535")
+        return value
+
+    try:
+        api_port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("ASR_API_BASE has an invalid port") from exc
+    if api_port is None:
+        raise RuntimeError("ASR_API_BASE must include a port for an SSH tunnel")
+
+    local_port = _port("ASR_SSH_TUNNEL_LOCAL_PORT", api_port)
+    if local_port != api_port:
+        raise RuntimeError(
+            "ASR_SSH_TUNNEL_LOCAL_PORT must match the ASR_API_BASE port"
+        )
+    if not is_port_available("127.0.0.1", local_port):
+        logging.info(
+            "[start_services] reusing existing ASR endpoint on port %s",
+            local_port,
+        )
+        return None
+
+    ssh_port = _port("ASR_SSH_TUNNEL_PORT", 22)
+    remote_port = _port("ASR_SSH_TUNNEL_REMOTE_PORT")
+    remote_host = os.environ.get(
+        "ASR_SSH_TUNNEL_REMOTE_HOST", "127.0.0.1"
+    ).strip()
+    ssh_user = os.environ.get("ASR_SSH_TUNNEL_USER", "").strip()
+    destination = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
+    command = [
+        "ssh",
+        "-p",
+        str(ssh_port),
+        "-N",
+        "-L",
+        f"{local_port}:{remote_host}:{remote_port}",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        destination,
+    ]
+    return "asr-model-tunnel", command, DATA_ROOT
+
+
 def _build_commands(mode: str, dotenv_path: Path | None = None) -> list[tuple[str, list[str], Path]]:
     """Build startup commands for instance.
 
@@ -463,6 +658,16 @@ def _build_commands(mode: str, dotenv_path: Path | None = None) -> list[tuple[st
     dotenv_arg = ["--dotenv", str(dotenv_path)] if dotenv_path else []
 
     if mode in ("all", "app", "dev"):
+        if dotenv_path is None:
+            tunnel = _video_ssh_tunnel_sidecar_command()
+            if tunnel is not None:
+                commands.append(tunnel)
+            asr_tunnel = _asr_ssh_tunnel_sidecar_command()
+            if asr_tunnel is not None:
+                commands.append(asr_tunnel)
+            sidecar = _omnimemory_sidecar_command(python_cmd)
+            if sidecar is not None:
+                commands.append(sidecar)
         cmd = [python_cmd, "-m", "jiuwenswarm.app"] + dotenv_arg
         commands.append(("app", cmd, DATA_ROOT))
 
@@ -756,6 +961,7 @@ def _run(mode: str) -> int:
         if _sync_default_env_ports(cmd.config.ports) is not None:
             return 1
 
+    load_dotenv_runtime(get_env_file(), override=True)
     commands = _build_commands(mode)
     if not commands:
         logging.info(f"[start_services] no commands to run for mode: {mode}")

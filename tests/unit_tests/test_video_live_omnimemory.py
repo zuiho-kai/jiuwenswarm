@@ -383,6 +383,83 @@ def test_current_visual_identification_drops_stale_entity_memory() -> None:
     assert "瑞幸" not in json.dumps(scoped, ensure_ascii=False)
 
 
+def test_visible_text_question_uses_current_frames_only() -> None:
+    memory_context = {
+        "available": True,
+        "qa_history": [{"answer": "瓶子上写着白桦树苏打水"}],
+    }
+
+    scoped = video_live._memory_context_for_question(
+        memory_context,
+        "水瓶上写了什么？",
+    )
+    frames = video_live._latest_frames_by_source(
+        [
+            ("old-camera", "camera"),
+            ("new-screen", "screen"),
+            ("new-camera", "camera"),
+        ]
+    )
+
+    assert scoped == {"available": True, "scope": "current_frames_only"}
+    assert frames == [("new-screen", "screen"), ("new-camera", "camera")]
+
+
+@pytest.mark.asyncio
+async def test_realtime_visible_text_ignores_old_frames_and_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Session:
+        def __init__(self, ws_url: str, api_key: str, model: str) -> None:
+            captured["config"] = (ws_url, api_key, model)
+
+        async def ask(self, **kwargs: object) -> str:
+            captured.update(kwargs)
+            return "MiniMax"
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("http://model/v1", "key", "openbmb/MiniCPM-o-4_5"),
+    )
+    monkeypatch.setattr(
+        video_live,
+        "_video_stream_realtime_ws_url",
+        lambda _base, _model: "ws://model/v1/video/chat/stream",
+    )
+    monkeypatch.setattr(video_live, "_VllmVideoStreamSession", _Session)
+
+    answer = "".join(
+        [
+            part
+            async for part in video_live._stream_video_answer(
+                "水瓶上写了什么？",
+                [
+                    ("data:image/jpeg;base64,b2xk", "camera"),
+                    ("data:image/jpeg;base64,bmV3", "camera"),
+                ],
+                [],
+                memory_context={
+                    "available": True,
+                    "qa_history": [{"answer": "白桦树苏打水"}],
+                },
+            )
+        ]
+    )
+
+    assert answer == "MiniMax"
+    assert captured["frames"] == [
+        ("data:image/jpeg;base64,bmV3", "camera")
+    ]
+    assert "白桦树苏打水" not in str(captured["system_prompt"])
+    assert "current_frames_only" in str(captured["system_prompt"])
+
+
 def test_historical_visual_question_keeps_memory() -> None:
     memory_context = {
         "available": True,
@@ -787,6 +864,178 @@ async def test_typed_question_keeps_audio_for_primary_omni(
     )
 
 
+def test_asr_config_does_not_fall_back_to_video_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "ASR_API_BASE",
+        "ASR_API_KEY",
+        "ASR_MODEL_NAME",
+        "VISION_API_BASE",
+        "VISION_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(video_live, "_configured_audio_model", lambda: ("", "", ""))
+    monkeypatch.setattr(
+        video_live,
+        "_omni_model_config",
+        lambda: ("http://joyai/v1", "video-key", "jdopensource/JoyAI-VL-Interaction"),
+    )
+
+    assert video_live._asr_model_config() == (
+        "",
+        "",
+        "FunAudioLLM/SenseVoiceSmall",
+    )
+
+
+def test_unconfigured_auxiliary_models_do_not_invent_model_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "VIDEO_FALLBACK_API_BASE",
+        "VIDEO_FALLBACK_API_KEY",
+        "VIDEO_FALLBACK_MODEL_NAME",
+        "VIDEO_TOOL_API_BASE",
+        "VIDEO_TOOL_API_KEY",
+        "VIDEO_TOOL_MODEL_NAME",
+        "VISION_API_BASE",
+        "VISION_API_KEY",
+        "VISION_MODEL_NAME",
+        "REASONING_API_BASE",
+        "REASONING_API_KEY",
+        "REASONING_MODEL_NAME",
+        "DEEP_REASONING_ENABLED",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    primary = (
+        "http://joyai/v1",
+        "video-key",
+        "jdopensource/JoyAI-VL-Interaction",
+    )
+    default = (
+        "https://api.deepseek.com",
+        "chat-key",
+        "deepseek-v4-flash",
+    )
+    monkeypatch.setattr(video_live, "_omni_model_config", lambda: primary)
+    monkeypatch.setattr(video_live, "_configured_default_model", lambda: default)
+
+    assert video_live._video_tool_model_config() == default
+    assert video_live._fallback_video_model_config() == primary
+    assert video_live._deep_reasoning_model_config() == default
+
+
+def test_configured_default_model_prefers_marked_main_chat_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jiuwenswarm.common import config
+
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda: {
+            "models": {
+                "defaults": [
+                    {
+                        "model_client_config": {
+                            "api_base": "https://secondary.example/v1",
+                            "api_key": "secondary-key",
+                            "model_name": "secondary-model",
+                        },
+                        "is_default": False,
+                    },
+                    {
+                        "model_client_config": {
+                            "api_base": "https://main.example/v1/",
+                            "api_key": "main-key",
+                            "model_name": "main-model",
+                        },
+                        "is_default": True,
+                    },
+                ]
+            }
+        },
+    )
+
+    assert video_live._configured_default_model() == (
+        "https://main.example/v1",
+        "main-key",
+        "main-model",
+    )
+
+
+@pytest.mark.asyncio
+async def test_typed_question_ignores_audio_when_non_omni_has_no_asr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    for name in (
+        "ASR_API_BASE",
+        "ASR_API_KEY",
+        "ASR_MODEL_NAME",
+        "VISION_API_BASE",
+        "VISION_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(video_live, "_configured_audio_model", lambda: ("", "", ""))
+
+    async def unexpected_transcription(audio_inputs):
+        del audio_inputs
+        raise AssertionError("typed request must not call an unconfigured ASR")
+
+    monkeypatch.setattr(
+        video_live,
+        "_transcribe_audio_inputs",
+        unexpected_transcription,
+    )
+    requests: list[dict[str, object]] = []
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="画面请求已正常回答。",
+                            reasoning_content=None,
+                        )
+                    )
+                ]
+            )
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+    answer = "".join(
+        [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "请回答我的文字问题",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [("data:audio/webm;base64,eA==", "共享屏幕音频")],
+                model_config=(
+                    "http://joyai/v1",
+                    "video-key",
+                    "jdopensource/JoyAI-VL-Interaction",
+                ),
+            )
+        ]
+    )
+
+    assert answer == "画面请求已正常回答。"
+    request_content = requests[0]["messages"][1]["content"]
+    assert all(item.get("type") != "audio_url" for item in request_content)
+
+
 @pytest.mark.asyncio
 async def test_microphone_uses_verified_asr_text_instead_of_omni_audio(
     monkeypatch: pytest.MonkeyPatch,
@@ -835,6 +1084,127 @@ async def test_microphone_uses_verified_asr_text_instead_of_omni_audio(
     }
     assert any(event["name"] == "video.transcript" for event in channel.events)
     assert channel.responses[-1]["payload"]["native_audio_emitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_video_question_preserves_turn_when_model_answer_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIMEMORY_API_BASE", raising=False)
+    monkeypatch.setattr(video_live, "_memory_client", None)
+
+    async def empty_answer(question, frames, audio_inputs, **options):
+        del question, frames, audio_inputs, options
+        if False:
+            yield ""
+
+    monkeypatch.setattr(video_live, "_stream_video_answer", empty_answer)
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["video.ask"](
+        object(),
+        "ask-empty-answer",
+        {
+            "question": "你能看见当前画面吗？",
+            "frames": [_frame()],
+            "voice_question": True,
+        },
+        "session-empty-answer",
+    )
+
+    payload = channel.responses[-1]["payload"]
+    assert payload["answer"] == ""
+    assert payload["ignored"] is False
+    assert payload["outcome"] == "empty_model_answer"
+
+
+@pytest.mark.asyncio
+async def test_video_question_only_ignores_rejected_microphone_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIMEMORY_API_BASE", raising=False)
+    monkeypatch.setattr(video_live, "_memory_client", None)
+    monkeypatch.setattr(
+        video_live,
+        "_transcribe_audio_inputs",
+        lambda inputs: asyncio.sleep(0, result=""),
+    )
+
+    async def unexpected_answer(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("rejected voice must not call the video model")
+        yield ""  # pragma: no cover
+
+    monkeypatch.setattr(video_live, "_stream_video_answer", unexpected_answer)
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["video.ask"](
+        object(),
+        "ask-rejected-voice",
+        {
+            "question": "",
+            "frames": [_frame()],
+            "audio_inputs": [{
+                "data_url": "data:audio/wav;base64,eA==",
+                "source_label": "用户麦克风提问",
+            }],
+        },
+        "session-rejected-voice",
+    )
+
+    payload = channel.responses[-1]["payload"]
+    assert payload["ignored"] is True
+    assert payload["outcome"] == "voice_rejected"
+
+
+@pytest.mark.asyncio
+async def test_verified_voice_question_discards_ambient_source_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIMEMORY_API_BASE", raising=False)
+    monkeypatch.setattr(video_live, "_memory_client", None)
+
+    async def unexpected_transcription(inputs):
+        del inputs
+        raise AssertionError("verified voice must not transcribe ambient source audio")
+
+    captured: dict[str, object] = {}
+
+    async def stream_answer(question, frames, audio_inputs, **options):
+        del frames, options
+        captured["question"] = question
+        captured["audio_inputs"] = audio_inputs
+        yield "我能看到当前画面。"
+
+    monkeypatch.setattr(video_live, "_transcribe_audio_inputs", unexpected_transcription)
+    monkeypatch.setattr(video_live, "_stream_video_answer", stream_answer)
+    channel = _Channel()
+    video_live.register_video_live_handler(channel)
+
+    await channel.methods["video.ask"](
+        object(),
+        "ask-verified-with-ambient-audio",
+        {
+            "question": "能看见我手中的水杯吗？",
+            "frames": [_frame()],
+            "voice_question": True,
+            "audio_inputs": [{
+                "data_url": "data:audio/wav;base64,eA==",
+                "source_label": "共享屏幕音频",
+            }],
+        },
+        "session-verified-with-ambient-audio",
+    )
+
+    assert captured == {
+        "question": "能看见我手中的水杯吗？",
+        "audio_inputs": [],
+    }
+    payload = channel.responses[-1]["payload"]
+    assert payload["outcome"] == "success"
+    assert payload["ignored"] is False
 
 
 @pytest.mark.asyncio
@@ -1018,10 +1388,73 @@ async def test_deep_reasoning_subagent_searches_before_conclusion(
     )
     assert "tools" not in requests[2]
     assert statuses == [
-        "DSV3.2 正在搜索：可口可乐最新财报和估值",
-        "DSV3.2 正在搜索：可口可乐近期风险新闻",
-        "DSV3.2 正在汇总结论",
+        "文本推理模型正在搜索：可口可乐最新财报和估值",
+        "文本推理模型正在搜索：可口可乐近期风险新闻",
+        "文本推理模型正在汇总结论",
     ]
+
+
+@pytest.mark.asyncio
+async def test_deep_reasoning_retries_without_unsupported_auto_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    class _AutoToolChoiceError(Exception):
+        status_code = 400
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise _AutoToolChoiceError(
+                    '"auto" tool choice requires --enable-auto-tool-choice '
+                    "and --tool-call-parser to be set"
+                )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="根据现有证据，暂时无法确认。",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        )
+                    )
+                ]
+            )
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+    monkeypatch.setattr(
+        video_live,
+        "_deep_reasoning_model_config",
+        lambda: (
+            "http://reasoning-without-auto-tools",
+            "key",
+            "openbmb/MiniCPM-o-4_5",
+        ),
+    )
+
+    result = await video_live._run_deep_reasoning(
+        {"problem": "分析当前证据"},
+        question="结论是什么？",
+        memory_context=None,
+    )
+
+    assert result["conclusion"] == "根据现有证据，暂时无法确认。"
+    assert requests[0]["tool_choice"] == "auto"
+    assert "tools" in requests[0]
+    assert "tools" not in requests[1]
+    assert "tool_choice" not in requests[1]
 
 
 @pytest.mark.asyncio
@@ -1104,9 +1537,9 @@ async def test_deep_reasoning_stops_after_search_backend_error(
     assert result["search_queries"] == ["可口可乐股票"]
     assert result["conclusion"] == "搜索不可用，无法可靠判断。"
     assert statuses == [
-        "DSV3.2 正在搜索：可口可乐股票",
+        "文本推理模型正在搜索：可口可乐股票",
         "外部搜索不可用，正在根据现有证据总结",
-        "DSV3.2 正在汇总结论",
+        "文本推理模型正在汇总结论",
     ]
 
 
@@ -1169,6 +1602,128 @@ async def test_qwen_does_not_register_memory_search_tool(
     assert [
         tool["function"]["name"] for tool in requests[0]["tools"]
     ] == ["respond", "silent"]
+    assert requests[0]["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_qwen_retries_without_tools_when_vllm_rejects_auto_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    class _AutoToolChoiceError(Exception):
+        status_code = 400
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise _AutoToolChoiceError(
+                    '"auto" tool choice requires --enable-auto-tool-choice '
+                    "and --tool-call-parser to be set"
+                )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="杯子在桌面上。",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        )
+                    )
+                ]
+            )
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+    model_config = (
+        "http://vllm-without-auto-tools",
+        "key",
+        "openbmb/MiniCPM-o-4_5",
+    )
+
+    first_answer = "".join(
+        [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "杯子放在哪里？",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [],
+                model_config=model_config,
+            )
+        ]
+    )
+    second_answer = "".join(
+        [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "杯子放在哪里？",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [],
+                model_config=model_config,
+            )
+        ]
+    )
+
+    assert first_answer == "杯子在桌面上。"
+    assert second_answer == "杯子在桌面上。"
+    assert requests[0]["tool_choice"] == "auto"
+    assert "tools" in requests[0]
+    assert all("tools" not in request for request in requests[1:])
+    assert all("tool_choice" not in request for request in requests[1:])
+
+
+@pytest.mark.asyncio
+async def test_qwen_does_not_hide_unrelated_bad_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    class _OtherBadRequest(Exception):
+        status_code = 400
+
+    class _Completions:
+        async def create(self, **request):
+            requests.append(request)
+            raise _OtherBadRequest("maximum context length exceeded")
+
+    class _OpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _OpenAI)
+
+    with pytest.raises(_OtherBadRequest, match="maximum context length"):
+        _ = [
+            part
+            async for part in video_live._stream_qwen_omni(
+                "杯子放在哪里？",
+                [("data:image/jpeg;base64,eA==", "camera")],
+                [],
+                model_config=(
+                    "http://vllm-other-bad-request",
+                    "key",
+                    "openbmb/MiniCPM-o-4_5",
+                ),
+            )
+        ]
+
+    assert len(requests) == 1
     assert requests[0]["tool_choice"] == "auto"
 
 

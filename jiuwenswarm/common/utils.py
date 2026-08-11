@@ -1693,9 +1693,9 @@ def get_env_file() -> Path:
 
 
 def reset_free_search_runtime_flags() -> None:
-    """Start each process with free-search engines disabled unless reopened via config UI."""
-    os.environ["FREE_SEARCH_DDG_ENABLED"] = "false"
-    os.environ["FREE_SEARCH_BING_ENABLED"] = "false"
+    """Default free-search engines to disabled while preserving explicit config."""
+    os.environ.setdefault("FREE_SEARCH_DDG_ENABLED", "false")
+    os.environ.setdefault("FREE_SEARCH_BING_ENABLED", "false")
 
 
 def get_config_file() -> Path:
