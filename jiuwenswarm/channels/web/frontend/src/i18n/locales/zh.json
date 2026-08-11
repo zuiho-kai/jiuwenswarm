@@ -479,7 +479,7 @@
     "formSubmit": "确定",
     "formCancel": "取消",
     "editTitle": "编辑目标",
-    "toolbarTag": "目标",
+    "toolbarTag": "当前任务",
     "toolbarUnavailable": "当前已有进行中的目标，请先完成或清除",
     "toolbarUnavailablePlan": "计划模式进行中，暂不可选择目标",
     "closeTag": "取消目标",
