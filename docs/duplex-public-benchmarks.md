@@ -161,3 +161,12 @@ AgentRadio 成对报告默认对比原 SDK steer，可显式设置 `comparison_b
 取消旧判断并合并重判、原 DAO ACK 和重复消息去重、EventBus 事件不被输入分类阻塞、
 真实工具执行收据落盘，以及同题持久 Native 和原 Python 3.11 浏览器动作解析器。
 模型响应为受控测试端点；结果不是公开任务分数。Ruff 检查通过。
+
+服务器本轮回归为 68 通过、2 跳过（仍缺 Harbor 和独立 WebArena 环境）。真实模型
+独立启动进一步发现适配器未绑定 SDK 消息表会话；补上入口会话隔离后，本机和服务器
+各自的独立 DB 专项测试均通过。服务器代码版本为 `b7e952cb`。
+
+修复后的真实 SiliconFlow + Jiuwen DB 检查完成：原首条更新入库并由原 DAO 确认已读，
+快路由约 2010 ms 超时降级 APPEND，慢模型后续采纳更新并完成响应。全链约 92 秒；
+这仍是无网页工具的接线验证，不能作为任务成功率或延迟收益。结果位于服务器
+`results/live-db-rework/result.json`、`events.jsonl`，相对于上述部署目录。
