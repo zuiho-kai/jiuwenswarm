@@ -1,5 +1,5 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Bounded, stateless shadow routing. This module never mutates agent state."""
+"""Bounded, stateless input classification; never mutates agent state."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class InboundMessage:
     message_id: str
     sender: str
     content: str
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ INTERRUPT: a changed goal or hard constraint invalidates the committed direction
 If evidence is insufficient, choose APPEND. Unknown fields mean unknown, not safe.
 You cannot see hidden reasoning, partial output, or KV cache. Do not infer them.
 Return only action, context_version, round_id, checkpoint_id using the supplied
-identifiers exactly. This is a shadow experiment: no action will be executed.
+identifiers exactly. The runtime applies the decision only after version validation.
 """
 
 
@@ -93,8 +94,8 @@ async def observe(
 ) -> Observation:
     """Recompute once on a changed snapshot within one total time budget.
 
-    Cancellation propagates to the owner; errors/timeouts only affect the
-    observation. The real delivery must run independently of this coroutine.
+    Cancellation propagates to the owner; errors/timeouts return APPEND.
+    The caller owns delivery and must validate the version before applying it.
     """
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be finite and positive")
@@ -134,7 +135,7 @@ def prompt_for(snapshot: ControlSnapshot, messages: tuple[InboundMessage, ...]) 
     for message in messages:
         payload = asdict(message)
         payload["content"] = message.content[:per_message]
-        payload["truncated"] = len(message.content) > per_message
+        payload["truncated"] = message.truncated or len(message.content) > per_message
         payloads.append(payload)
     return json.dumps({"snapshot": asdict(snapshot),
                        "messages": payloads}, ensure_ascii=False)

@@ -1,6 +1,13 @@
 # 前端显示语言：zh（中文）/ en（英文），与 Web 界面语言切换同步
 preferred_language: zh
 
+# Native A2A / U2A 输入路由；修改 mode 后重启团队。模型名来自当前团队模型池。
+duplex_router:
+  mode: "off"  # off / shadow / active
+  policy: model  # model / always_interrupt / steer / serial（后两项用于对照）
+  model_name: ""
+  timeout_seconds: 2.0
+
 # Web 首次模型配置引导；用户确认完成后会自动关闭，可通过侧栏问号再次打开
 setup_guide:
   enabled: true

@@ -134,6 +134,7 @@ async def test_observer_coalesces_bounds_queue_and_closes_without_leak(monkeypat
     monkeypatch.setattr(shadow.logger, "info", info)
     host = Host()
     observer = shadow.ShadowObserver(host, "small", 2)
+    observer._snapshot = snapshot
     entered = asyncio.Event()
 
     async def blocked(*_):
