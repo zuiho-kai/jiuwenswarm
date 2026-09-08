@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 
@@ -18,7 +19,7 @@ class PendingInput:
 class InputController:
     """Batch arrivals without cancelling an already applying Native transaction.
 
-    Futures resolve only after delivery. The SDK remains responsible for DB ACK.
+    Futures resolve after application; the SDK can ACK earlier after durable acceptance.
     The oldest arrival owns the deadline, so a busy sender cannot starve delivery.
     """
     def __init__(self, *, snapshot, classify, apply, timeout=None):
@@ -45,7 +46,14 @@ class InputController:
         self.changed.set()
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._run(), name="duplex-input-controller")
+            self.task.add_done_callback(self._report_failure)
         return future
+
+    @staticmethod
+    def _report_failure(task):
+        if not task.cancelled() and task.exception() is not None:
+            logging.getLogger(__name__).error(
+                "accepted input application failed; durable input retained", exc_info=task.exception())
 
     async def _decide(self, deadline):
         attempts = 0
@@ -99,8 +107,7 @@ class InputController:
                     else:
                         item.future.set_exception(error)
             self.pending.clear()
-            if isinstance(error, asyncio.CancelledError):
-                raise
+            raise
 
     async def aclose(self):
         self.closed = True

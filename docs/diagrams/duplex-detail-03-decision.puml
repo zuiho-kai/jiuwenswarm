@@ -19,8 +19,8 @@ else (是)
 endif
 :③.2 快模型判断追加或打断;
 note right
-  使用模型自身请求超时。
-  仅在显式配置时增加总判断期限；新消息不延长它。
+  总期限取 SDK 快模型 timeout，可显式覆盖。
+  从最早消息到达起算；新消息不延长它。
   真正并发到达的新消息可取消旧判断并合批。
 end note
 if (③.3 判断成功且版本有效？) then (否)
@@ -33,7 +33,7 @@ endif
 stop
 legend bottom
   快模型不负责暂停；应用时再验版本。
-  超时、异常和过期结果不自动转成追加。
+  超时、异常和过期结果不执行旧打断；沿用原 steer。
   对应代码：duplex_router.py / duplex_state.py / duplex_shadow.py
 endlegend
 @enduml

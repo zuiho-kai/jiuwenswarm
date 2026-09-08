@@ -7,14 +7,13 @@ skinparam activityBackgroundColor #E1F0FF
 skinparam activityDiamondBackgroundColor #FFF1CC
 skinparam noteBackgroundColor #F5F6F8
 start
-:先持久保存完整消息和稳定会话身份\n写入失败就不投递、不确认已读;
+:使用第 ② 步已可靠保存的输入;
 :④.1 慢 Agent 的执行器收到决定\n再次检查消息 ID、当前运行状态和版本;
 if (这一批已经全部接收？) then (是)
   :不重复执行，返回接收成功;
 else (否)
   if (决定仍适用于当前状态？) then (否)
-    :返回投递失败\nDB 保持未读，等待重试;
-    stop
+    :过滤已应用消息\n剩余消息交原 steer;
   else (是)
     if (④.2 快模型选择什么？) then (追加)
       :④A 放入追加队列\n当前模型或工具继续执行;
@@ -31,7 +30,7 @@ else (否)
         :取消正在进行的模型生成\n恢复生成前的安全检查点;
       endif
       if (安全暂停成功且没有被停止 / 取消？) then (否)
-        :投递失败，不自动重启\nDB 消息保持未读;
+        :投递失败，不自动重启\n持久输入保留，停止标记阻止自动恢复;
         stop
       else (是)
         :加入完整新消息\n同一个慢 Agent 带着保留的结果继续;
@@ -39,7 +38,7 @@ else (否)
     endif
   endif
 endif
-:④.3 接收成功后，原消息处理器确认 DB 已读\n用户入口则返回接收结果;
+:④.3 标记当前实例已应用输入;
 :进入总览第 ⑤ 步：慢 Agent 继续任务;
 stop
 legend bottom

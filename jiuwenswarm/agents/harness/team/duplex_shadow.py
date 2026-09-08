@@ -194,7 +194,7 @@ def _submit(handler, msg, expanded, is_human_agent: bool) -> None:
                                    expanded.body))
 
 
-async def deliver_routed(host, content, *, use_steer, original, settings=None):
+async def deliver_routed(host, content, *, use_steer, original, settings=None, accept_only=False):
     from jiuwenswarm.common.config import get_config
     from jiuwenswarm.agents.harness.team.duplex_native import DuplexNativeHarness
 
@@ -216,8 +216,12 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     if policy != "always_interrupt" and not str(config.get("model_name") or "").strip():
         raise ValueError("active model routing requires model_name")
     controller = input_controller(host, config, original)
+    content = await native.durable_input(content)
+    future = controller.submit(content)
+    if accept_only:
+        return  # Durable acceptance frees the original SDK event/drain loop.
     try:
-        return await controller.submit(content)
+        return await asyncio.shield(future)
     except asyncio.CancelledError:
         await controller.aclose()
         raise
@@ -231,8 +235,10 @@ def input_controller(host, config, original):
     if controller is not None and not controller.closed:
         return controller
     model = str(config.get("model_name") or "")
-    timeout = (float(config["timeout_seconds"]) if config.get("timeout_seconds") is not None else None)
-    if (timeout is not None and (not math.isfinite(timeout) or timeout <= 0)):
+    timeout = (float(config["timeout_seconds"]) if config.get("timeout_seconds") is not None
+               else (None if config.get("policy") == "always_interrupt"
+                     else float(host.tiny_agent_model_resolver(model).model_client_config.timeout)))
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("invalid input controller timeout")
     observer = ShadowObserver(host, model, timeout)
 
@@ -246,11 +252,13 @@ def input_controller(host, config, original):
         batch = tuple(item for item in batch if item.message.message_id not in native._duplex_received)
         if not batch:
             return
-        if decision is not None and decision.status == "stale" and native.active_round is None:
-            decision = None  # The previous round ended; SDK can admit this as a new input.
+        # Input is already durable. Classification failure keeps the proposal's
+        # original steer fallback; never label a failed classification successful.
         if decision is not None and decision.status != "ok":
-            raise RuntimeError(f"input classification failed: {decision.status}; retry delivery")
-        batch = tuple([await native.durable_input(item) for item in batch])
+            recorder = getattr(host, "record_duplex_observation", None)
+            if recorder is not None:
+                recorder(decision)
+            decision = None
         if decision is None:
             for item in batch:
                 await original(host, str(item), use_steer=True)
@@ -264,7 +272,11 @@ def input_controller(host, config, original):
             message_id=batch[0].message.message_id,
             message_ids=tuple(item.message.message_id for item in batch))
         if effective == "STALE":
-            raise RuntimeError("input decision became stale; retry delivery")
+            for item in batch:
+                if item.message.message_id not in native._duplex_received:
+                    await original(host, str(item), use_steer=True)
+                    native._duplex_received.add(item.message.message_id)
+            effective = "APPEND"
         logger.info("duplex.route %s", json.dumps({
             "message_ids": [item.message.message_id for item in batch],
             "proposed_action": decision.proposed_action, "effective_action": effective,
@@ -337,7 +349,7 @@ def install_shadow_observer() -> bool:
     @wraps(deliver)
     async def deliver_with_route(self, content, *, use_steer=True):
         if isinstance(content, RoutedInput):
-            return await deliver_routed(self, content, use_steer=use_steer, original=deliver)
+            return await deliver_routed(self, content, use_steer=use_steer, original=deliver, accept_only=True)
         return await deliver(self, content, use_steer=use_steer)
 
     TeamAgent.deliver_input = deliver_with_route

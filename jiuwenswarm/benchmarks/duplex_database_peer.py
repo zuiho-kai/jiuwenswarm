@@ -26,6 +26,7 @@ class DatabasePeer(NativePeer):
         super().__init__(**kwargs)
         self.database, self.team = Path(database), team
         self.db = None
+        self._receipts = {}
         self.duplex_settings = {"mode": "active", "policy": self.policy,
                                 "model_name": "fast"}
 
@@ -50,7 +51,7 @@ class DatabasePeer(NativePeer):
         from openjiuwen.agent_teams.tools.database import DatabaseConfig, DatabaseType, TeamDatabase
         from openjiuwen.agent_teams.tools.message_manager import TeamMessageManager
         from openjiuwen.agent_teams.agent.coordination.handlers.message import MessageHandler
-        from openjiuwen.agent_teams.agent.coordination.event_bus import EventBus
+        from openjiuwen.agent_teams.agent.coordination.event_bus import EventBus, InnerEventType
         from openjiuwen.agent_teams.schema.events import TeamTopic
         from openjiuwen.agent_teams.schema.team import TeamRole
         from jiuwenswarm.agents.harness.team.duplex_shadow import install_shadow_observer
@@ -96,20 +97,24 @@ class DatabasePeer(NativePeer):
             message = peer.handler
 
             async def dispatch(self, event):
-                await peer.handler.on_message_or_broadcast(event)
+                try:
+                    if event.event_type == InnerEventType.POLL_MAILBOX:
+                        await peer.handler.on_poll_mailbox(event)
+                    else:
+                        await peer.handler.on_message_or_broadcast(event)
+                    for identity, future in tuple(peer._receipts.items()):
+                        row = await peer.db.message.get_message(identity)
+                        if row is not None and row.is_read and not future.done():
+                            future.set_result(None)
+                except Exception as error:
+                    for future in tuple(peer._receipts.values()):
+                        if not future.done():
+                            future.set_exception(error)
+                    raise
 
         self.topic = TeamTopic.MESSAGE.build(self.team, self.team)
         await self.bus.start(wake_callback=Dispatch().dispatch)
         await self.messager.subscribe(self.topic, self.bus.enqueue)
-        self.poller = asyncio.create_task(self._poll(), name="jiuwen-benchmark-db-poll")
-
-    async def _poll(self):
-        while True:
-            try:
-                await self.handler.on_poll_mailbox(None)
-            except Exception as error:
-                self.events.add("mailbox_poll_error", error_type=type(error).__name__)
-            await asyncio.sleep(0.25)
 
     @team_context
     async def receive(self, content, *, message_id, sender="coral"):
@@ -127,13 +132,14 @@ class DatabasePeer(NativePeer):
         elif row.is_read:
             return
         self.events.add("message_arrived", member=self.name, message_id=identity)
+        future = self._receipts.setdefault(identity, asyncio.get_running_loop().create_future())
         await self.messager.publish(topic_id=self.topic, message=EventMessage.from_event(MessageEvent(
             message_id=identity, team_name=self.team, from_member_name=sender, to_member_name=self.name)))
-        # Original SDK drain owns rendering, ordering and ACK after delivery.
-        await self.handler._process_unread_messages(self.name)
-        row = await self.db.message.get_message(identity)
-        if not row.is_read:
-            raise RuntimeError("official transport input remains unread")
+        # Only the original event bus / mailbox poll drives the drain.
+        try:
+            await asyncio.shield(future)
+        finally:
+            self._receipts.pop(identity, None)
         self.events.add("message_accepted", member=self.name, message_id=identity)
 
     @team_context
@@ -143,10 +149,10 @@ class DatabasePeer(NativePeer):
     @team_context
     async def close(self):
         if self.db is not None:
-            poller = getattr(self, "poller", None)
-            if poller is not None:
-                poller.cancel()
-                await asyncio.gather(poller, return_exceptions=True)
+            for future in self._receipts.values():
+                if not future.done():
+                    future.cancel()
+            self._receipts.clear()
             if hasattr(self, "topic"):
                 await self.messager.unsubscribe(self.topic)
             if hasattr(self, "bus"):

@@ -184,7 +184,11 @@ class NativePeer:
                 await asyncio.sleep(0.01)
                 if self._failure is not None:
                     raise RuntimeError(f"native benchmark worker failed: {self._failure}")
-                if self.harness.state is HarnessState.IDLE and self._last_result is not None:
+                controller = getattr(self.harness, "_duplex_controller", None)
+                if controller is not None and controller.task is not None and controller.task.done():
+                    controller.task.result()  # Accepted input application failures are visible to the run.
+                if (self.harness.state is HarnessState.IDLE and self._last_result is not None
+                        and not (controller is not None and controller.pending)):
                     return self._last_result
 
     async def close(self):
@@ -219,5 +223,8 @@ class UserInputPeer(NativePeer):
                         handler="AgentLifecycleHandler.on_user_input")
         await handler.on_user_input(InnerEventMessage(event_type=InnerEventType.USER_INPUT,
             payload={"content": content, "message_id": message_id}))
+        controller = getattr(self.harness, "_duplex_controller", None)
+        if controller is not None and controller.task is not None:
+            await asyncio.shield(controller.task)
         self._received.add(message_id)
         self.events.add("message_accepted", member=self.name, message_id=message_id)
