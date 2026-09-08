@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -442,6 +444,39 @@ async def test_user_input_uses_same_atomic_controller(world):
     recovered = json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
     assert "Change goal: use PostgreSQL only" in recovered
     assert w.native._st.round_id_counter == 2
+
+
+@pytest.mark.asyncio
+async def test_official_interruptbench_update_reaches_native_unchanged(world, tmp_path):
+    """Official input through real runtime; not a WebArena task success test."""
+    from jiuwenswarm.common.duplex_public_benchmark import load_official_interrupt
+    from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
+
+    source = os.environ.get("JIUWEN_INTERRUPT_BENCH_ROOT")
+    if not source:
+        pytest.skip("set JIUWEN_INTERRUPT_BENCH_ROOT to the pinned official checkout")
+    root = Path(source)
+    trajectory = tmp_path / "baseline-shape-fixture.json"
+    trajectory.write_text(json.dumps({"task_id": 0, "actions": [{"action_type": 0}] * 7}))
+    case = load_official_interrupt(root, suite="1update", task_id="0",
+        config_file=root / "Eval/config_files/wa/test_webarena_lite_transformed_1update/0.json",
+        spec_file=root / "Eval/interrupt_config/process/interrupt_spec_1update_opus_02.json",
+        trajectory_file=trajectory)
+    w = world
+    await w.harness.send(case.initial_intent)
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+    lifecycle = AgentLifecycleHandler(w.host, w.handler._blueprint, w.handler._infra, NS())
+    with pytest.raises(ValueError, match="boundary"):
+        await case.deliver(lifecycle, completed_actions=2, run_id="fixture")
+    await case.deliver(lifecycle, completed_actions=1, run_id="fixture")
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+    recovered = json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
+    assert case.initial_intent in recovered and case.update in recovered
+    assert "Impulse Duffle" not in recovered  # official evaluator answer stays private
+    rounds = w.native._st.round_id_counter
+    await case.deliver(lifecycle, completed_actions=1, run_id="fixture")
+    assert w.native._st.round_id_counter == rounds
+    assert w.tool.path.read_text() == "committed\n"
 
 
 @pytest.mark.asyncio

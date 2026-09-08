@@ -78,6 +78,10 @@ G2 安全全量打断、G3 快模型选择性打断。测试报告记录快慢�
 
 ## 真实快模型分类回放
 
+此回放只诊断路由，不能代替方案要求的公开任务评测。
+AgentRadio / InterruptBench 原始输入、接入进展和缺口见
+[公开评测接入](duplex-public-benchmarks.md)。
+
 ```powershell
 python -m jiuwenswarm.common.duplex_benchmark tests/fixtures/duplex/routing_cases.jsonl --validate-only
 python -m jiuwenswarm.common.duplex_benchmark tests/fixtures/duplex/routing_cases.jsonl --model-config D:/private/fast-model.json --output D:/results/duplex.json --repeats 3
