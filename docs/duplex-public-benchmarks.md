@@ -32,11 +32,72 @@ trajectory，校验任务 ID、初始意图与更新原文；直接执行固定�
 或输入被改写时拒绝投递；同一实验/阶段的重试使用相同 run_id。真实目标答案和
 评分条件不会交给快模型或慢模型。
 
-当前只支持初始阶段的一次更新。连续更新需要核对上游每一阶段生成的配置和历史，
-不能把第二轮 config 偷换成原始初始任务。上游 `update_mode=append/replace` 是
-用户意图更新方式，不是快模型应该输出 APPEND/INTERRUPT 的标签。
+这个输入级 helper 只支持初始阶段的一次更新。完整执行入口 `interruptbench_runner`
+在上游 runner 的实际注入分支接入，保留上游生成的逐阶段意图与历史，支持连续更新。
+上游 `update_mode=append/replace` 是用户意图更新方式，不是快模型的正确动作标签。
 
-## 验证与剩余工作
+## 完整执行入口
+
+`jiuwenswarm.benchmarks.duplex_experiment` 执行整个实验，配置例子在
+[AgentRadio](examples/duplex-agentradio.json)、[InterruptBench](examples/duplex-interruptbench.json)
+和[快慢模型](examples/duplex-models.json)。复制到工作区外填写真实配置，不提交密钥。
+例子默认只选一题验证接线；删除 `task_ids` 后使用完整官方任务集合。
+
+```powershell
+python -m jiuwenswarm.benchmarks.duplex_experiment D:/private/duplex-experiment.json --output D:/results/duplex-run-001
+```
+
+输出目录必须是新的。子进程逐条执行，不经过 shell 拼接；环境文件是字符串键值的
+JSON，凭据只进入子进程环境，不进入实验配置副本或汇总。产物包括每步日志、
+`execution.json`、原评分文件和 `report.json`。失败立即留下步骤和日志，不把它删掉。
+
+### AgentRadio
+
+- `JiuwenAgentRadio` 是 Harbor 0.6.4 的真实适配器，继承上游 Coral 启动、四 Agent
+  会话、任务容器和答案收集逻辑。原脚本生成的五阶段提示、通信脚本及恢复提示均保留。
+- 每个 peer 启动真实 Native。Bash 后台任务完成后把原 watcher 输出送到接收侧路由；
+  Agent 仍使用原 Coral 服务通信。这个实验测的是 Native 在原 Coral 通道上的执行策略，
+  不是把 Coral 偷换成 Jiuwen DB；Jiuwen DB 链路另由运行时集成测试覆盖。
+- L2/L3 使用上游原适配器；`steer` 使用原 Native；`abort_restart` 丢弃执行上下文，
+  保留输入重建 Native；`model` 使用安全 checkpoint 恢复。工具副作用不会随重建撤销。
+- 官方 `verify_local.py` 对每个 trial 评分。模型名、提供方和原基线的认证/代理需要配置一致；
+  上游 Claude Code 基线不能直接接任意 OpenAI 服务，需要其支持的代理适配。
+
+### InterruptBench
+
+- 原 `run.py` 在内存中只增加一个官方更新回调；网页 reset、轨迹 replay、提示构造、
+  动作解析、环境执行及 `evaluator_router` 都使用上游代码，不修改上游文件。
+- WebArena 依赖较旧，与 Native SDK 冲突，使用两个 Python 环境。旧环境拥有网页；
+  新环境通过独立进程执行 Native。stdin/stdout 只承载内部协议，模型日志走独立文件。
+- 模型收到的 chat messages 由原 prompt constructor 生成；模型返回文本交回原动作解析器。
+  Native 的内部工具及额外提示不进入浏览器模型请求。
+- 官方模式保持原 step 边界更新；并发扩展在同一 K-action 边界发起旧模型调用并异步投递
+  官方更新，期间不执行任何新网页动作。报告明确标记该注入条件，不冒充原版运行时。
+- 全量 abort 基线取消并重建模型执行上下文，但保留上游权威网页轨迹和已提交页面状态；
+  它不能撤销网页副作用，也不额外 reset 页面后重新执行旧动作。
+- 实验先保存一份官方 baseline，Stage 1 各策略共享该轨迹；后续阶段逐策略调用原
+  `make_multi_interrupt_stage.py`，沿各自上一阶段轨迹生成更新，历史不被清空。
+- 成对网页实验强制要求 `--reset_server_url` 和 `--reset_before_each_task`，避免状态污染。
+
+## 环境
+
+Harbor 固定 `harbor[modal]==0.6.4`、`modal==1.4.2`，需 Docker 或已认证的 Modal。
+将 Jiuwen 与 AgentRadio 仓库根目录放进 Harbor 环境的 `PYTHONPATH`。容器适配器会
+安装锁定的 Native SDK，并上传当前软件包；只打包 tracked 文件和明确的适配代码。
+
+WebArena 使用独立 Python 3.11，安装上游 requirements；此外，上游代码导入但未列在
+requirements 中的 `lxml`、`dashscope`、`anthropic` 也需安装，并受原依赖版本约束：
+
+```powershell
+uv pip install --python D:/eval/Scripts/python.exe -r D:/repos/InterruptBench/Eval/requirements.txt
+uv pip install --python D:/eval/Scripts/python.exe -c D:/repos/InterruptBench/Eval/requirements.txt lxml dashscope anthropic
+D:/eval/Scripts/python.exe -m playwright install chromium
+```
+
+Native Python 使用仓库锁定的 agent-core `94e10cb`。环境文件填写上游要求的站点、
+模型和评分器变量；真实 WebArena 网站镜像及 reset 服务仍须按上游部署说明启动。
+
+## 验证记录
 
 2026-09-08：8 项上游输入契约测试、1 项真实 Native U2A 桥接测试通过。
 测试读取外部官方数据；模型响应和 baseline 轨迹形状为测试夹具。
@@ -48,17 +109,20 @@ $env:JIUWEN_INTERRUPT_BENCH_ROOT='D:/jiusi_agent/_repos/InterruptBench'
 python -m pytest tests/unit_tests/agentserver/test_duplex_public_benchmark.py tests/integration_tests/test_duplex_e2e.py -k 'public_benchmark or official_interruptbench' -q -o addopts=''
 ```
 
-需要继续完成的实测链路：
+后续完整回归 132 项通过，另新增 2 项测试单独通过，共 134 项。包括实际 Native 进程、后台 Bash 投递、取消恢复和从头重跑
+副作用对照；原 AgentRadio 启动脚本真正执行并生成角色提示，官方三阶段生成器验证
+了更新顺序、历史和 K 边界。新增测试覆盖成对报告统计，以及真实 Python 3.11 上游
+PromptAgent → Python 3.12 Native → 原动作解析器；后者使用受控模型响应。
+跨环境启动会隔离父进程的 PYTHONHOME 等解释器变量，避免标准库版本混用。
 
-1. AgentRadio：原容器环境、消息服务、四 Agent 协议接入 Jiuwen 执行器，保持原题、
-   原工具与原评分器；分别运行 L2、L3、Jiuwen steer、全部 abort 重跑和语义路由。
-2. InterruptBench：将桥接挂到真实 WebArena replay runner，保留页面 reset、官方
-   updates、触发位置、完整 trajectory 与 `evaluator_router`；覆盖连续更新阶段。
-3. 收集原任务成功率、makespan、采纳延迟、快慢模型总 token、取消请求成本和重复
-   副作用。缺少指标必须报告缺失，不能把分类准确率代替任务成绩。
+本机已成功启动原 Coral 服务（API 返回 200），并在独立依赖环境中加载原
+InterruptBench runner 的命令入口。Harbor CLI 和上游 Chromium 已安装验证。
+以上都不是公开任务成绩。
 
-现有集成测试中的 `always_interrupt` 是安全边界恢复对照，不等同于公开方案的
-“任意消息都 abort 后从头重跑”基线，不能冒用该组成绩。
+报告将缺失评分留在分母内，基于末阶段做任务配对和 task bootstrap 置信区间。
+记录流式慢模型调用、取消、快模型决策次数、消息接受时间和可取得的 usage。
+消息接受时间不冒充首次正确动作时间；缺失的全量 token、GPU 时间及外部副作用
+统计保持 null，不推断成零。
 
-本机检查尚未找到 Docker/Harbor 命令、已配置的 WebArena 站点或可用模型配置。
-这些运行依赖及上述执行器接入尚未完成，因此目前没有公开任务成功率或性能结论。
+当前真实跑分仍缺外部运行配置：本机 Jiuwen 默认模型名、服务地址和密钥为空；没有
+可用 Docker/已认证 Modal 及 WebArena 站点配置。尚无公开任务成功率或性能结论。

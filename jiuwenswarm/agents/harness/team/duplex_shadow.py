@@ -196,11 +196,11 @@ def _submit(handler, msg, expanded, is_human_agent: bool) -> None:
                                    expanded.body[:_MAX_BODY], len(expanded.body) > _MAX_BODY))
 
 
-async def deliver_routed(host, content, *, use_steer, original):
+async def deliver_routed(host, content, *, use_steer, original, settings=None):
     from jiuwenswarm.common.config import get_config
     from jiuwenswarm.agents.harness.team.duplex_native import DuplexNativeHarness
 
-    config = get_config().get("duplex_router", {}) or {}
+    config = settings if settings is not None else (get_config().get("duplex_router", {}) or {})
     native = native_from_runtime(host.harness)
     if (config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness)
             or not use_steer):
@@ -228,6 +228,9 @@ async def deliver_routed(host, content, *, use_steer, original):
         router = ShadowObserver(host, model, timeout)
         result = await observe(snapshot, (message,), classify=router._classify,
                                current_snapshot=router._snapshot, timeout_seconds=timeout)
+        recorder = getattr(host, "record_duplex_observation", None)
+        if recorder is not None:
+            recorder(result)
         action, status = result.proposed_action, result.status
         # observe may have recomputed against a newer snapshot.
         version = result.context_version

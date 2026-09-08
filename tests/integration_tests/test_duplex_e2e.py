@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -50,6 +51,8 @@ class Endpoint:
         self.block_model = True
         self.tool_first = True
         self.intent_first = False
+        self.repeat_tool_without_result = False
+        self.final_content = "Finished using PostgreSQL."
 
     async def handle(self, request):
         body = await request.json()
@@ -63,7 +66,7 @@ class Endpoint:
         model = body["model"]
         call = sum(c["model"] == model for c in self.calls)
         slow_call = call - int(self.intent_first)
-        message = {"role": "assistant", "content": "Finished using PostgreSQL."}
+        message = {"role": "assistant", "content": self.final_content}
         if model == "fast":
             self.fast_entered.set()
             await self.fast_gate.wait()
@@ -80,7 +83,9 @@ class Endpoint:
             message = self.tool_message("update_working_intent", {
                 "goal": "Order event system", "current_hypothesis": "Use Kafka",
                 "next_action": "Implement producer", "constraints": ["Existing infrastructure only"]})
-        elif slow_call == 1 and self.tool_first:
+        elif self.tool_first and (slow_call == 1 or (self.repeat_tool_without_result and not any(
+                m.get("role") == "tool" and "committed exactly once" in str(m.get("content"))
+                for m in body["messages"]))):
             message = self.tool_message("write_once", {})
         elif self.block_model and slow_call == (2 if self.tool_first else 1):
             self.model_entered.set()
@@ -477,6 +482,173 @@ async def test_official_interruptbench_update_reaches_native_unchanged(world, tm
     await case.deliver(lifecycle, completed_actions=1, run_id="fixture")
     assert w.native._st.round_id_counter == rounds
     assert w.tool.path.read_text() == "committed\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy,writes", [("model", 1), ("abort_restart", 2)])
+async def test_benchmark_native_peer_executes_recovery_and_naive_restart(world, tmp_path, policy, writes):
+    from jiuwenswarm.benchmarks.duplex_runtime import Events, NativePeer
+    w = world
+    w.endpoint.repeat_tool_without_result = True
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    tool = WriteOnce(tmp_path / "peer-effects.txt")
+    events = Events(tmp_path / "metrics.jsonl")
+    peer = NativePeer(name="real-peer", models={"slow": slow, "fast": fast}, policy=policy,
+        system_prompt="Implement the task using tools.", tools=[tool], events=events)
+    await peer.start()
+    try:
+        await peer.send("Implement order events using Kafka.")
+        await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+        await peer.receive("Customer forbids Kafka. Use PostgreSQL.", message_id="m1")
+        result = await peer.wait(timeout=6)
+        assert "PostgreSQL" in result["output"]
+        assert tool.path.read_text() == "committed\n" * writes
+        assert any(e["event"] == "model_end" and e["status"] == "cancelled" for e in events.records)
+        assert any(e["event"] == "message_accepted" for e in events.records)
+    finally:
+        await peer.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_native_adapter_returns_original_prompt_action(world, tmp_path):
+    from jiuwenswarm.benchmarks.duplex_runtime import Events
+    from jiuwenswarm.benchmarks.interruptbench_runner import NativeBrowserBridge
+    w = world
+    w.endpoint.tool_first = False
+    w.endpoint.block_model = False
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    events = Events(tmp_path / "browser-metrics.jsonl")
+    bridge = NativeBrowserBridge(models={"slow": slow, "fast": fast}, policy="model",
+        events=events, official_records=[])
+    prompt = [{"role": "system", "content": "Keep official action syntax."},
+              {"role": "user", "content": "Original browser observation."}]
+    after = [*prompt, {"role": "user", "content": "Official updated goal."}]
+    current = {"after_prompt": after, "pending": {"before": "Original goal", "after": "Updated goal",
+        "update": "Official updated goal.", "message_id": "u-1", "delivered": False}}
+    answer = await bridge._predict(NS(model="slow", gen_config={}), prompt, current)
+    assert "PostgreSQL" in answer
+    requests = [r for r in w.endpoint.calls if r["model"] == "slow"]
+    assert requests[-1]["messages"] == after
+    assert not requests[-1].get("tools")
+
+
+@pytest.mark.asyncio
+async def test_browser_worker_process_uses_native_http_and_clean_stdio(world, tmp_path):
+    from jiuwenswarm.benchmarks.interruptbench_runner import ProcessWorker
+    w = world
+    w.endpoint.tool_first = False
+    w.endpoint.block_model = False
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({"slow": slow.model_dump(), "fast": fast.model_dump()}))
+    worker = ProcessWorker(Path(sys.executable), models, "model", tmp_path / "process.jsonl")
+    try:
+        prompt = [{"role": "user", "content": "Use the official browser action format."}]
+        answer = await asyncio.wait_for(asyncio.to_thread(worker.predict,
+            NS(model="slow", gen_config={}), prompt, None), 45)
+        assert "PostgreSQL" in answer
+        assert [r for r in w.endpoint.calls if r["model"] == "slow"][-1]["messages"] == prompt
+    finally:
+        await asyncio.to_thread(worker.close)
+
+
+@pytest.mark.asyncio
+async def test_background_bash_completion_reaches_live_native_peer(world, tmp_path):
+    from jiuwenswarm.benchmarks.agentradio_peer import BashTool
+    from jiuwenswarm.benchmarks.duplex_runtime import Events, NativePeer
+    import shutil
+    shell = shutil.which("bash") if os.name != "nt" else "C:/Program Files/Git/bin/bash.exe"
+    if not shell or not Path(shell).exists():
+        pytest.skip("Bash is required for the official AgentRadio shell adapter")
+    w = world
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    events = Events(tmp_path / "background.jsonl")
+    bash = BashTool(tmp_path, events, shell=shell)
+    peer = NativePeer(name="background-peer", models={"slow": slow, "fast": fast}, policy="model",
+        system_prompt="Implement the task.", tools=[WriteOnce(tmp_path / "bg-effects.txt"), bash], events=events)
+    bash.peer = peer
+    await peer.start()
+    try:
+        await peer.send("Implement order events using Kafka.")
+        await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+        result = await bash.invoke({"command": "printf 'Customer forbids Kafka. Use PostgreSQL.'", "run_in_background": True})
+        assert "started" in result
+        await asyncio.wait_for(asyncio.gather(*bash.jobs.values()), 6)
+        assert "PostgreSQL" in (await peer.wait(timeout=6))["output"]
+        slow_calls = [r for r in w.endpoint.calls if r["model"] == "slow"]
+        assert "Customer forbids Kafka" in json.dumps(slow_calls[-1]["messages"])
+    finally:
+        await bash.close()
+        await peer.close()
+
+
+@pytest.mark.asyncio
+async def test_original_browser_prompt_and_action_parser_across_environments(world, tmp_path):
+    """Real upstream PromptAgent -> separate Native process -> original parser."""
+    python = os.environ.get("JIUWEN_INTERRUPT_PYTHON")
+    root = os.environ.get("JIUWEN_INTERRUPT_BENCH_ROOT")
+    if not python or not root:
+        pytest.skip("separate official WebArena environment required")
+    w = world
+    w.endpoint.tool_first = False
+    w.endpoint.block_model = False
+    w.endpoint.final_content = "```stop [done]```"
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({"slow": slow.model_dump(), "fast": fast.model_dump()}))
+    script = tmp_path / "official-agent.py"
+    script.write_text('''import json,os,sys
+from pathlib import Path
+root,models,native,metrics=sys.argv[1:]
+os.chdir(Path(root)/"Eval")
+sys.path.insert(0,str(Path(root)/"Eval"))
+import agent.agent as module
+import run as upstream
+from browser_env.utils import DetachedPage
+from jiuwenswarm.benchmarks.duplex_metrics import Events
+from jiuwenswarm.benchmarks.interruptbench_runner import NativeBrowserBridge
+sys.argv=["run.py","--provider","openai","--model","slow","--mode","chat",
+"--instruction_path","agent/prompts/jsons/p_cot_id_actree_2s.json",
+"--action_set_tag","id_accessibility_tree","--observation_type","accessibility_tree",
+"--max_obs_length","0"]
+args=upstream.config()
+bridge=NativeBrowserBridge(models=None,policy="model",events=Events(Path(metrics)),
+official_records=[],native_python=Path(native),models_file=Path(models))
+restore=bridge.install(module)
+try:
+    agent=module.construct_agent(args)
+    trajectory=[{"observation":{"text":"A fixture page"},"info":{"page":DetachedPage("http://127.0.0.1:1","")}}]
+    action=agent.next_action(trajectory,"Finish the fixture task.",meta_data={"action_history":["None"]})
+    assert int(action["action_type"])==17,action
+    assert action["answer"]=="done",action
+    print("OFFICIAL_ACTION_OK")
+finally:
+    restore()
+''', encoding="utf-8")
+    env = {**os.environ, "DATASET": "webarena", "OPENAI_API_KEY": "local-test",
+           "OPENAI_API_URL": "http://127.0.0.1:1"}
+    env.update({name: "http://127.0.0.1:1" for name in
+        ("REDDIT", "SHOPPING", "SHOPPING_ADMIN", "GITLAB", "WIKIPEDIA", "MAP", "HOMEPAGE")})
+    process = await asyncio.create_subprocess_exec(python, str(script), root, str(models), sys.executable,
+        str(tmp_path / "official.jsonl"), env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), 90)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    assert process.returncode == 0, output.decode(errors="replace")
+    assert b"OFFICIAL_ACTION_OK" in output
 
 
 @pytest.mark.asyncio
