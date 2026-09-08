@@ -82,8 +82,8 @@ def resolve_intent(native, plan):
     goal = plan.get("goal") or (query if isinstance(query, str) else "")
     next_action = current.get("description") or current.get("content") or ""
     return {
-        "goal": str((explicit.get("goal") if same_scope else "") or goal)[:2000],
-        "next_action": str((explicit.get("next_action") if same_action else "") or next_action)[:1000],
+        "goal": str((explicit.get("goal") if same_scope else "") or goal),
+        "next_action": str((explicit.get("next_action") if same_action else "") or next_action),
         "current_hypothesis": explicit.get("current_hypothesis", "") if same_action else "",
         "constraints": list(explicit.get("constraints", []) if same_scope else plan.get("constraints", [])),
         "intent_source": "explicit" if same_action else "mixed" if same_scope else "committed_state",

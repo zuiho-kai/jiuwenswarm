@@ -27,7 +27,7 @@ class DatabasePeer(NativePeer):
         self.database, self.team = Path(database), team
         self.db = None
         self.duplex_settings = {"mode": "active", "policy": self.policy,
-                                "model_name": "fast", "timeout_seconds": 2.0}
+                                "model_name": "fast"}
 
     def has_pending_interrupt(self):
         check = getattr(self.harness, "has_pending_interrupt", None)

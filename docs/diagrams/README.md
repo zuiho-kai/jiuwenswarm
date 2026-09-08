@@ -2,14 +2,16 @@
 
 架构简图和输入流程图统一使用 ①–⑤，只展示一次新消息如何影响慢 Agent；代码细节见实现说明。
 
+当前删减范围见 [简化说明](../duplex-simplification.md)。
+
 ## 特性评审入口
 
 先看[五步总览](duplex-architecture.svg)，再按同样编号展开：
 
 | 总览步骤 | 详细图 | 评审内容 | PUML |
 | --- | --- | --- | --- |
-| ② 接消息 | [打开](duplex-detail-02-intake.svg) | 入库、去重、队列容量、新消息合并与取消旧判断 | [源文件](duplex-detail-02-intake.puml) |
-| ③ 做判断 | [打开](duplex-detail-03-decision.svg) | 状态来源、判断预算、版本校验、超时降级 | [源文件](duplex-detail-03-decision.puml) |
+| ② 接消息 | [打开](duplex-detail-02-intake.svg) | 原入口、顺序投递、重复输入处理 | [源文件](duplex-detail-02-intake.puml) |
+| ③ 做判断 | [打开](duplex-detail-03-decision.svg) | 状态来源、显式期限、版本校验、失败重试 | [源文件](duplex-detail-03-decision.puml) |
 | ④ 执行决定 | [打开](duplex-detail-04-apply.svg) | 追加时机、安全暂停、工具结果、恢复、已读确认 | [源文件](duplex-detail-04-apply.puml) |
 
 这些图描述当前实现；恢复需要相同稳定会话身份、持久文件和可恢复的外部环境，不能据此承诺任意外部操作恰好一次。

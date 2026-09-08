@@ -60,19 +60,19 @@ async def test_continually_changing_context_is_discarded():
     result = await observe(s, MESSAGES, classify=classify,
                            current_snapshot=lambda: next(values))
     assert result.status == "stale"
-    assert result.proposed_action == "APPEND"
+    assert result.proposed_action == "UNDECIDED"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response", [None, "INTERRUPT", {},
     dict(action="DELETE", context_version="v1", round_id="r1", checkpoint_id="c1"),
     dict(action="INTERRUPT", context_version="v0", round_id="r1", checkpoint_id="c1")])
-async def test_invalid_response_falls_back(response):
+async def test_invalid_response_produces_no_decision(response):
     s = snapshot()
     result = await observe(s, MESSAGES, classify=AsyncMock(return_value=response),
                            current_snapshot=lambda: s)
     assert result.status == "error"
-    assert result.proposed_action == "APPEND"
+    assert result.proposed_action == "UNDECIDED"
 
 
 @pytest.mark.asyncio
@@ -129,7 +129,7 @@ class Host:
 
 
 @pytest.mark.asyncio
-async def test_observer_coalesces_bounds_queue_and_closes_without_leak(monkeypatch):
+async def test_observer_coalesces_and_closes_without_dropping_at_arbitrary_limit(monkeypatch):
     info = Mock()
     monkeypatch.setattr(shadow.logger, "info", info)
     host = Host()
@@ -147,10 +147,9 @@ async def test_observer_coalesces_bounds_queue_and_closes_without_leak(monkeypat
     await entered.wait()
     for index in range(40):
         observer.submit(InboundMessage(str(index), "A1", "new evidence"))
-    assert len(observer._pending) == 32
+    assert len(observer._pending) == 40
     assert observer._inflight == {"m204"}
-    assert info.call_count == 8
-    assert json.loads(info.call_args.args[1])["status"] == "overloaded"
+    assert info.call_count == 0
     await observer.aclose()
     assert observer._task.done()
     assert not observer._pending
@@ -291,12 +290,12 @@ async def test_replay_counts_failed_append_as_failure_and_never_sends_label():
     assert report["accuracy_including_failures"] == 5 / 6
 
 
-def test_prompt_budget_retains_ids_and_marks_truncation():
-    messages = tuple(InboundMessage(str(i), "A1", "x" * 4000) for i in range(32))
+def test_prompt_preserves_full_messages_and_tail_constraints():
+    messages = tuple(InboundMessage(str(i), "A1", "x" * 13000 + "DO NOT SEND") for i in range(32))
     payload = json.loads(prompt_for(snapshot(), messages))
     assert len(payload["messages"]) == 32
-    assert sum(len(m["content"]) for m in payload["messages"]) <= 12000
-    assert all(m["truncated"] for m in payload["messages"])
+    assert all(m["content"] == messages[i].content for i, m in enumerate(payload["messages"]))
+    assert all(m["content"].endswith("DO NOT SEND") for m in payload["messages"])
 
 
 @pytest.mark.parametrize("mode,human,template,protocol,native", [

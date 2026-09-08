@@ -21,9 +21,9 @@ class InputController:
     Futures resolve only after delivery. The SDK remains responsible for DB ACK.
     The oldest arrival owns the deadline, so a busy sender cannot starve delivery.
     """
-    def __init__(self, *, snapshot, classify, apply, timeout=2.0, capacity=32):
+    def __init__(self, *, snapshot, classify, apply, timeout=None):
         self.snapshot, self.classify, self.apply = snapshot, classify, apply
-        self.timeout, self.capacity = timeout, capacity
+        self.timeout = timeout
         self.pending = {}
         self.changed = asyncio.Event()
         self.task = None
@@ -38,8 +38,6 @@ class InputController:
             if previous.content.message != content.message:
                 raise ValueError("message_id reused with different content")
             return previous.future
-        if len(self.pending) >= self.capacity:
-            raise OverflowError("input controller full; message must remain unread")
         future = asyncio.get_running_loop().create_future()
         # A mailbox prefetch may fail before the original drain awaits it.
         future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
@@ -58,11 +56,11 @@ class InputController:
             snapshot = self.snapshot()
             if snapshot is None:
                 return batch, None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 return batch, Observation(tuple(p.content.message.message_id for p in batch),
                     snapshot.context_version, snapshot.round_id, snapshot.checkpoint_id,
-                    "APPEND", "UNCHANGED", "timeout", (time.monotonic() - started) * 1000, attempts)
+                    "UNDECIDED", "UNCHANGED", "timeout", (time.monotonic() - started) * 1000, attempts)
             classification = asyncio.create_task(observe(snapshot,
                 tuple(p.content.message for p in batch), classify=self.classify,
                 current_snapshot=self.snapshot, timeout_seconds=remaining))
@@ -87,7 +85,7 @@ class InputController:
         try:
             while self.pending:
                 first = next(iter(self.pending.values()))
-                batch, decision = await self._decide(first.arrived + self.timeout)
+                batch, decision = await self._decide(None if self.timeout is None else first.arrived + self.timeout)
                 await self.apply(tuple(p.content for p in batch), decision)
                 for item in batch:
                     self.pending.pop(item.content.message.message_id, None)

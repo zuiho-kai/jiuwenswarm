@@ -7,44 +7,33 @@ skinparam activityBackgroundColor #E1F0FF
 skinparam activityDiamondBackgroundColor #FFF1CC
 skinparam noteBackgroundColor #F5F6F8
 start
-:③.1 读取慢 Agent 已提交的工作状态;
+:③.1 读取已提交的计划、约束和工具状态;
 note right
-  任务、约束、已提交公开输出、工具状态，
-  以及版本、轮次和检查点标识。
-  假设未显式发布时保持未知；不读隐藏思维。
-  摘要绑定发布时的计划与任务；来源改变后，
-  旧目标 / 旧动作不能覆盖新计划。
+  摘要来源改变后失效；不读隐藏思维。
+  原消息和状态不按固定字符数截断。
 end note
-if (有可用的工作快照？) then (否)
-  :交回原投递逻辑\n不凭空做打断决定;
+if (有工作快照？) then (否)
+  :交回原投递逻辑;
   stop
 else (是)
 endif
-:③.2 计算剩余判断时间\n默认从最早消息到达起共 2 秒;
-if (还有剩余时间？) then (否)
-  :降级为“追加”;
+:③.2 快模型判断追加或打断;
+note right
+  使用模型自身请求超时。
+  仅在显式配置时增加总判断期限；新消息不延长它。
+  真正并发到达的新消息可取消旧判断并合批。
+end note
+if (③.3 判断成功且版本有效？) then (否)
+  :返回投递失败
+DB 保持未读，等待原机制重试;
+  stop
 else (是)
-  :③.3 快模型看消息与工作状态\n只返回“追加 / 打断”和对应版本;
-  note right
-    判断期间新消息到达：取消本次判断，
-    回到 ② 合批，再进入 ③；预算不重置。
-  end note
-  if (③.4 返回及时，且结果合法？) then (否)
-    :超时、异常或非法结果\n降级为“追加”;
-  else (是)
-    :③.5 对照当前工作状态校验版本;
-    note right
-      状态变化时，单次 observe 最多重算一次。
-      仍无法得到有效决定或预算耗尽：追加。
-      执行器应用前还会再次校验，见 ④。
-    end note
-  endif
 endif
-:③.6 将决定、版本和完整消息交给第 ④ 步;
+:③.4 决定、版本与完整消息交给第 ④ 步;
 stop
 legend bottom
-  **本图输出：一个决定。快模型自己不会暂停慢 Agent。**
-  给快模型的消息有长度限制并标记截断；真正投递保留完整原文。
+  快模型不负责暂停；应用时再验版本。
+  超时、异常和过期结果不自动转成追加。
   对应代码：duplex_router.py / duplex_state.py / duplex_shadow.py
 endlegend
 @enduml

@@ -62,7 +62,7 @@ async def test_continuous_arrivals_cannot_extend_oldest_message_deadline():
             controller.submit(message(f"m{index}"))
         await asyncio.wait_for(first, .15)
         assert decisions[0].status == "timeout"
-        assert decisions[0].proposed_action == "APPEND"
+        assert decisions[0].proposed_action == "UNDECIDED"
     finally:
         await controller.aclose()
 

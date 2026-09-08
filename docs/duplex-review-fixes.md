@@ -1,5 +1,7 @@
 # 第二轮评审修复
 
+后续已按评审删除额外收件机制和硬编码限制，当前行为见 [简化说明](duplex-simplification.md)。以下验证记录对应删减前提交。
+
 针对 `duplex-review-ab595cc9.md` 中 F1–F4。先看[五步总览及分层评审入口](diagrams/README.md)。
 
 | 问题 | 改动 | 验证场景 |

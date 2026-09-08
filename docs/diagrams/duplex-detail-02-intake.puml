@@ -7,39 +7,24 @@ skinparam activityBackgroundColor #E1F0FF
 skinparam activityDiamondBackgroundColor #FFF1CC
 skinparam noteBackgroundColor #F5F6F8
 start
-:②.1 从原入口接收消息\n其他 Agent：DB 未读消息；用户：原用户入口;
-note right
-  DB 的事件和轮询负责唤醒。
-  普通消息预取不能越过控制、审批、模板消息。
-  控制消息仍交原逻辑处理。
-end note
-if (②.2 当前实例已经接收过这个 ID？) then (是)
-  :不重复送入慢 Agent\nDB 输入可重试原已读确认;
+:②.1 原 SDK 接收消息
+DB 事件 / 轮询，或原用户入口;
+:②.2 原处理器按顺序投递
+控制、审批、模板消息仍走原逻辑;
+if (当前实例已经接收过这个 ID？) then (是)
+  :不重复投递
+DB 输入重试原已读确认;
   stop
 else (否)
 endif
-if (同 ID 正在等待处理？) then (是)
-  :复用已有等待结果\n输入信息冲突则报错;
-  stop
-else (否)
-endif
-if (②.3 等待队列已满 32 条？) then (是)
-  :暂不接收，返回可重试错误\nDB 消息保持未读;
-  stop
-else (否)
-  :记录消息与到达时间;
-endif
-if (②.4 上一批已开始交给执行器应用？) then (是)
-  :新消息留到下一批\n不拆开正在应用的决定;
-else (否)
-  :若快模型仍在判断，取消旧判断\n按到达顺序合并尚未处理的消息;
-endif
-:②.5 将批次交给第 ③ 步判断;
+:②.3 交给判断层
+相同 ID 复用处理结果，内容冲突报错;
+:②.4 进入第 ③ 步判断;
 stop
 legend bottom
-  **本图输出：一批有顺序、有 ID 的消息。此时还未确认 DB 已读。**
-  判断预算从本批最早消息到达起算；新消息不延长截止时间。
-  第 ④ 步先持久保存输入，再允许确认已读；当前步骤只负责组织待处理消息。
-  对应代码：duplex_ingress.py / duplex_controller.py / duplex_shadow.py
+  不新增 DB 轮询、事件派发任务或接收容量限制。
+  DB 按原 SDK 顺序送入；只有真正并发到达判断层的输入才合批。
+  本步骤不确认已读；第 ④ 步先持久保存输入，再确认接收。
+  对应代码：原 MessageHandler / duplex_shadow.py / duplex_controller.py
 endlegend
 @enduml

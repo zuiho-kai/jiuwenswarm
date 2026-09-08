@@ -169,11 +169,10 @@ class NativePeer:
                 await self.start()
                 await self.harness.send("\n\n".join(self._inputs))
             else:
-                routed = RoutedInput(content, InboundMessage(message_id, sender, content[:4000], len(content) > 4000))
+                routed = RoutedInput(content, InboundMessage(message_id, sender, content))
                 if self.policy in ("model", "always_interrupt"):
                     await deliver_routed(self, routed, use_steer=True, original=self._original,
-                        settings={"mode": "active", "policy": self.policy, "model_name": "fast",
-                                  "timeout_seconds": 2.0})
+                        settings={"mode": "active", "policy": self.policy, "model_name": "fast"})
                 else:
                     await self.harness.send(content, immediate=self.policy != "serial")
             self._received.add(message_id)
@@ -201,7 +200,7 @@ class UserInputPeer(NativePeer):
         from jiuwenswarm.agents.harness.team.duplex_shadow import install_shadow_observer
         install_shadow_observer()
         self.duplex_settings = {"mode": "active", "policy": self.policy,
-                                "model_name": "fast", "timeout_seconds": 2.0}
+                                "model_name": "fast"}
         await super().start()
 
     async def deliver_input(self, content, *, use_steer=True):

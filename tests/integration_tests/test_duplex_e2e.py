@@ -337,7 +337,7 @@ async def test_append_during_tool_is_adopted_without_restart(world):
 
 
 @pytest.mark.asyncio
-async def test_fast_timeout_falls_back_and_db_message_is_not_lost(world):
+async def test_fast_timeout_leaves_db_unread_until_successful_retry(world):
     w = world
     w.settings["duplex_router"]["timeout_seconds"] = 0.05
     w.endpoint.fast_gate.clear()
@@ -346,6 +346,14 @@ async def test_fast_timeout_falls_back_and_db_message_is_not_lost(world):
     await w.harness.send("Research database options.")
     await asyncio.wait_for(w.tool.entered.wait(), 6)
     mid = await send_message(w, "Also export Markdown.")
+    with pytest.raises(RuntimeError, match="classification failed: timeout"):
+        await asyncio.wait_for(w.handler.on_poll_mailbox(None), 3)
+    assert any(str(row.message_id) == mid for row in await w.manager.get_messages(
+        to_member_name="A2", unread_only=True))
+    w.endpoint.fast_gate.set()
+    w.settings["duplex_router"].pop("timeout_seconds")
+    await w.native._duplex_controller.aclose()
+    w.endpoint.fast_action = "APPEND"
     await asyncio.wait_for(w.handler.on_poll_mailbox(None), 3)
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
     w.tool.gate.set()
@@ -522,7 +530,7 @@ async def test_benchmark_native_peer_executes_recovery_and_naive_restart(world, 
 
 
 @pytest.mark.asyncio
-async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_path):
+async def test_database_peer_uses_original_drain_and_acks_both_updates(world, tmp_path):
     from jiuwenswarm.benchmarks.duplex_database_peer import DatabasePeer
     from jiuwenswarm.benchmarks.duplex_runtime import Events
 
@@ -548,11 +556,9 @@ async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_pa
         inputs.append(asyncio.create_task(peer.receive("Use PostgreSQL instead.", message_id="one")))
         await asyncio.wait_for(w.endpoint.fast_entered.wait(), 6)
         inputs.append(asyncio.create_task(peer.receive("Keep the existing schema.", message_id="two")))
-        await wait_until(lambda: sum(c["model"] == "fast" for c in w.endpoint.calls) >= 2)
-        latest = json.dumps([c for c in w.endpoint.calls if c["model"] == "fast"][-1])
-        assert "PostgreSQL" in latest and "existing schema" in latest
+        await wait_until(lambda: len(inputs) == 2 and not inputs[1].done())
         rows = await peer.messages()
-        assert len(rows) == 2 and not any(row.is_read for row in rows)
+        assert not any(row.is_read for row in rows)
         w.endpoint.fast_gate.set()
         await asyncio.wait_for(asyncio.gather(*inputs), 6)
         await peer.wait(timeout=6)
@@ -571,7 +577,7 @@ async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_input_dispatch_does_not_block_lifecycle_event(world):
+async def test_input_dispatch_preserves_sdk_event_order(world):
     from openjiuwen.agent_teams.agent.coordination.event_bus import (
         EventBus, InnerEventMessage, InnerEventType,
     )
@@ -594,11 +600,13 @@ async def test_input_dispatch_does_not_block_lifecycle_event(world):
         await bus.enqueue(InnerEventMessage(event_type=InnerEventType.USER_INPUT))
         await asyncio.wait_for(entered.wait(), 2)
         await bus.enqueue(InnerEventMessage(event_type=InnerEventType.REFRESH_TEAM_CONTEXT))
+        assert not lifecycle.is_set()
+        release.set()
         await asyncio.wait_for(lifecycle.wait(), 2)
-        assert not release.is_set()
     finally:
+        release.set()
         await bus.stop()
-    assert not bus._duplex_input_tasks
+    assert not hasattr(bus, "_duplex_input_tasks")
 
 
 @pytest.mark.asyncio

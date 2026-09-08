@@ -24,8 +24,6 @@ from jiuwenswarm.common.duplex_router import (
 )
 
 logger = logging.getLogger(__name__)
-_MAX_PENDING = 32
-_MAX_BODY = 4000
 
 
 class RoutedInput(str):
@@ -66,8 +64,8 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
     query = active.original_query
     if isinstance(query, list):
         query = "\n".join(str(item) for item in query)
-    goal = str(plan.get("goal") or (query if isinstance(query, str) else ""))[:2000]
-    next_action = str(current.get("description") or current.get("content") or "")[:1000]
+    goal = str(plan.get("goal") or (query if isinstance(query, str) else ""))
+    next_action = str(current.get("description") or current.get("content") or "")
     phase = str(getattr(active.iter_phase, "value", active.iter_phase))
     # Object identities distinguish replacement snapshots/rounds with equal
     # indices. This token is process-local, not a durable checkpoint address.
@@ -90,9 +88,9 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
 
 
 class ShadowObserver:
-    """One bounded worker per recipient; no fast-model wait on the delivery path."""
+    """One observation worker per recipient; no fast-model wait on the delivery path."""
 
-    def __init__(self, host: Any, model_name: str, timeout_seconds: float) -> None:
+    def __init__(self, host: Any, model_name: str, timeout_seconds: float | None) -> None:
         self._host = weakref.ref(host)
         self._model_name = model_name
         self._timeout = timeout_seconds
@@ -103,12 +101,6 @@ class ShadowObserver:
 
     def submit(self, message: InboundMessage) -> None:
         if message.message_id in self._pending or message.message_id in self._inflight:
-            return
-        if len(self._pending) >= _MAX_PENDING:
-            logger.info("duplex.shadow %s", json.dumps({
-                "status": "overloaded", "message_ids": [message.message_id],
-                "effective_action": "UNCHANGED",
-            }))
             return
         self._pending[message.message_id] = message
         self._pending_snapshot = self._snapshot()
@@ -191,15 +183,15 @@ def _submit(handler, msg, expanded, is_human_agent: bool) -> None:
     if msg.protocol not in (None, "", "text", "plain"):
         return
     model = str(config.get("model_name") or "").strip()
-    timeout = float(config.get("timeout_seconds", 2.0))
-    if not model or not math.isfinite(timeout) or not 0 < timeout <= 30:
+    timeout = (float(config["timeout_seconds"]) if config.get("timeout_seconds") is not None else None)
+    if not model or (timeout is not None and (not math.isfinite(timeout) or timeout <= 0)):
         return
     observer = getattr(handler, "_duplex_shadow_observer", None)
     if observer is None:
         observer = ShadowObserver(host, model, timeout)
         handler._duplex_shadow_observer = observer
     observer.submit(InboundMessage(str(msg.message_id), str(msg.from_member_name),
-                                   expanded.body[:_MAX_BODY], len(expanded.body) > _MAX_BODY))
+                                   expanded.body))
 
 
 async def deliver_routed(host, content, *, use_steer, original, settings=None):
@@ -221,15 +213,8 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
         result = await original(host, str(content), use_steer=policy == "steer")
         native._duplex_received.add(message.message_id)
         return result
-    try:
-        timeout = float(config.get("timeout_seconds", 2.0))
-    except (ValueError, TypeError):
-        content = await native.durable_input(content)
-        return await original(host, str(content), use_steer=use_steer)
-    if (not math.isfinite(timeout) or not 0 < timeout <= 30 or
-            (policy != "always_interrupt" and not str(config.get("model_name") or "").strip())):
-        content = await native.durable_input(content)
-        return await original(host, str(content), use_steer=use_steer)
+    if policy != "always_interrupt" and not str(config.get("model_name") or "").strip():
+        raise ValueError("active model routing requires model_name")
     controller = input_controller(host, config, original)
     try:
         return await controller.submit(content)
@@ -246,8 +231,8 @@ def input_controller(host, config, original):
     if controller is not None and not controller.closed:
         return controller
     model = str(config.get("model_name") or "")
-    timeout = float(config.get("timeout_seconds", 2.0))
-    if not math.isfinite(timeout) or not 0 < timeout <= 30:
+    timeout = (float(config["timeout_seconds"]) if config.get("timeout_seconds") is not None else None)
+    if (timeout is not None and (not math.isfinite(timeout) or timeout <= 0)):
         raise ValueError("invalid input controller timeout")
     observer = ShadowObserver(host, model, timeout)
 
@@ -261,6 +246,10 @@ def input_controller(host, config, original):
         batch = tuple(item for item in batch if item.message.message_id not in native._duplex_received)
         if not batch:
             return
+        if decision is not None and decision.status == "stale" and native.active_round is None:
+            decision = None  # The previous round ended; SDK can admit this as a new input.
+        if decision is not None and decision.status != "ok":
+            raise RuntimeError(f"input classification failed: {decision.status}; retry delivery")
         batch = tuple([await native.durable_input(item) for item in batch])
         if decision is None:
             for item in batch:
@@ -275,11 +264,7 @@ def input_controller(host, config, original):
             message_id=batch[0].message.message_id,
             message_ids=tuple(item.message.message_id for item in batch))
         if effective == "STALE":
-            for item in batch:
-                if item.message.message_id not in native._duplex_received:
-                    await original(host, str(item), use_steer=True)
-                    native._duplex_received.add(item.message.message_id)
-            effective = "APPEND"
+            raise RuntimeError("input decision became stale; retry delivery")
         logger.info("duplex.route %s", json.dumps({
             "message_ids": [item.message.message_id for item in batch],
             "proposed_action": decision.proposed_action, "effective_action": effective,
@@ -326,8 +311,7 @@ def install_shadow_observer() -> bool:
             _submit(self, msg, expanded, is_human_agent)
             if not is_human_agent and not expanded.is_template and msg.protocol in (None, "", "text", "plain"):
                 text = RoutedInput(text, InboundMessage(str(msg.message_id),
-                                   str(msg.from_member_name), expanded.body[:_MAX_BODY],
-                                   len(expanded.body) > _MAX_BODY))
+                                   str(msg.from_member_name), expanded.body))
         except Exception:
             logger.warning("duplex shadow skipped; delivery unchanged", exc_info=True)
         return text
@@ -357,8 +341,6 @@ def install_shadow_observer() -> bool:
         return await deliver(self, content, use_steer=use_steer)
 
     TeamAgent.deliver_input = deliver_with_route
-    from jiuwenswarm.agents.harness.team.duplex_ingress import install_ingress
-    install_ingress(MessageHandler, deliver)
     from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
     user_input = AgentLifecycleHandler.on_user_input
 
@@ -367,7 +349,7 @@ def install_shadow_observer() -> bool:
         content = event.payload.get("content", "")
         if isinstance(content, str) and not isinstance(content, RoutedInput):
             message = InboundMessage(str(event.payload.get("message_id") or f"u2a-{uuid.uuid4().hex}"),
-                                     "user", content[:_MAX_BODY], len(content) > _MAX_BODY)
+                                     "user", content)
             event = event.model_copy(update={"payload": {**event.payload,
                                                           "content": RoutedInput(content, message)}})
         return await user_input(self, event)

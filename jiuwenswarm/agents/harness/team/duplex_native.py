@@ -11,7 +11,6 @@ import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from openjiuwen.agent_teams.harness.control import (
     _CmdAbort, _CmdPause, _CmdResume, _CmdSend,
@@ -78,11 +77,11 @@ class WorkingIntentTool(Tool):
                          "next action and hard constraints for the input controller. "
                          "Use a short factual summary, never private reasoning."),
             input_params={"type": "object", "properties": {
-                "goal": {"type": "string", "maxLength": 2000},
-                "current_hypothesis": {"type": "string", "maxLength": 1000},
-                "next_action": {"type": "string", "maxLength": 1000},
-                "constraints": {"type": "array", "maxItems": 16,
-                                "items": {"type": "string", "maxLength": 500}},
+                "goal": {"type": "string"},
+                "current_hypothesis": {"type": "string"},
+                "next_action": {"type": "string"},
+                "constraints": {"type": "array",
+                                "items": {"type": "string"}},
             }, "required": ["goal", "current_hypothesis", "next_action", "constraints"],
                 "additionalProperties": False},
         ))
@@ -101,7 +100,6 @@ class DuplexNativeHarness(NativeHarness):
         super().__init__(*args, **kwargs)
         self._duplex_version = 0
         self._duplex_pending: _RouteInput | None = None
-        self._duplex_waiting: list[Any] = []
         self._duplex_received: set[str] = set()
         self._duplex_steering: _SteeringQueue | None = None
         self._duplex_intent: dict = {}
@@ -215,10 +213,10 @@ class DuplexNativeHarness(NativeHarness):
         if any(not isinstance(value[k], str) for k in ("goal", "current_hypothesis", "next_action")):
             raise ValueError("working intent fields must be strings")
         constraints = value["constraints"]
-        if not isinstance(constraints, list) or len(constraints) > 16 or any(
-                not isinstance(item, str) or len(item) > 500 for item in constraints):
+        if not isinstance(constraints, list) or any(
+                not isinstance(item, str) for item in constraints):
             raise ValueError("invalid constraints")
-        self._duplex_intent = {k: (v[:2000] if isinstance(v, str) else list(v)) for k, v in value.items()}
+        self._duplex_intent = {k: (v if isinstance(v, str) else list(v)) for k, v in value.items()}
         self._session.update_state({"duplex_working_intent": self._duplex_intent})
         from .duplex_state import bind_intent
 
@@ -255,12 +253,6 @@ class DuplexNativeHarness(NativeHarness):
             elif cmd.ack is None or not cmd.ack.cancelled():
                 await asyncio.to_thread(self._duplex_inbox.activate, self.durable_scope)
         elif isinstance(cmd, _CmdSend):
-            if self._duplex_pending is not None:
-                if len(self._duplex_waiting) >= 32:
-                    self._reject_ack(cmd.ack, "input queue full")
-                else:
-                    self._duplex_waiting.append(cmd)
-                return
             if self.state is HarnessState.PAUSING:
                 self._reject_ack(cmd.ack, "runtime is being paused")
                 return
@@ -304,17 +296,11 @@ class DuplexNativeHarness(NativeHarness):
             return
         self._duplex_pending = None
         if cmd.ack.cancelled():
-            self._reject_waiting("delivery caller cancelled")
             return  # keep the safe PAUSED state; do not resurrect cancelled work
         send_ack = asyncio.get_running_loop().create_future()
         await super()._on_send(_CmdSend(msg=InboxMessage(0, cmd.content, True), ack=send_ack))
         self._duplex_received.update(cmd.message_ids or (cmd.message_id,))
         self._ack(cmd.ack, "INTERRUPT")
-        waiting, self._duplex_waiting = self._duplex_waiting, []
-        for send in waiting:
-            if not send.ack.cancelled():
-                self._duplex_version += 1
-                await super()._on_send(send)
 
     async def _on_round_done(self, cmd):
         active = self.active_round
@@ -355,16 +341,10 @@ class DuplexNativeHarness(NativeHarness):
         if ack is not None and not ack.done():
             ack.set_exception(DeliverySuperseded(reason))
 
-    def _reject_waiting(self, reason):
-        for cmd in self._duplex_waiting:
-            self._reject_ack(cmd.ack, reason)
-        self._duplex_waiting.clear()
-
     def _reject_transaction(self, reason):
         if self._duplex_pending is not None:
             self._reject_ack(self._duplex_pending.ack, reason)
             self._duplex_pending = None
-        self._reject_waiting(reason)
 
     async def _on_stop(self, cmd):
         await asyncio.to_thread(self._duplex_inbox.suspend, self.durable_scope)

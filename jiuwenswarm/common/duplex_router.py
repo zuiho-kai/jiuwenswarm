@@ -95,17 +95,17 @@ async def observe(
     *,
     classify: Classify,
     current_snapshot: Callable[[], ControlSnapshot | None],
-    timeout_seconds: float = 2.0,
+    timeout_seconds: float | None = None,
 ) -> Observation:
     """Recompute once on a changed snapshot within one total time budget.
 
-    Cancellation propagates to the owner; errors/timeouts return APPEND.
+    Cancellation propagates to the owner; errors/timeouts produce no decision.
     The caller owns delivery and must validate the version before applying it.
     """
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+    if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
         raise ValueError("timeout_seconds must be finite and positive")
     started = time.monotonic()
-    action, status, attempts = "APPEND", "ok", 0
+    action, status, attempts = "UNDECIDED", "ok", 0
     try:
         async with asyncio.timeout(timeout_seconds):
             for attempts in (1, 2):
@@ -134,13 +134,5 @@ async def observe(
 
 
 def prompt_for(snapshot: ControlSnapshot, messages: tuple[InboundMessage, ...]) -> str:
-    # Bound the whole batch and explicitly signal omitted text.
-    per_message = max(1, 12000 // max(1, len(messages)))
-    payloads = []
-    for message in messages:
-        payload = asdict(message)
-        payload["content"] = message.content[:per_message]
-        payload["truncated"] = message.truncated or len(message.content) > per_message
-        payloads.append(payload)
     return json.dumps({"snapshot": asdict(snapshot),
-                       "messages": payloads}, ensure_ascii=False)
+                       "messages": [asdict(message) for message in messages]}, ensure_ascii=False)
