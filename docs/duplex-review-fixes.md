@@ -32,3 +32,7 @@
 以及原 Python 3.11 WebArena 环境的真实 Chromium 测试。一个上游 Authlib 废弃提示，
 不影响退出码 0。Ruff、diff 空白检查、6 份 PlantUML 语法与 SVG 生成均通过。
 日志：`D:/jiusi_agent/duplex-review-fixes-full-2.txt`。
+
+后续测试修正（`b3f6642a`）：服务器打断可能发生在旧 HTTP 请求发出之前，原测试按请求到达顺序阻塞，误把恢复后的新请求卡住。改为按旧提示内容阻塞，并增加发送 HTTP 前取消的确定性用例；未修改生产逻辑。三组 U2A 专项全部通过；相关本机回归 **33 passed、2 skipped、1 deselected**，其中未配置的官方环境用例跳过，耗时 Chromium 用例本轮未重复执行（已包含在上述 160 项回归）。
+
+服务器最终回归（`b3f6642a`）：**88 passed、3 skipped**，94.32 秒，无失败。原超时项和新增 HTTP 前取消用例均通过；跳过项为缺 Harbor 的 1 项、缺独立官方 WebArena 环境的 2 项。日志：`D:/jiusi_agent/duplex-remote-results/review-fixes-tests-final.log`。
