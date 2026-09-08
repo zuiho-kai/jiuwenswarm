@@ -49,6 +49,7 @@ class Endpoint:
         self.model_entered = asyncio.Event()
         self.fast_entered = asyncio.Event()
         self.block_model = True
+        self.block_prompt = None
         self.tool_first = True
         self.intent_first = False
         self.repeat_tool_without_result = False
@@ -87,7 +88,9 @@ class Endpoint:
                 m.get("role") == "tool" and "committed exactly once" in str(m.get("content"))
                 for m in body["messages"]))):
             message = self.tool_message("write_once", {})
-        elif self.block_model and slow_call == (2 if self.tool_first else 1):
+        elif self.block_model and (
+                self.block_prompt in json.dumps(body["messages"]) if self.block_prompt is not None
+                else slow_call == (2 if self.tool_first else 1)):
             self.model_entered.set()
             await self.model_gate.wait()
             message["content"] = "Obsolete Kafka answer."

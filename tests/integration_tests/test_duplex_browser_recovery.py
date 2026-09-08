@@ -73,14 +73,34 @@ def test_worker_cli_passes_safe_policy_to_server(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["always_interrupt", "model"])
-async def test_official_update_uses_production_u2a_and_keeps_browser_receipt(world, tmp_path, policy):
+@pytest.mark.parametrize(("policy", "delay_old_http"), [
+    ("always_interrupt", False), ("model", False), ("always_interrupt", True),
+], ids=["always_interrupt", "model", "always_interrupt_before_http"])
+async def test_official_update_uses_production_u2a_and_keeps_browser_receipt(
+        world, tmp_path, monkeypatch, policy, delay_old_http):
     world.endpoint.tool_first = False
+    # A cancellation may win before the old HTTP request reaches the server.
+    # Block only obsolete work, never "the first request" (which can be new).
+    world.endpoint.block_prompt = "Original browser observation."
     fast = world.host.tiny_agent_model_resolver("fast")
     slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
         update={"model_name": "slow"})})
     bridge = NativeBrowserBridge(models={"slow": slow, "fast": fast}, policy=policy,
         events=Events(tmp_path / "u2a.jsonl"), official_records=[])
+    if delay_old_http:
+        from openjiuwen.core.foundation.llm import Model
+        original_stream = Model.stream
+        delayed = False
+
+        async def hold_old_request(self, *args, **kwargs):
+            nonlocal delayed
+            if self is bridge._peer.model and not delayed:
+                delayed = True
+                await asyncio.Event().wait()  # deterministic cancellation before HTTP
+            async for chunk in original_stream(self, *args, **kwargs):
+                yield chunk
+
+        monkeypatch.setattr(Model, "stream", hold_old_request)
     await bridge.reset_native("official-task-1", "live-browser")
     await bridge.browser_operation("browser_begin", action={"action_type": "click", "element_id": "save"})
     trajectory = [{"observation": "before"}, {"action_type": "click", "element_id": "save"},
@@ -100,6 +120,8 @@ async def test_official_update_uses_production_u2a_and_keeps_browser_receipt(wor
         assert peer.harness._duplex_browser_checkpoint["ordinal"] == 1
         requests = [c for c in world.endpoint.calls if c["model"] == "slow"]
         assert requests[-1]["messages"] == after
+        if delay_old_http:
+            assert requests[0]["messages"] == after
         if policy == "always_interrupt":
             assert not any(c["model"] == "fast" for c in world.endpoint.calls)
         events = [json.loads(line) for line in bridge.events.path.read_text().splitlines()]
