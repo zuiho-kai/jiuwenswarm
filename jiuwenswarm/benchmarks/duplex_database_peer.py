@@ -3,8 +3,22 @@ import asyncio
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from functools import wraps
 
 from jiuwenswarm.benchmarks.duplex_runtime import NativePeer
+
+
+def team_context(method):
+    """Bind the SDK's dynamic message-table namespace for every external entry."""
+    @wraps(method)
+    async def scoped(self, *args, **kwargs):
+        from openjiuwen.agent_teams.context import set_session_id, reset_session_id
+        token = set_session_id(self.team)
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            reset_session_id(token)
+    return scoped
 
 
 class DatabasePeer(NativePeer):
@@ -29,6 +43,7 @@ class DatabasePeer(NativePeer):
         return await TeamAgent.deliver_input(self, content,
                                             use_steer=use_steer and self.policy != "serial")
 
+    @team_context
     async def start(self):
         from filelock import FileLock
         from openjiuwen.agent_teams.messager import InProcessMessager
@@ -92,6 +107,7 @@ class DatabasePeer(NativePeer):
                 self.events.add("mailbox_poll_error", error_type=type(error).__name__)
             await asyncio.sleep(0.25)
 
+    @team_context
     async def receive(self, content, *, message_id, sender="coral"):
         from openjiuwen.agent_teams.schema.events import EventMessage, MessageEvent
         identity = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.team}/{self.name}/{message_id}"))
@@ -116,6 +132,11 @@ class DatabasePeer(NativePeer):
             raise RuntimeError("official transport input remains unread")
         self.events.add("message_accepted", member=self.name, message_id=identity)
 
+    @team_context
+    async def messages(self):
+        return await self.db.message.get_team_messages(self.team)
+
+    @team_context
     async def close(self):
         if self.db is not None:
             poller = getattr(self, "poller", None)

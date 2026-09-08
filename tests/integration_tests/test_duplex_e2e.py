@@ -533,6 +533,7 @@ async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_pa
         models={"slow": slow, "fast": fast}, policy="model", system_prompt="Complete the task.",
         tools=[], events=Events(tmp_path / "db-events.jsonl"))
     inputs = []
+    outside = set_session_id("")  # stand-alone benchmark has no inherited team session
     try:
         await peer.start()
         await peer.send("Use Kafka for the order system.")
@@ -547,12 +548,12 @@ async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_pa
         await wait_until(lambda: sum(c["model"] == "fast" for c in w.endpoint.calls) >= 2)
         latest = json.dumps([c for c in w.endpoint.calls if c["model"] == "fast"][-1])
         assert "PostgreSQL" in latest and "existing schema" in latest
-        rows = await peer.db.message.get_team_messages("official")
+        rows = await peer.messages()
         assert len(rows) == 2 and not any(row.is_read for row in rows)
         w.endpoint.fast_gate.set()
         await asyncio.wait_for(asyncio.gather(*inputs), 6)
         await peer.wait(timeout=6)
-        rows = await peer.db.message.get_team_messages("official")
+        rows = await peer.messages()
         assert all(row.is_read for row in rows)
         count = len(peer.events.records)
         await peer.receive("Use PostgreSQL instead.", message_id="one")
@@ -563,6 +564,7 @@ async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_pa
                 task.cancel()
         await asyncio.gather(*inputs, return_exceptions=True)
         await peer.close()
+        reset_session_id(outside)
 
 
 @pytest.mark.asyncio
