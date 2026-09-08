@@ -1,0 +1,84 @@
+@startuml duplex-architecture
+!pragma layout smetana
+title Native 全双工：修改架构
+top to bottom direction
+hide stereotype
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 14
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam componentStyle rectangle
+skinparam ArrowColor #52647A
+skinparam packageStyle rectangle
+skinparam backgroundColor #FFFFFF
+skinparam componentBackgroundColor<<existing>> #EDF1F5
+skinparam componentBackgroundColor<<adapter>> #E1F0FF
+skinparam componentBackgroundColor<<new>> #DEF3E7
+skinparam noteBackgroundColor #FFF6DC
+
+actor "其他 Agent" as sender
+actor "用户" as user
+
+package "原 SDK 消息与生命周期" {
+  database "消息 DB" as db
+  component "EventBus / poll\nMessageHandler\n顺序、广播水位、DB ACK" as message <<existing>>
+  component "AgentLifecycleHandler\non_user_input" as lifecycle <<existing>>
+}
+
+package "接入与决策（duplex_shadow.py / duplex_router.py）" {
+  component "TeamAgent.deliver_input 包装入口\nRoutedInput：完整文本 + message_id" as input <<adapter>>
+  component "deliver_routed\n模式、策略、去重、降级" as route <<new>>
+  component "ControlSnapshot\n已提交的任务 / Working Intent\n版本、轮次、阶段、检查点标签" as snapshot <<new>>
+  component "observe + TinyAgent\n无状态快模型\nAPPEND / INTERRUPT" as fast <<new>>
+  component "ShadowObserver\n异步记录，不改变投递" as shadow <<new>>
+}
+
+package "Native 执行层（duplex_native.py）" {
+  component "DuplexNativeHarness\nsupervisor: _RouteInput\n原子校验 → 安全暂停 → 注入恢复" as supervisor <<new>>
+  component "_SteeringQueue\n追加消息 commit / rewind\n末次生成后 continuation" as steering <<new>>
+  component "Snapshot Rail\n模型调用前补充检查点\n边界递增 context_version" as rail <<adapter>>
+  component "原 Native / ReAct\n慢模型与工具执行" as native <<existing>>
+  component "update_working_intent\n显式发布任务控制摘要" as intent <<new>>
+}
+
+sender --> db : A2A 普通消息
+db --> message
+message --> input : 原渲染文本
+user --> lifecycle : U2A 输入
+lifecycle --> input
+input --> route
+route <--> fast : model 策略分类\n返回动作与版本标识
+snapshot --> fast : 只读摘要 + 有界消息
+route -up-> supervisor : 完整原文\n_RouteInput
+supervisor --> steering : APPEND
+supervisor --> native : INTERRUPT / 恢复
+steering --> native : 安全边界采纳
+native --> rail : 执行边界
+rail -[norank]-> snapshot
+native --> intent : 工具调用
+intent -[norank]-> snapshot : 已提交摘要
+message ..> shadow : shadow 模式
+shadow ..> fast
+
+note bottom of fast
+默认总预算 2 秒；版本过期最多重算一次。
+异常、超时、非法输出保守 APPEND。
+不读取隐藏思维、未完成输出或 KV。
+end note
+note bottom of supervisor
+TeamHarness.inner_agent 在 active 时使用此子类；
+off / shadow 保留原 Native。投递成功后沿用原 DB ACK。
+模型阶段：取消请求，恢复安全检查点。
+工具阶段：等待完成，保留结果与外部副作用。
+生命周期命令可取代事务，不自动复活已停止任务。
+去重和检查点标签仅在当前 Native 实例内有效。
+end note
+
+legend bottom
+  |= 颜色 |= 含义 |
+  | <#EDF1F5> 灰 | 复用原 SDK |
+  | <#E1F0FF> 蓝 | 包装 / 适配入口 |
+  | <#DEF3E7> 绿 | 本次新增逻辑 |
+  实线：执行或数据关系；虚线：观察、模式选择或确认关系。
+endlegend
+@enduml

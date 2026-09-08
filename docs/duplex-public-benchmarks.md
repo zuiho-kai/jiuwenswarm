@@ -40,7 +40,8 @@ trajectory，校验任务 ID、初始意图与更新原文；直接执行固定�
 
 `jiuwenswarm.benchmarks.duplex_experiment` 执行整个实验，配置例子在
 [AgentRadio](examples/duplex-agentradio.json)、[InterruptBench](examples/duplex-interruptbench.json)
-和[快慢模型](examples/duplex-models.json)。复制到工作区外填写真实配置，不提交密钥。
+和[快慢模型](examples/duplex-models.json)。另提供已验证调用的
+[SiliconFlow 模型模板](examples/duplex-models-siliconflow.json)。复制到工作区外填写真实配置，不提交密钥。
 例子默认只选一题验证接线；删除 `task_ids` 后使用完整官方任务集合。
 
 ```powershell
@@ -124,5 +125,19 @@ InterruptBench runner 的命令入口。Harbor CLI 和上游 Chromium 已安装�
 消息接受时间不冒充首次正确动作时间；缺失的全量 token、GPU 时间及外部副作用
 统计保持 null，不推断成零。
 
-当前真实跑分仍缺外部运行配置：本机 Jiuwen 默认模型名、服务地址和密钥为空；没有
-可用 Docker/已认证 Modal 及 WebArena 站点配置。尚无公开任务成功率或性能结论。
+已用真实 SiliconFlow 服务验证 DeepSeek-V3.2 慢模型和 Qwen3.5-9B 快路由。
+Windows Native 在慢模型流式执行期间接收了官方首条更新，快路由在约 1.80 秒内
+返回 APPEND，后续慢模型调用完成。该检查没有浏览器工具，只验证真实服务接线。
+
+模型认证现已具备。服务器部署目录为 `/workspace/wzr/duplex-benchmark-20260908`，
+使用独立虚拟环境；密钥置于仓库外的私有目录。当前服务器没有 Docker/socket，
+`user.max_user_namespaces=0`，`unshare -Ur true` 失败，账号不具备免密 sudo。
+正式任务仍需可用容器环境和 WebArena 站点，尚无公开任务成功率或性能结论。
+
+同日服务器真实 Native 接线检查完成：快路由达到 2 秒预算后按设计降级为 APPEND，
+慢模型继续完成响应，结果保存在上述服务器目录的 `results/live-native/`。
+这个结果只验证接线和超时降级，不证明快模型及时决策，也不是官方网页任务成绩。
+服务器工作目录位于网络文件系统；运行时将 `PYTHONPYCACHEPREFIX` 和
+`XDG_CACHE_HOME` 指向本机临时目录，避免导入时大量写网络缓存。
+服务器针对路由、官方输入、实验统计及 Native 接线的回归结果为 62 通过、2 跳过；
+跳过项是尚未安装 Harbor 的原启动脚本测试和缺少独立 WebArena 环境的原动作解析测试。

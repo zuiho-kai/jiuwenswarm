@@ -1,0 +1,106 @@
+@startuml duplex-routing-flow
+title Native 全双工：输入路由与安全恢复
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 14
+skinparam shadowing false
+skinparam ArrowColor #52647A
+skinparam activityBackgroundColor #E1F0FF
+skinparam activityBorderColor #6A8BAB
+skinparam activityDiamondBackgroundColor #FFF6DC
+skinparam noteBackgroundColor #FFF6DC
+skinparam backgroundColor #FFFFFF
+
+start
+:A2A / U2A 进入原投递入口;
+if (active + DuplexNative\n且允许 steer？) then (否)
+  :沿用原投递；shadow 仅异步观察;
+  stop
+else (是)
+endif
+if (策略为 serial / steer？) then (是)
+  :调用原 SDK 对应投递策略;
+  stop
+else (否)
+endif
+if (当前实例已接收 message_id？) then (是)
+  :直接成功返回，避免 ACK 重试重复执行;
+  stop
+else (否)
+endif
+:读取已提交的 ControlSnapshot;
+if (快照可用？) then (否)
+  :沿用原 SDK 投递;
+  stop
+else (是)
+endif
+if (always_interrupt？) then (是)
+  :动作 = INTERRUPT;
+else (model)
+  if (快模型与超时配置有效？) then (否)
+    :沿用原 SDK 投递;
+    stop
+  else (是)
+  endif
+  :独立 TinyAgent 分类\n仅发送控制摘要与有界消息;
+  if (返回合法且快照仍一致？) then (是)
+    :接受 APPEND / INTERRUPT;
+  else (否)
+    if (仅版本过期且还有预算？) then (是)
+      :使用最新快照，最多重算一次;
+      if (重算合法且快照一致？) then (是)
+        :接受新动作;
+      else (否)
+        :动作 = APPEND;
+      endif
+    else (超时 / 异常 / 非法)
+      :动作 = APPEND;
+    endif
+  endif
+endif
+:提交 _RouteInput\n完整原文、message_id、版本、动作;
+partition "Native supervisor 内的串行事务" {
+  if (重复消息？) then (是)
+    :返回 DUPLICATE;
+    stop
+  else (否)
+  endif
+  if (RUNNING、版本匹配\n且无其他待完成事务？) then (否)
+    :返回 STALE;
+    :外层改走原 SDK 追加路径;
+    stop
+  else (是)
+  endif
+  if (动作为 APPEND？) then (是)
+    :进入 steering 队列，记录去重与版本;
+    :成功返回；当前模型 / 工具继续;
+    note right
+      采纳后在安全边界 commit。
+      如恰逢末次生成，安排 continuation。
+      未提交的消息在取消后按序 rewind。
+    end note
+  else (INTERRUPT)
+    :登记待完成事务，调用原 Native pause;
+    if (处于工具阶段？) then (是)
+      :等待工具结束，保留已完成结果;
+    else (模型 / 其他安全阶段)
+      :原 SDK 安全暂停\n在模型阶段取消并恢复检查点;
+    endif
+    if (事务被生命周期命令取代、调用方取消\n或失败而不能安全恢复？) then (是)
+      :拒绝 / 取消投递，不自动重启;
+      :A2A 保持未读，交原恢复路径处理;
+      stop
+    else (否)
+      :PAUSED 后在同一事务内\n注入完整原文并恢复 Native;
+      :记录 message_id，返回 INTERRUPT\n继续处理暂存的后续 send;
+    endif
+  endif
+}
+:投递成功返回；A2A 原处理器写 DB ACK;
+stop
+
+legend bottom
+生命周期控制可在事务等待期间取代它；图中的判断汇总该异步结果。
+DB ACK 由原 SDK 负责，U2A 沿用其原入口返回语义。
+工具外部副作用不回滚；这不是跨进程恰好一次保证。
+endlegend
+@enduml
