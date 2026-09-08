@@ -23,3 +23,11 @@
 原方案来源：`D:/jiusi_agent/jiuwen_duplex_a2a_proposal.html` 的失败/超时降级说明。先前把这项也当成无依据设计删除，是误判；当前已恢复，且保留并发合批和生命周期不阻塞的功能断言。
 
 当前图：[收件](diagrams/duplex-detail-02-intake.svg)、[判断](diagrams/duplex-detail-03-decision.svg)、[执行](diagrams/duplex-detail-04-apply.svg)。
+
+## 最终验证
+
+代码提交 `7c57e9e9`：本机 **162 passed**，233.92 秒，无跳过，含真实 Chromium 和进程强杀恢复；一个上游 Authlib 废弃提示。服务器 **89 passed、3 skipped**，65.90 秒；缺 Harbor 的 1 项及缺独立 WebArena 环境的 2 项跳过。
+
+保留并验证：真实 DB 新消息取消旧判断并合批；真实用户入口的慢判断不阻塞 SDK 后续事件；SDK 模型 timeout 与显式路由期限都能触发原 steer；持久接受后强杀仍恢复输入；暂停不自动重启，工具及网页操作不重复执行。Ruff、diff 检查及 PlantUML 生成通过。
+
+日志：`D:/jiusi_agent/duplex-native-intake-full.txt`、`D:/jiusi_agent/duplex-remote-results/duplex-native-intake-tests.log`。这些是功能回归结果，不是公开 Benchmark 分数。

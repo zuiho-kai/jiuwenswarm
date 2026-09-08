@@ -12,7 +12,7 @@
 | --- | --- | --- | --- |
 | ② 接消息 | [打开](duplex-detail-02-intake.svg) | 原入口、可靠接受、异步判断 | [源文件](duplex-detail-02-intake.puml) |
 | ③ 做判断 | [打开](duplex-detail-03-decision.svg) | 状态来源、SDK 期限、版本校验、原 steer 降级 | [源文件](duplex-detail-03-decision.puml) |
-| ④ 执行决定 | [打开](duplex-detail-04-apply.svg) | 追加时机、安全暂停、工具结果、恢复、已读确认 | [源文件](duplex-detail-04-apply.puml) |
+| ④ 执行决定 | [打开](duplex-detail-04-apply.svg) | 追加时机、安全暂停、工具结果、恢复、应用结果 | [源文件](duplex-detail-04-apply.puml) |
 
 这些图描述当前实现；恢复需要相同稳定会话身份、持久文件和可恢复的外部环境，不能据此承诺任意外部操作恰好一次。
 

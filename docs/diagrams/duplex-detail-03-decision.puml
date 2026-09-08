@@ -24,8 +24,8 @@ note right
   真正并发到达的新消息可取消旧判断并合批。
 end note
 if (③.3 判断成功且版本有效？) then (否)
-  :返回投递失败
-DB 保持未读，等待原机制重试;
+  :按原方案交给 SDK steer
+记录失败状态，不算作成功分类;
   stop
 else (是)
 endif
