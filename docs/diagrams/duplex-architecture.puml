@@ -1,91 +1,64 @@
 @startuml duplex-architecture
-!pragma layout smetana
-title Native 全双工：修改架构
-top to bottom direction
-hide stereotype
+title 全双工架构：慢 Agent 工作时，新消息怎么进来
 skinparam defaultFontName Microsoft YaHei
-skinparam defaultFontSize 14
+skinparam defaultFontSize 17
 skinparam shadowing false
-skinparam roundCorner 10
-skinparam componentStyle rectangle
-skinparam ArrowColor #52647A
-skinparam packageStyle rectangle
 skinparam backgroundColor #FFFFFF
-skinparam componentBackgroundColor<<existing>> #EDF1F5
-skinparam componentBackgroundColor<<adapter>> #E1F0FF
-skinparam componentBackgroundColor<<new>> #DEF3E7
-skinparam noteBackgroundColor #FFF6DC
-
-actor "其他 Agent" as sender
-actor "用户" as user
-
-package "原 SDK 消息与生命周期" {
-  database "Jiuwen 消息 DB\n本地收件账本" as db #EDF1F5
-  component "EventBus / poll\nMessageHandler\n顺序、广播水位、DB ACK" as message <<existing>>
-  component "AgentLifecycleHandler\non_user_input" as lifecycle <<existing>>
+skinparam ArrowColor #52647A
+skinparam activityBackgroundColor #E1F0FF
+skinparam activityBorderColor #6A8BAB
+skinparam activityDiamondBackgroundColor #FFF1CC
+skinparam activityDiamondBorderColor #BD963C
+skinparam noteBackgroundColor #F5F6F8
+skinparam noteBorderColor #B8C1CC
+skinparam activity {
+  StartColor #52647A
+  EndColor #52647A
 }
 
-package "输入接入与决策" {
-  component "duplex_ingress / duplex_shadow\n输入异步分发 + DB 按序预取\nRoutedInput：完整文本 + message_id" as input <<adapter>>
-  component "deliver_routed / InputController\n合批、去重、最早消息截止时间\n新输入到达可取消快模型重算" as route <<new>>
-  component "ControlSnapshot\n已提交的任务 / Working Intent\n版本、轮次、阶段、检查点标签" as snapshot <<new>>
-  component "observe + TinyAgent\n无状态快模型\nAPPEND / INTERRUPT" as fast <<new>>
-  component "ShadowObserver\n异步记录，不改变投递" as shadow <<new>>
+start
+:原慢 Agent 正在执行任务;
+note right
+  例如：正在写使用 Kafka 的代码
+end note
+:① 新消息到达;
+note right
+  例如：“别用 Kafka，改用 PostgreSQL”
+  来自用户或其他 Agent
+end note
+partition "新增：接消息、判断是否要打断" {
+  :② 输入控制器接住消息;
+  note right
+    慢 Agent 此时继续工作
+    判断期间又来消息：合起来重新判断
+  end note
+  :③ 快模型看新消息\n和慢 Agent 已提交的工作状态;
+  if (需要现在打断吗？) then (否：追加)
+    :④A 当前步骤继续执行\n在下一次模型调用前加入新消息;
+  else (是：打断)
+    :④B 由慢 Agent 的执行器安全停下\n并加入新消息\n保留已完成的工作;
+    note right
+      正在生成：取消当前生成，从安全点继续
+      工具已开始：先等工具完成，保留结果
+    end note
+  endif
 }
-
-package "Native 执行层（duplex_native.py）" {
-  component "DuplexNativeHarness\nsupervisor: _RouteInput\n原子校验 → 安全暂停 → 注入恢复" as supervisor <<new>>
-  component "_SteeringQueue\n追加消息 commit / rewind\n末次生成后 continuation" as steering <<new>>
-  component "Snapshot Rail + StatePublicationRail\n安全检查点 / 边界自动发布\n已提交任务、输出与待执行工具状态" as rail <<adapter>>
-  component "原 Native / ReAct\n慢模型与工具执行" as native <<existing>>
-  database "ToolLedger（SQLite）\n独立于可回滚模型上下文\nprepared / committed / uncertain" as ledger #DEF3E7
-}
-
-sender --> db : A2A 普通消息
-db --> message
-message --> input : 原渲染文本
-user --> lifecycle : U2A 输入
-lifecycle --> input
-input --> route
-route <--> fast : model 策略分类\n返回动作与版本标识
-snapshot --> fast : 只读摘要 + 有界消息
-route -up-> supervisor : 完整原文\n_RouteInput
-supervisor --> steering : APPEND
-supervisor --> native : INTERRUPT / 恢复
-steering --> native : 安全边界采纳
-native --> rail : 执行边界
-rail -[norank]-> snapshot
-native --> ledger : Native 工具调用包装\nsession + call_id + 参数摘要
-message ..> shadow : shadow 模式
-shadow ..> fast
-
-note bottom of fast
-每批默认 2 秒，以最早消息到达时间计。
-新输入不延长截止时间；单次 observe 版本重算最多一次。
-异常、超时、非法输出保守 APPEND。
-不读取隐藏思维、未完成输出或 KV。
+:⑤ 同一个慢 Agent\n带着新消息继续任务;
+note right
+  例如：接下来改用 PostgreSQL
 end note
-note bottom of supervisor
-TeamHarness.inner_agent 在 active 时使用此子类；
-off / shadow 保留原 Native。投递成功后沿用原 DB ACK。
-模型阶段：取消请求，恢复安全检查点。
-工具阶段：等待完成，保留结果与外部副作用。
-生命周期命令可取代事务，不自动复活已停止任务。
-去重和检查点标签仅在当前 Native 实例内有效。
-end note
-note bottom of ledger
-相同身份且已有可恢复回执：复用结果。
-非幂等调用结果不确定：拒绝自动重做，需核对。
-外部副作用不回滚；不提供全局恰好一次保证。
-end note
+stop
 
 legend bottom
-  |= 颜色 |= 含义 |
-  | <#EDF1F5> 灰 | 复用原 SDK |
-  | <#E1F0FF> 蓝 | 包装 / 适配入口 |
-  | <#DEF3E7> 绿 | 本次新增逻辑 |
-  实线：执行或数据关系；虚线：观察、模式选择或确认关系。
-  update_working_intent 可显式发布语义；未发布的 hypothesis 保持未知。
-  自动状态投影仅发生在执行边界；控制 / 审批消息不被普通输入预取越过。
+  **这次架构改动，就看中间这一块：**
+  新增输入控制器和快模型判断；慢 Agent 仍是原来的执行者。
+  快模型超时或判断失败，走“追加”。
+
+  **配套机制（不展开成主流程）：**
+  消息存储 / 投递 / 已读确认：沿用原 SDK 消息链。
+  工作状态发布：供快模型参考；未明确发布的假设仍是未知。
+  工具账本：记录执行结果，辅助恢复，不能撤销外部副作用。
+
+  本图只展示一次新消息的处理；⑤后 Agent 仍可继续接收消息。
 endlegend
 @enduml

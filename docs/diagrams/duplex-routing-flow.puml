@@ -1,90 +1,40 @@
 @startuml duplex-routing-flow
-title Native 全双工：输入合批与安全恢复
+title 一条新消息的处理流程
 skinparam defaultFontName Microsoft YaHei
-skinparam defaultFontSize 14
+skinparam defaultFontSize 17
 skinparam shadowing false
+skinparam backgroundColor #FFFFFF
 skinparam ArrowColor #52647A
 skinparam activityBackgroundColor #E1F0FF
 skinparam activityBorderColor #6A8BAB
-skinparam activityDiamondBackgroundColor #FFF6DC
-skinparam noteBackgroundColor #FFF6DC
-skinparam backgroundColor #FFFFFF
+skinparam activityDiamondBackgroundColor #FFF1CC
+skinparam noteBackgroundColor #F5F6F8
+skinparam noteBorderColor #B8C1CC
 
 start
-:A2A / U2A 输入异步分发\nA2A 原 drain 按序预取，保留 DB ACK;
-if (active + DuplexNative + 可路由输入\n且策略 / 配置满足控制器入口？) then (否)
-  :沿用原投递或 serial / steer 策略\nshadow 仅观察;
-  stop
-else (是)
+:① 慢 Agent 正在干活\n此时收到一条新消息;
+:② 接住消息，交给快模型判断;
+note right
+  慢 Agent 此时继续工作
+  又来消息就合起来重新判断
+end note
+if (③ 新消息需要马上改变当前工作吗？) then (不需要)
+  :④A 当前步骤继续\n下一次模型调用前加入新消息;
+else (需要)
+  :④B 安全停下当前工作\n加入新消息，保留已完成的结果;
+  note right
+    谁来停？慢 Agent 自己的执行器。
+    正在生成：取消当前生成，从安全点继续。
+    工具已经开始：先等工具完成，保留结果。
+  end note
 endif
-if (当前实例已接收 message_id？) then (是)
-  :成功返回，原 DB ACK 可继续;
-  stop
-else (否)
-endif
-partition "InputController：每个 Native 一个持有者" {
-  :submit：同 ID 复用待完成 future\n不同内容拒绝；容量 32，溢出不确认;
-  :最早到达时间 + timeout = 固定截止时间;
-  repeat
-    :取当前待处理批次与 ControlSnapshot;
-    if (快照不可用？) then (是)
-      :按序沿用原 SDK 投递\n成功后完成批次 future;
-      stop
-    else (否)
-    endif
-    if (截止时间已到？) then (是)
-      :当前批次 APPEND，结束决策等待;
-    else (否)
-      :model：独立 TinyAgent 分类\nalways_interrupt：规则返回 INTERRUPT;
-      note right
-        同时监听新输入。
-        仅版本变化时，单次 observe 最多重算一次。
-        超时 / 异常 / 非法输出默认 APPEND。
-      end note
-    endif
-    if (分类期间有新输入？) then (是)
-      :取消尚未应用的快模型判断\n把新输入并入批次，不延长截止时间;
-    else (否)
-    endif
-  repeat while (需要重新取批次？) is (是) not (否)
-  :apply：过滤已接收 ID，提交一条 _RouteInput\n完整原文按序拼接 + 全部 message_ids + 版本 / 动作;
-}
-partition "Native supervisor：事务应用阶段不被新输入抢占" {
-  if (批次全部已接收？) then (是)
-    :返回 DUPLICATE;
-  else (否)
-    if (RUNNING、版本匹配\n且没有待完成事务？) then (否)
-      :返回 STALE\n外层逐条走原 SDK 追加路径;
-    else (是)
-      if (动作为 APPEND？) then (是)
-        :进入 steering 队列\n记录批次 ID 与版本，当前执行继续;
-        note right
-          安全边界 commit，取消后按序 rewind。
-          末次模型生成遇到追加，安排 continuation。
-        end note
-      else (INTERRUPT)
-        :登记事务，调用原 Native pause;
-        if (工具正在执行？) then (是)
-          :等待工具完成，保留结果\n工具账本回执独立于模型回滚;
-        else (模型 / 其他安全阶段)
-          :安全暂停\n模型阶段取消请求并恢复检查点;
-        endif
-        if (生命周期取代、调用方取消\n或无法安全恢复？) then (是)
-          :拒绝 / 取消投递，不自动重启\nA2A 保持未读供原恢复路径处理;
-          stop
-        else (否)
-          :PAUSED 后注入整批原文并恢复\n记录 message_ids，返回 INTERRUPT;
-        endif
-      endif
-    endif
-  endif
-}
-:完成该批 future，继续下一批\nA2A 原 drain 在投递成功后写 DB ACK;
+:⑤ 同一个慢 Agent\n按新消息继续任务;
 stop
 
 legend bottom
-输入事件不阻塞生命周期分发；预取不越过控制 / 审批 / 模板消息。
-执行边界自动投影已提交状态；未显式发布的 hypothesis 为未知。
-工具账本仅覆盖 Native 工具调用，不回滚副作用，不包含 WebArena env.step。
+  **快模型只判断；慢 Agent 的执行器负责真正停下和继续。**
+  判断超时或失败，走左边“追加”分支。
+  图中只展开一次消息处理；慢 Agent 继续后仍可接收新消息。
+  去重、版本检查、已读确认等保护细节由代码处理，不展开成主流程。
 endlegend
 @enduml

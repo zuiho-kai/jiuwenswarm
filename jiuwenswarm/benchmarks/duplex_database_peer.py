@@ -56,6 +56,10 @@ class DatabasePeer(NativePeer):
         from jiuwenswarm.agents.harness.team.duplex_shadow import install_shadow_observer
 
         install_shadow_observer()
+        # Stable across worker restarts, isolated across databases, members and
+        # benchmark policies. Bind before Native restores its durable inbox.
+        self.harness.durable_scope = "agentradio:" + uuid.uuid5(uuid.NAMESPACE_URL,
+            f"{self.database.resolve()}/{self.team}/{self.name}/{self.policy}").hex
         await super().start()
         if self.db is not None:  # abort reference rebuilds only its executor
             return

@@ -110,14 +110,25 @@ class DuplexNativeHarness(NativeHarness):
         from jiuwenswarm.agents.harness.team.duplex_ledger import ToolLedger
         self._duplex_ledger = ToolLedger(os.environ.get("JIUWEN_DUPLEX_LEDGER_PATH") or
                                         Path.home() / ".jiuwenswarm/duplex-state/duplex-tools.sqlite3")
+        from jiuwenswarm.agents.harness.team.duplex_inbox import DurableInbox
+        self._duplex_inbox = DurableInbox(os.environ.get("JIUWEN_DUPLEX_INBOX_PATH") or
+                                          self._duplex_ledger.path.with_name("duplex-inbox.sqlite3"))
+        self.durable_scope = None
+        self._duplex_admission_inputs = {}
+        self._duplex_receipt_version = 0
         execute = self.ability_manager._execute_single_tool_call
 
         async def execute_with_receipt(tool_call, session, tag=None):
+            from jiuwenswarm.agents.harness.team.duplex_inbox import persist_native
+            # Rail callbacks may be isolated by the SDK. Enforce persistence
+            # here too: a failed checkpoint must never release a side effect.
+            await persist_native(self)
             card = self.ability_manager.get(tool_call.name)
             return await self._duplex_ledger.execute(
-                scope=session.get_session_id(), call=tool_call,
+                scope=self.durable_scope or session.get_session_id(), call=tool_call,
                 idempotent=bool(getattr(card, "idempotent", False)),
-                invoke=lambda: execute(tool_call=tool_call, session=session, tag=tag))
+                invoke=lambda: execute(tool_call=tool_call, session=session, tag=tag),
+                capture_state=self._capture_tool_state)
 
         self.ability_manager._execute_single_tool_call = execute_with_receipt
         from jiuwenswarm.agents.harness.team.duplex_state import StatePublicationRail
@@ -143,11 +154,20 @@ class DuplexNativeHarness(NativeHarness):
                 if _name in ("before_model_call", "after_react_iteration"):
                     if self._duplex_steering is not None:
                         self._duplex_steering.commit()
+                if _name in ("before_model_call", "before_tool_call", "after_react_iteration"):
+                    from jiuwenswarm.agents.harness.team.duplex_inbox import persist_native
+                    await persist_native(self)
 
             setattr(rail, name, boundary)
 
     async def start(self, **kwargs):
+        already_started = self._st.supervisor_task is not None
         await super().start(**kwargs)
+        if already_started:
+            return
+        self.durable_scope = self.durable_scope or f"{self.session_id}/{self.card.id}"
+        self._duplex_inbox.path = Path(os.environ.get("JIUWEN_DUPLEX_INBOX_PATH") or
+                                       self._duplex_ledger.path.with_name("duplex-inbox.sqlite3"))
         queues = self.event_handler.interaction_queues
         if not isinstance(queues.steering, _SteeringQueue):
             replacement = _SteeringQueue()
@@ -155,8 +175,37 @@ class DuplexNativeHarness(NativeHarness):
                 replacement.put_nowait(queues.steering.get_nowait())
             queues.steering = replacement
         self._duplex_steering = queues.steering
+        admit = self.react_agent._admit_user_message
+
+        async def admit_with_identity(ctx, context, parts, *, source, prefix=""):
+            await admit(ctx, context, parts, source=source, prefix=prefix)
+            if parts:
+                messages = context.get_messages(with_history=False)
+                if messages and messages[-1].role == "user":
+                    messages[-1].metadata["duplex_input_ids"] = [
+                        key for part in parts for key in self._duplex_admission_inputs.get(part, ())]
+
+        self.react_agent._admit_user_message = admit_with_identity
         self._duplex_intent = self._session.get_state("duplex_working_intent") or {}
         self._duplex_control_state = self._session.get_state("duplex_control_state") or {}
+        from jiuwenswarm.agents.harness.team.duplex_inbox import restore_native
+        await restore_native(self)
+
+    async def durable_input(self, content):
+        """Fsync the complete input before any caller is allowed to ACK it."""
+        from jiuwenswarm.agents.harness.team.duplex_shadow import RoutedInput
+        message = content.message
+        text = await asyncio.to_thread(self._duplex_inbox.accept, self.durable_scope,
+                                       message.message_id, message.sender, str(content))
+        self._duplex_admission_inputs[text] = (message.message_id,)
+        return RoutedInput(text, message)
+
+    def _capture_tool_state(self):
+        self._duplex_receipt_version += 1
+        return {"version": self._duplex_receipt_version,
+                "state": self.load_state(self._session).to_session_dict(),
+                "intent_state": {key: self._session.get_state(key) for key in (
+                    "duplex_working_intent", "duplex_control_state", "duplex_intent_sources")}}
 
     def commit_working_intent(self, value):
         if not isinstance(value, dict) or set(value) != {
@@ -171,6 +220,9 @@ class DuplexNativeHarness(NativeHarness):
             raise ValueError("invalid constraints")
         self._duplex_intent = {k: (v[:2000] if isinstance(v, str) else list(v)) for k, v in value.items()}
         self._session.update_state({"duplex_working_intent": self._duplex_intent})
+        from .duplex_state import bind_intent
+
+        bind_intent(self, self._session)
         self._duplex_version += 1
 
     def _start_round(self, query, **kwargs):
@@ -178,13 +230,14 @@ class DuplexNativeHarness(NativeHarness):
         if not kwargs.get("resume_continuation"):
             self._duplex_intent = {}
             self._duplex_control_state = {}
-            self._session.update_state({"duplex_working_intent": {}})
+            self._session.update_state({"duplex_working_intent": {}, "duplex_intent_sources": {}})
         return super()._start_round(query, **kwargs)
 
     async def route_input(self, content, *, version, action, message_id, message_ids=()):
         self._require_alive()
         if action not in ("APPEND", "INTERRUPT"):
             raise ValueError("invalid action")
+        self._duplex_admission_inputs[str(content)] = tuple(message_ids) or (message_id,)
         ack = asyncio.get_running_loop().create_future()
         await self._control.put(_RouteInput(str(content), version, action, message_id, ack,
                                            tuple(message_ids) or (message_id,)))
@@ -197,6 +250,10 @@ class DuplexNativeHarness(NativeHarness):
         if isinstance(cmd, (_CmdPause, _CmdAbort, _CmdResume)):
             self._reject_transaction("superseded by lifecycle control")
             self._duplex_version += 1
+            if isinstance(cmd, (_CmdPause, _CmdAbort)):
+                await asyncio.to_thread(self._duplex_inbox.suspend, self.durable_scope)
+            elif cmd.ack is None or not cmd.ack.cancelled():
+                await asyncio.to_thread(self._duplex_inbox.activate, self.durable_scope)
         elif isinstance(cmd, _CmdSend):
             if self._duplex_pending is not None:
                 if len(self._duplex_waiting) >= 32:
@@ -208,6 +265,8 @@ class DuplexNativeHarness(NativeHarness):
                 self._reject_ack(cmd.ack, "runtime is being paused")
                 return
             self._duplex_version += 1
+            if cmd.ack is None or not cmd.ack.cancelled():
+                await asyncio.to_thread(self._duplex_inbox.activate, self.durable_scope)
         await super()._dispatch(cmd)
 
     async def _route(self, cmd):
@@ -264,6 +323,9 @@ class DuplexNativeHarness(NativeHarness):
             # An uncertain tool result must not trigger the SDK's query replay.
             active.failure_retry = True
         await super()._on_round_done(cmd)
+        if self.state is HarnessState.IDLE and cmd.error is None and not (cmd.result or {}).get("error"):
+            from jiuwenswarm.agents.harness.team.duplex_inbox import persist_native
+            await persist_native(self, running=False)
         if pending_round:
             if self.state is HarnessState.PAUSED:
                 await self._finish_transaction()
@@ -305,6 +367,7 @@ class DuplexNativeHarness(NativeHarness):
         self._reject_waiting(reason)
 
     async def _on_stop(self, cmd):
+        await asyncio.to_thread(self._duplex_inbox.suspend, self.durable_scope)
         self._reject_transaction("runtime stopped")
         controller = getattr(self, "_duplex_controller", None)
         if controller is not None:

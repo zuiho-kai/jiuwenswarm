@@ -39,22 +39,67 @@ class StatePublicationRail(AgentRail):
         self.publish(ctx, "after_react_iteration")
 
 
+def _sources(native, plan):
+    active = native.active_round
+    query = active.original_query if active is not None else ""
+    provider = getattr(native, "_duplex_goal_provider", None)
+    if provider is not None:
+        query = provider()
+    current = next((item for item in plan.get("tasks", [])
+                    if item.get("id") == plan.get("current_task_id")), {})
+    scope = {"query": query, "goal": plan.get("goal"),
+             "constraints": plan.get("constraints", [])}
+    action = {"scope": scope, "task_id": plan.get("current_task_id"),
+              "task": current.get("description") or current.get("content")}
+    return scope, action, current, query
+
+
+def current_plan(native, fallback=None, session=None):
+    session = session if session is not None else getattr(native, "_session", None)
+    if session is not None:
+        return native.load_state(session).to_session_dict().get("task_plan") or {}
+    return fallback or {}
+
+
+def bind_intent(native, session):
+    """Persist the committed sources which this explicit summary describes."""
+    scope, action, _, _ = _sources(native, current_plan(native, session=session))
+    session.update_state({"duplex_intent_sources": copy.deepcopy({
+        "scope": scope, "action": action, "intent": native._duplex_intent,
+    })})
+
+
+def resolve_intent(native, plan):
+    """A summary can enrich its source, but cannot override a changed source."""
+    scope, action, current, query = _sources(native, plan)
+    session = getattr(native, "_session", None)
+    sources = session.get_state("duplex_intent_sources") if session is not None else None
+    explicit = getattr(native, "_duplex_intent", {})
+    # Old persisted summaries without provenance are not fresh by default.
+    same_scope = bool(explicit and sources and sources.get("intent") == explicit
+                      and sources.get("scope") == scope)
+    same_action = same_scope and sources.get("action") == action
+    goal = plan.get("goal") or (query if isinstance(query, str) else "")
+    next_action = current.get("description") or current.get("content") or ""
+    return {
+        "goal": str((explicit.get("goal") if same_scope else "") or goal)[:2000],
+        "next_action": str((explicit.get("next_action") if same_action else "") or next_action)[:1000],
+        "current_hypothesis": explicit.get("current_hypothesis", "") if same_action else "",
+        "constraints": list(explicit.get("constraints", []) if same_scope else plan.get("constraints", [])),
+        "intent_source": "explicit" if same_action else "mixed" if same_scope else "committed_state",
+    }
+
+
 def publish_state(native, ctx, boundary):
     active = native.active_round
     if active is None or ctx.session is None:
         return
-    plan = native.load_state(ctx.session).to_session_dict().get("task_plan") or {}
-    explicit = native._duplex_intent
-    current = next((item for item in plan.get("tasks", [])
-                    if item.get("id") == plan.get("current_task_id")), {})
-    query = active.original_query
-    goal = explicit.get("goal") or plan.get("goal") or (query if isinstance(query, str) else "")
+    plan = current_plan(native, session=ctx.session)
     messages = []
     context = native.react_agent.context_engine.get_context(session_id=ctx.session.get_session_id())
     if context is not None:
         messages = context.get_messages()
-    # Some adapters own an authoritative external history (e.g. WebArena).
-    # Use that history directly, rather than the executor's placeholder input.
+    # External adapters supply their authoritative, committed history.
     provider = getattr(native, "_duplex_context_provider", None)
     if provider is not None:
         messages = provider()
@@ -66,12 +111,8 @@ def publish_state(native, ctx, boundary):
             committed = content[-2000:]
             break
     state = {
-        "goal": str(goal)[:2000],
-        "next_action": str(explicit.get("next_action") or current.get("description") or current.get("content") or "")[:1000],
-        "current_hypothesis": explicit.get("current_hypothesis", ""),
-        "constraints": list(explicit.get("constraints", [])),
+        **resolve_intent(native, plan),
         "committed_output": committed,
-        "intent_source": "explicit" if explicit else "committed_state",
         "boundary": boundary,
         "pending_tools": copy.deepcopy(getattr(native, "_duplex_tools", {})),
     }

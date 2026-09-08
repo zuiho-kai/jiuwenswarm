@@ -49,8 +49,8 @@ def native_from_runtime(runtime):
 def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
     """Copy only committed control data; never copy context_messages/reasoning.
 
-    Prefer explicit Working Intent in active mode; use the committed task plan
-    otherwise. Never infer unknown hypotheses or constraints from partial output.
+    Use explicit Working Intent only while its committed sources still match.
+    Resolve against the current committed plan, even before the next rail hook. Never infer unknown hypotheses or constraints from partial output.
     """
     active = harness.active_round
     if active is None:
@@ -58,7 +58,9 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
     checkpoint = active.last_iter_snapshot or active.pre_round_snapshot
     if checkpoint is None:
         return None
-    plan = checkpoint.deep_agent_state.get("task_plan") or {}
+    from .duplex_state import current_plan, resolve_intent
+
+    plan = current_plan(harness, checkpoint.deep_agent_state.get("task_plan"))
     current_id = plan.get("current_task_id")
     current = next((t for t in plan.get("tasks", []) if t.get("id") == current_id), {})
     query = active.original_query
@@ -71,8 +73,9 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
     # indices. This token is process-local, not a durable checkpoint address.
     version_data = [id(active), id(checkpoint), phase, active.model_call_in_flight,
                     active.tool_started, active.pause_requested, goal, next_action]
-    version = hashlib.sha256(json.dumps(version_data).encode()).hexdigest()[:20]
-    intent = {**getattr(harness, "_duplex_control_state", {}), **getattr(harness, "_duplex_intent", {})}
+    intent = {**getattr(harness, "_duplex_control_state", {}), **resolve_intent(harness, plan)}
+    version_data.append(intent)
+    version = hashlib.sha256(json.dumps(version_data, sort_keys=True).encode()).hexdigest()[:20]
     return ControlSnapshot(
         context_version=f"{getattr(harness, '_duplex_version', 0)}:{version}", round_id=str(active.round_id),
         checkpoint_id=f"{active.round_id}:{checkpoint.iteration_index}",
@@ -207,23 +210,25 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     if config is None:
         config = get_config().get("duplex_router", {}) or {}
     native = native_from_runtime(host.harness)
-    if (config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness)
-            or not use_steer):
+    if config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness):
         return await original(host, str(content), use_steer=use_steer)
-    policy = config.get("policy", "model")
-    if policy == "serial":
-        return await original(host, str(content), use_steer=False)
-    if policy == "steer":
-        return await original(host, str(content), use_steer=True)
     message = content.message
     if message.message_id in native._duplex_received:
-        return  # retry after an ACK write failure must not start another round
+        return
+    policy = config.get("policy", "model") if use_steer else "serial"
+    if policy in ("serial", "steer"):
+        content = await native.durable_input(content)
+        result = await original(host, str(content), use_steer=policy == "steer")
+        native._duplex_received.add(message.message_id)
+        return result
     try:
         timeout = float(config.get("timeout_seconds", 2.0))
     except (ValueError, TypeError):
+        content = await native.durable_input(content)
         return await original(host, str(content), use_steer=use_steer)
     if (not math.isfinite(timeout) or not 0 < timeout <= 30 or
             (policy != "always_interrupt" and not str(config.get("model_name") or "").strip())):
+        content = await native.durable_input(content)
         return await original(host, str(content), use_steer=use_steer)
     controller = input_controller(host, config, original)
     try:
@@ -256,6 +261,7 @@ def input_controller(host, config, original):
         batch = tuple(item for item in batch if item.message.message_id not in native._duplex_received)
         if not batch:
             return
+        batch = tuple([await native.durable_input(item) for item in batch])
         if decision is None:
             for item in batch:
                 await original(host, str(item), use_steer=True)

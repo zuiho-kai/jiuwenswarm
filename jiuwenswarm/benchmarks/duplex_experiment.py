@@ -74,7 +74,7 @@ class Experiment:
             self.command([*base, "--policy", "official", "--metrics", self.output / f"r{repeat}-baseline.jsonl", "--",
                 *c["runner_args"], "--test_config_base_dir", config0, "--test_indices", ",".join(task_ids),
                 "--result_dir", baseline, "--save_trajectory"], cwd=cwd, label=f"r{repeat}-baseline")
-            for policy in c.get("policies", ["official", "steer", "abort_restart", "model"]):
+            for policy in c.get("policies", ["official", "steer", "always_interrupt", "abort_restart", "model"]):
                 previous = baseline
                 for stage in range(1, stages + 1):
                     label = f"r{repeat}-{policy}-stage{stage}"

@@ -21,8 +21,10 @@ async def serve(args, output):
             try:
                 request = json.loads(line)
                 if request.get("operation") == "reset":
-                    await bridge.close_native()
+                    await bridge.reset_native(request.get("task"), request.get("environment"))
                     response = {"reset": True}
+                elif request.get("operation") in ("browser_begin", "browser_commit"):
+                    response = await bridge.browser_operation(**request)
                 else:
                     config = SimpleNamespace(model=request["model"], gen_config=request["gen_config"])
                     answer = await bridge._predict(config, request["prompt"], request["current"])
@@ -43,7 +45,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models", required=True)
     parser.add_argument("--metrics", required=True)
-    parser.add_argument("--policy", required=True)
+    from jiuwenswarm.benchmarks.interruptbench_runner import POLICIES
+    parser.add_argument("--policy", choices=[p for p in POLICIES if p != "official"], required=True)
     args = parser.parse_args()
     output = sys.stdout
     with contextlib.redirect_stdout(sys.stderr):

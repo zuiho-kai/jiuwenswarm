@@ -73,11 +73,14 @@ def load_models(path: Path):
 class NativePeer:
     """A persistent native worker; Runner's lifetime belongs to the entry point."""
     def __init__(self, *, name, models, policy, system_prompt, tools, events, prompt=None,
-                 max_iterations=1000):
+                 max_iterations=1000, durable_scope=None, ledger_path=None, goal=None):
         if policy not in ("serial", "steer", "abort_restart", "model", "always_interrupt"):
             raise ValueError("unsupported benchmark policy")
         self.name, self.policy, self.events = name, policy, events
         self.models = models
+        self.durable_scope, self.ledger_path = durable_scope, ledger_path
+        self.goal = goal
+        self.browser_checkpoint = None
         self.blueprint = SimpleNamespace(member_name=name)
         self.tiny_agent_model_resolver = lambda name: models["fast"] if name == "fast" else None
         self.model = MeasuredModel(models["slow"], events, lane="slow", prompt=prompt)
@@ -104,13 +107,24 @@ class NativePeer:
 
         cls = DuplexNativeHarness if self.policy in ("model", "always_interrupt") else NativeHarness
         harness = cls(Spec())
+        if self.durable_scope is not None:
+            harness.durable_scope = self.durable_scope
+        if self.ledger_path is not None and isinstance(harness, DuplexNativeHarness):
+            from jiuwenswarm.agents.harness.team.duplex_ledger import ToolLedger
+            from jiuwenswarm.agents.harness.team.duplex_inbox import DurableInbox
+            harness._duplex_ledger = ToolLedger(self.ledger_path)
+            harness._duplex_inbox = DurableInbox(Path(self.ledger_path).with_suffix(".inbox.sqlite3"))
         if self.model.prompt is not None:
             harness._duplex_context_provider = self.model.prompt
+        if self.goal is not None:
+            harness._duplex_goal_provider = self.goal
+        if self.browser_checkpoint is not None:
+            harness._duplex_browser_checkpoint = self.browser_checkpoint
         return harness
 
     async def start(self):
-        await self.harness.start()
         await self.harness.subscribe(on_round=self._on_round)
+        await self.harness.start()
         self._collector = asyncio.create_task(self._drain())
 
     async def _drain(self):
@@ -178,3 +192,33 @@ class NativePeer:
         await self.harness.stop()
         if self._collector is not None:
             await self._collector
+
+
+class UserInputPeer(NativePeer):
+    """Use the production USER_INPUT handler and TeamAgent delivery boundary."""
+
+    async def start(self):
+        from jiuwenswarm.agents.harness.team.duplex_shadow import install_shadow_observer
+        install_shadow_observer()
+        self.duplex_settings = {"mode": "active", "policy": self.policy,
+                                "model_name": "fast", "timeout_seconds": 2.0}
+        await super().start()
+
+    async def deliver_input(self, content, *, use_steer=True):
+        if self.policy == "abort_restart":
+            message = content.message
+            return await super().receive(str(content), message_id=message.message_id, sender="user")
+        from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+        return await TeamAgent.deliver_input(self, content, use_steer=self.policy != "serial")
+
+    async def receive_user(self, content, *, message_id):
+        from openjiuwen.agent_teams.agent.coordination.event_bus import InnerEventMessage, InnerEventType
+        from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
+        handler = AgentLifecycleHandler(self, self.blueprint, None, None)
+        self.events.add("message_arrived", member=self.name, message_id=message_id)
+        self.events.add("user_input_entry", member=self.name, message_id=message_id,
+                        handler="AgentLifecycleHandler.on_user_input")
+        await handler.on_user_input(InnerEventMessage(event_type=InnerEventType.USER_INPUT,
+            payload={"content": content, "message_id": message_id}))
+        self._received.add(message_id)
+        self.events.add("message_accepted", member=self.name, message_id=message_id)

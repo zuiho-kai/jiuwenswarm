@@ -49,7 +49,7 @@ class ToolLedger:
             db.execute("UPDATE calls SET state=?,result=? WHERE scope=? AND call_id=?",
                        (state, result, scope, call_id))
 
-    async def execute(self, *, scope, call, idempotent, invoke):
+    async def execute(self, *, scope, call, idempotent, invoke, capture_state=None):
         from openjiuwen.core.foundation.llm import ToolMessage
 
         arguments = call.arguments
@@ -68,7 +68,9 @@ class ToolLedger:
         try:
             value, message = await invoke()
             try:
-                serialized = json.dumps({"value": value, "message": message.model_dump()}, ensure_ascii=False)
+                serialized = json.dumps({"value": value, "message": message.model_dump(),
+                                         "recovery_state": capture_state() if capture_state else None},
+                                        ensure_ascii=False)
             except (TypeError, AttributeError):
                 # Complex SDK/workflow objects cannot be reconstructed safely.
                 # Record completion, but refuse to replay them from a partial receipt.

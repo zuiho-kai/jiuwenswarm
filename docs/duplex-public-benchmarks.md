@@ -144,6 +144,9 @@ Windows Native 在慢模型流式执行期间接收了官方首条更新，快�
 
 ## 评审后的接线修正
 
+本节记录第一次接线修正；最新的 U2A 生产入口、网页动作提交和安全全量打断修复见
+[第二轮修复](duplex-review-fixes.md)。
+
 AgentRadio 保留原 Coral 协议、题目和评分；收到的消息现在先写入 Jiuwen DB，
 由原 EventBus/Poll、未读 drain、Native 控制器和原 DAO ACK 处理。适配器注册真实
 Jiuwen 成员，避免消息已经投递但因缺少成员记录无法确认已读。Coral 是外部通信协议，

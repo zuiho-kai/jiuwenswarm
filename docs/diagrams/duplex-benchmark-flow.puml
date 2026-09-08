@@ -19,7 +19,7 @@ if (评测集？) then (InterruptBench / U2A)
     repeat
       :运行官方 baseline，保存轨迹;
       repeat
-        :默认策略 official / steer / abort_restart / model;
+        :默认策略 official / steer / always_interrupt / abort_restart / model;
         repeat
           :上游 make_multi_interrupt_stage\n由上一阶段轨迹生成当前意图与更新边界;
           note right
@@ -32,7 +32,7 @@ if (评测集？) then (InterruptBench / U2A)
           else (并发扩展)
             :原 PromptAgent 构造更新前 / 后 prompts;
             :ProcessWorker：stdio JSON\n独立 Python 3.12，同题复用 NativePeer;
-            :启动旧 prompt 的慢模型请求\n异步投递官方原始 update;
+            :启动旧 prompt 的慢模型请求\n原用户输入处理器投递官方 update;
             note right
               更新仍在同一 K-action 边界。
               等待期间不执行新网页动作。
@@ -44,8 +44,9 @@ if (评测集？) then (InterruptBench / U2A)
           endif
           :原动作解析 → 原环境 env.step → 保存轨迹\n原 evaluator_router 评分;
           note right
-            env.step 未纳入 Native 工具账本。
-            网页副作用与权威轨迹由原环境管理。
+            Native 组：执行前在同一工具账本预登记。
+            原轨迹追加后提交动作结果并关联 Native 检查点。
+            结果不明或浏览器环境变化：停止恢复，不盲目重做。
           end note
         repeat while (还有更新阶段？) is (是) not (否)
       repeat while (还有策略？) is (是) not (否)
