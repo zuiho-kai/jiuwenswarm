@@ -165,6 +165,7 @@ async def wait_until(predicate, timeout=6):
 @pytest_asyncio.fixture
 async def world(tmp_path, monkeypatch, request):
     from jiuwenswarm.common import config
+    monkeypatch.setenv("JIUWEN_DUPLEX_LEDGER_PATH", str(tmp_path / "tool-ledger.sqlite3"))
 
     settings = {"duplex_router": {"mode": "active", "model_name": "fast", "timeout_seconds": 2}}
     settings["duplex_router"].update(getattr(request, "param", {}))
@@ -253,6 +254,12 @@ async def test_model_interrupt_keeps_original_task_tool_result_and_db_ack(world)
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
     assert w.tool.path.read_text() == "committed\n"
     assert w.tool.cancelled == 0
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(w.native._duplex_ledger.path)) as ledger:
+        receipts = ledger.execute("SELECT state,result FROM calls WHERE tool='write_once'").fetchall()
+    assert len(receipts) == 1 and receipts[0][0] == "committed"
+    assert "committed exactly once" in receipts[0][1]
     slow = [c for c in w.endpoint.calls if c["model"] == "slow"]
     recovered = json.dumps(slow[-1]["messages"])
     assert "Implement the order event system" in recovered
@@ -512,6 +519,84 @@ async def test_benchmark_native_peer_executes_recovery_and_naive_restart(world, 
 
 
 @pytest.mark.asyncio
+async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_path):
+    from jiuwenswarm.benchmarks.duplex_database_peer import DatabasePeer
+    from jiuwenswarm.benchmarks.duplex_runtime import Events
+
+    w = world
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    w.endpoint.tool_first = False
+    w.endpoint.fast_gate.clear()
+    peer = DatabasePeer(database=tmp_path / "official.db", team="official", name="agent-1",
+        models={"slow": slow, "fast": fast}, policy="model", system_prompt="Complete the task.",
+        tools=[], events=Events(tmp_path / "db-events.jsonl"))
+    inputs = []
+    try:
+        await peer.start()
+        await peer.send("Use Kafka for the order system.")
+        await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+        state = peer.harness._duplex_control_state
+        assert state["goal"] == "Use Kafka for the order system."
+        assert state["intent_source"] == "committed_state"
+        assert state["current_hypothesis"] == ""
+        inputs.append(asyncio.create_task(peer.receive("Use PostgreSQL instead.", message_id="one")))
+        await asyncio.wait_for(w.endpoint.fast_entered.wait(), 6)
+        inputs.append(asyncio.create_task(peer.receive("Keep the existing schema.", message_id="two")))
+        await wait_until(lambda: sum(c["model"] == "fast" for c in w.endpoint.calls) >= 2)
+        latest = json.dumps([c for c in w.endpoint.calls if c["model"] == "fast"][-1])
+        assert "PostgreSQL" in latest and "existing schema" in latest
+        rows = await peer.db.message.get_team_messages("official")
+        assert len(rows) == 2 and not any(row.is_read for row in rows)
+        w.endpoint.fast_gate.set()
+        await asyncio.wait_for(asyncio.gather(*inputs), 6)
+        await peer.wait(timeout=6)
+        rows = await peer.db.message.get_team_messages("official")
+        assert all(row.is_read for row in rows)
+        count = len(peer.events.records)
+        await peer.receive("Use PostgreSQL instead.", message_id="one")
+        assert len(peer.events.records) == count
+    finally:
+        for task in inputs:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*inputs, return_exceptions=True)
+        await peer.close()
+
+
+@pytest.mark.asyncio
+async def test_input_dispatch_does_not_block_lifecycle_event(world):
+    from openjiuwen.agent_teams.agent.coordination.event_bus import (
+        EventBus, InnerEventMessage, InnerEventType,
+    )
+
+    entered, release, lifecycle = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class Dispatch:
+        message = world.handler
+
+        async def dispatch(self, event):
+            if event.event_type == InnerEventType.USER_INPUT:
+                entered.set()
+                await release.wait()
+            else:
+                lifecycle.set()
+
+    bus = EventBus(role=TeamRole.LEADER)
+    await bus.start(wake_callback=Dispatch().dispatch)
+    try:
+        await bus.enqueue(InnerEventMessage(event_type=InnerEventType.USER_INPUT))
+        await asyncio.wait_for(entered.wait(), 2)
+        await bus.enqueue(InnerEventMessage(event_type=InnerEventType.REFRESH_TEAM_CONTEXT))
+        await asyncio.wait_for(lifecycle.wait(), 2)
+        assert not release.is_set()
+    finally:
+        await bus.stop()
+    assert not bus._duplex_input_tasks
+
+
+@pytest.mark.asyncio
 async def test_browser_native_adapter_returns_original_prompt_action(world, tmp_path):
     from jiuwenswarm.benchmarks.duplex_runtime import Events
     from jiuwenswarm.benchmarks.interruptbench_runner import NativeBrowserBridge
@@ -529,11 +614,22 @@ async def test_browser_native_adapter_returns_original_prompt_action(world, tmp_
     after = [*prompt, {"role": "user", "content": "Official updated goal."}]
     current = {"after_prompt": after, "pending": {"before": "Original goal", "after": "Updated goal",
         "update": "Official updated goal.", "message_id": "u-1", "delivered": False}}
-    answer = await bridge._predict(NS(model="slow", gen_config={}), prompt, current)
-    assert "PostgreSQL" in answer
-    requests = [r for r in w.endpoint.calls if r["model"] == "slow"]
-    assert requests[-1]["messages"] == after
-    assert not requests[-1].get("tools")
+    try:
+        answer = await bridge._predict(NS(model="slow", gen_config={}), prompt, current)
+        assert "PostgreSQL" in answer
+        requests = [r for r in w.endpoint.calls if r["model"] == "slow"]
+        assert requests[-1]["messages"] == after
+        assert not requests[-1].get("tools")
+        original_peer = bridge._peer
+        second_prompt = [*after, {"role": "user", "content": "Next browser observation."}]
+        await bridge._predict(NS(model="slow", gen_config={}), second_prompt,
+                              {"intent": "Updated goal", "pending": None})
+        assert bridge._peer is original_peer
+        assert bridge._peer.harness._st.round_id_counter >= 2
+        assert [r for r in w.endpoint.calls if r["model"] == "slow"][-1]["messages"] == second_prompt
+    finally:
+        await bridge.close_native()
+
 
 
 @pytest.mark.asyncio

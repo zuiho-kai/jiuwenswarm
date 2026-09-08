@@ -106,3 +106,18 @@ python -m jiuwenswarm.common.duplex_benchmark tests/fixtures/duplex/routing_case
 
 依赖以仓库 `uv.lock` 锁定的 agent-core `94e10cb` 为准。共享环境的旧安装缺少主干所需
 Rail，直接使用远端最新 SDK 又有接口漂移；验证应使用锁定版本，不用业务代码掩盖依赖问题。
+
+## 2026-09-08 评审后的修正
+
+每个 Native 现在持有一个输入控制器。普通 DB 消息在原 drain 等待分类时仍可登记，
+新消息取消尚未应用的旧分类并合批重判，预算从最早消息到达计算，默认 2 秒、32 条。
+原 drain 保留排序和 ACK；控制消息仍走原处理。模型分类不再阻塞 EventBus 的其他事件。
+
+状态 rail 在模型、工具和迭代边界发布已提交状态；没有显式 Working Intent 时，
+假设字段保持未知。发布边界状态不代表模型自动生成了新的语义摘要。
+
+Native 工具执行前写 SQLite 账本，完成后保存可重建结果，同一会话和 tool_call_id
+重试复用结果。非幂等工具结果不明时拒绝自动重复执行。默认路径为
+`~/.jiuwenswarm/duplex-state/duplex-tools.sqlite3`，可用 `JIUWEN_DUPLEX_LEDGER_PATH` 指定。
+这不是外部系统的 exactly-once 保证；新进程恢复消息接受记录及检查点仍未完成验收。
+当前消息去重和 Native 安全恢复的证明范围仍是同一存活实例，不能据此宣称崩溃恢复完成。

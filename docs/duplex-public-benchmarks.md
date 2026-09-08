@@ -141,3 +141,23 @@ Windows Native 在慢模型流式执行期间接收了官方首条更新，快�
 `XDG_CACHE_HOME` 指向本机临时目录，避免导入时大量写网络缓存。
 服务器针对路由、官方输入、实验统计及 Native 接线的回归结果为 62 通过、2 跳过；
 跳过项是尚未安装 Harbor 的原启动脚本测试和缺少独立 WebArena 环境的原动作解析测试。
+
+## 评审后的接线修正
+
+AgentRadio 保留原 Coral 协议、题目和评分；收到的消息现在先写入 Jiuwen DB，
+由原 EventBus/Poll、未读 drain、Native 控制器和原 DAO ACK 处理。适配器注册真实
+Jiuwen 成员，避免消息已经投递但因缺少成员记录无法确认已读。Coral 是外部通信协议，
+Jiuwen DB 是本地收件账本，不能将其解释为替换了 Coral 的整个协作系统。
+
+InterruptBench 同题跨动作复用一个 Native，任务 reset 或失败时才关闭；原 PromptAgent
+仍负责 prompt 和动作解析，原 WebArena 环境负责 `env.step`。网页动作尚未纳入 Native
+工具账本，当前适配不能证明网页外部副作用与 Native 检查点统一提交。
+
+AgentRadio 成对报告默认对比原 SDK steer，可显式设置 `comparison_baseline`。
+`always_interrupt`（安全检查点恢复）和 `abort_restart`（重建并从头运行）是不同对照，
+不得混报。上述机制修正不产生官方分数，正式运行仍缺可用容器和 WebArena 站点。
+
+本轮 Windows 完整回归 140 项通过（2026-09-08）：包含真实 SQLite 连续两条消息
+取消旧判断并合并重判、原 DAO ACK 和重复消息去重、EventBus 事件不被输入分类阻塞、
+真实工具执行收据落盘，以及同题持久 Native 和原 Python 3.11 浏览器动作解析器。
+模型响应为受控测试端点；结果不是公开任务分数。Ruff 检查通过。

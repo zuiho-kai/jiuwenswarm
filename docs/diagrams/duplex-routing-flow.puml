@@ -1,5 +1,5 @@
 @startuml duplex-routing-flow
-title Native 全双工：输入路由与安全恢复
+title Native 全双工：输入合批与安全恢复
 skinparam defaultFontName Microsoft YaHei
 skinparam defaultFontSize 14
 skinparam shadowing false
@@ -11,96 +11,80 @@ skinparam noteBackgroundColor #FFF6DC
 skinparam backgroundColor #FFFFFF
 
 start
-:A2A / U2A 进入原投递入口;
-if (active + DuplexNative\n且允许 steer？) then (否)
-  :沿用原投递；shadow 仅异步观察;
+:A2A / U2A 输入异步分发\nA2A 原 drain 按序预取，保留 DB ACK;
+if (active + DuplexNative + 可路由输入\n且策略 / 配置满足控制器入口？) then (否)
+  :沿用原投递或 serial / steer 策略\nshadow 仅观察;
   stop
 else (是)
-endif
-if (策略为 serial / steer？) then (是)
-  :调用原 SDK 对应投递策略;
-  stop
-else (否)
 endif
 if (当前实例已接收 message_id？) then (是)
-  :直接成功返回，避免 ACK 重试重复执行;
+  :成功返回，原 DB ACK 可继续;
   stop
 else (否)
 endif
-:读取已提交的 ControlSnapshot;
-if (快照可用？) then (否)
-  :沿用原 SDK 投递;
-  stop
-else (是)
-endif
-if (always_interrupt？) then (是)
-  :动作 = INTERRUPT;
-else (model)
-  if (快模型与超时配置有效？) then (否)
-    :沿用原 SDK 投递;
-    stop
-  else (是)
-  endif
-  :独立 TinyAgent 分类\n仅发送控制摘要与有界消息;
-  if (返回合法且快照仍一致？) then (是)
-    :接受 APPEND / INTERRUPT;
-  else (否)
-    if (仅版本过期且还有预算？) then (是)
-      :使用最新快照，最多重算一次;
-      if (重算合法且快照一致？) then (是)
-        :接受新动作;
-      else (否)
-        :动作 = APPEND;
-      endif
-    else (超时 / 异常 / 非法)
-      :动作 = APPEND;
-    endif
-  endif
-endif
-:提交 _RouteInput\n完整原文、message_id、版本、动作;
-partition "Native supervisor 内的串行事务" {
-  if (重复消息？) then (是)
-    :返回 DUPLICATE;
-    stop
-  else (否)
-  endif
-  if (RUNNING、版本匹配\n且无其他待完成事务？) then (否)
-    :返回 STALE;
-    :外层改走原 SDK 追加路径;
-    stop
-  else (是)
-  endif
-  if (动作为 APPEND？) then (是)
-    :进入 steering 队列，记录去重与版本;
-    :成功返回；当前模型 / 工具继续;
-    note right
-      采纳后在安全边界 commit。
-      如恰逢末次生成，安排 continuation。
-      未提交的消息在取消后按序 rewind。
-    end note
-  else (INTERRUPT)
-    :登记待完成事务，调用原 Native pause;
-    if (处于工具阶段？) then (是)
-      :等待工具结束，保留已完成结果;
-    else (模型 / 其他安全阶段)
-      :原 SDK 安全暂停\n在模型阶段取消并恢复检查点;
-    endif
-    if (事务被生命周期命令取代、调用方取消\n或失败而不能安全恢复？) then (是)
-      :拒绝 / 取消投递，不自动重启;
-      :A2A 保持未读，交原恢复路径处理;
+partition "InputController：每个 Native 一个持有者" {
+  :submit：同 ID 复用待完成 future\n不同内容拒绝；容量 32，溢出不确认;
+  :最早到达时间 + timeout = 固定截止时间;
+  repeat
+    :取当前待处理批次与 ControlSnapshot;
+    if (快照不可用？) then (是)
+      :按序沿用原 SDK 投递\n成功后完成批次 future;
       stop
     else (否)
-      :PAUSED 后在同一事务内\n注入完整原文并恢复 Native;
-      :记录 message_id，返回 INTERRUPT\n继续处理暂存的后续 send;
+    endif
+    if (截止时间已到？) then (是)
+      :当前批次 APPEND，结束决策等待;
+    else (否)
+      :model：独立 TinyAgent 分类\nalways_interrupt：规则返回 INTERRUPT;
+      note right
+        同时监听新输入。
+        仅版本变化时，单次 observe 最多重算一次。
+        超时 / 异常 / 非法输出默认 APPEND。
+      end note
+    endif
+    if (分类期间有新输入？) then (是)
+      :取消尚未应用的快模型判断\n把新输入并入批次，不延长截止时间;
+    else (否)
+    endif
+  repeat while (需要重新取批次？) is (是) not (否)
+  :apply：过滤已接收 ID，提交一条 _RouteInput\n完整原文按序拼接 + 全部 message_ids + 版本 / 动作;
+}
+partition "Native supervisor：事务应用阶段不被新输入抢占" {
+  if (批次全部已接收？) then (是)
+    :返回 DUPLICATE;
+  else (否)
+    if (RUNNING、版本匹配\n且没有待完成事务？) then (否)
+      :返回 STALE\n外层逐条走原 SDK 追加路径;
+    else (是)
+      if (动作为 APPEND？) then (是)
+        :进入 steering 队列\n记录批次 ID 与版本，当前执行继续;
+        note right
+          安全边界 commit，取消后按序 rewind。
+          末次模型生成遇到追加，安排 continuation。
+        end note
+      else (INTERRUPT)
+        :登记事务，调用原 Native pause;
+        if (工具正在执行？) then (是)
+          :等待工具完成，保留结果\n工具账本回执独立于模型回滚;
+        else (模型 / 其他安全阶段)
+          :安全暂停\n模型阶段取消请求并恢复检查点;
+        endif
+        if (生命周期取代、调用方取消\n或无法安全恢复？) then (是)
+          :拒绝 / 取消投递，不自动重启\nA2A 保持未读供原恢复路径处理;
+          stop
+        else (否)
+          :PAUSED 后注入整批原文并恢复\n记录 message_ids，返回 INTERRUPT;
+        endif
+      endif
     endif
   endif
 }
-:投递成功返回；A2A 原处理器写 DB ACK;
+:完成该批 future，继续下一批\nA2A 原 drain 在投递成功后写 DB ACK;
 stop
 
 legend bottom
-生命周期控制可在事务等待期间取代它；图中的判断汇总该异步结果。
-DB ACK 由原 SDK 负责，U2A 沿用其原入口返回语义。
-工具外部副作用不回滚；这不是跨进程恰好一次保证。
+输入事件不阻塞生命周期分发；预取不越过控制 / 审批 / 模板消息。
+执行边界自动投影已提交状态；未显式发布的 hypothesis 为未知。
+工具账本仅覆盖 Native 工具调用，不回滚副作用，不包含 WebArena env.step。
 endlegend
 @enduml

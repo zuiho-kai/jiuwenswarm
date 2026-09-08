@@ -142,7 +142,8 @@ class Experiment:
     def _report(self, reports):
         (self.output / "report.json").write_text(json.dumps({"benchmark": self.config["benchmark"],
             "runs": reports, "paired_success": paired_success(reports,
-                "official" if self.config["benchmark"] == "interruptbench" else "L3"),
+                self.config.get("comparison_baseline",
+                    "official" if self.config["benchmark"] == "interruptbench" else "steer")),
             "notes": ["Missing official scores count in the denominator.",
             "Absent provider usage and GPU metrics are null, never estimated as zero.",
             "Later InterruptBench stages follow each policy's own official trajectory."]}, indent=2), encoding="utf-8")

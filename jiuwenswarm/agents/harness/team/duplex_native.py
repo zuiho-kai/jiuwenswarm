@@ -8,7 +8,9 @@ agent. A tool-phase pause is completed by the supervisor's round-finished event.
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from openjiuwen.agent_teams.harness.control import (
@@ -31,6 +33,7 @@ class _RouteInput:
     action: str
     message_id: str
     ack: asyncio.Future
+    message_ids: tuple[str, ...] = ()
 
 
 class _SteeringQueue(asyncio.Queue):
@@ -102,6 +105,23 @@ class DuplexNativeHarness(NativeHarness):
         self._duplex_received: set[str] = set()
         self._duplex_steering: _SteeringQueue | None = None
         self._duplex_intent: dict = {}
+        self._duplex_control_state: dict = {}
+        self._duplex_tools: dict = {}
+        from jiuwenswarm.agents.harness.team.duplex_ledger import ToolLedger
+        self._duplex_ledger = ToolLedger(os.environ.get("JIUWEN_DUPLEX_LEDGER_PATH") or
+                                        Path.home() / ".jiuwenswarm/duplex-state/duplex-tools.sqlite3")
+        execute = self.ability_manager._execute_single_tool_call
+
+        async def execute_with_receipt(tool_call, session, tag=None):
+            card = self.ability_manager.get(tool_call.name)
+            return await self._duplex_ledger.execute(
+                scope=session.get_session_id(), call=tool_call,
+                idempotent=bool(getattr(card, "idempotent", False)),
+                invoke=lambda: execute(tool_call=tool_call, session=session, tag=tag))
+
+        self.ability_manager._execute_single_tool_call = execute_with_receipt
+        from jiuwenswarm.agents.harness.team.duplex_state import StatePublicationRail
+        self.add_rail(StatePublicationRail(self))
         intent_tool = WorkingIntentTool(self)
         self.ability_manager.add_ability(intent_tool.card, intent_tool)
         # Wrap the actual phase rail before callback registration. This retains
@@ -136,6 +156,7 @@ class DuplexNativeHarness(NativeHarness):
             queues.steering = replacement
         self._duplex_steering = queues.steering
         self._duplex_intent = self._session.get_state("duplex_working_intent") or {}
+        self._duplex_control_state = self._session.get_state("duplex_control_state") or {}
 
     def commit_working_intent(self, value):
         if not isinstance(value, dict) or set(value) != {
@@ -156,15 +177,17 @@ class DuplexNativeHarness(NativeHarness):
         self._duplex_version += 1
         if not kwargs.get("resume_continuation"):
             self._duplex_intent = {}
+            self._duplex_control_state = {}
             self._session.update_state({"duplex_working_intent": {}})
         return super()._start_round(query, **kwargs)
 
-    async def route_input(self, content, *, version, action, message_id):
+    async def route_input(self, content, *, version, action, message_id, message_ids=()):
         self._require_alive()
         if action not in ("APPEND", "INTERRUPT"):
             raise ValueError("invalid action")
         ack = asyncio.get_running_loop().create_future()
-        await self._control.put(_RouteInput(str(content), version, action, message_id, ack))
+        await self._control.put(_RouteInput(str(content), version, action, message_id, ack,
+                                           tuple(message_ids) or (message_id,)))
         return await ack
 
     async def _dispatch(self, cmd):
@@ -192,8 +215,12 @@ class DuplexNativeHarness(NativeHarness):
 
         if cmd.ack.cancelled():
             return
-        if cmd.message_id in self._duplex_received:
+        ids = cmd.message_ids or (cmd.message_id,)
+        if all(key in self._duplex_received for key in ids):
             self._ack(cmd.ack, "DUPLICATE")
+            return
+        if any(key in self._duplex_received for key in ids):
+            self._ack(cmd.ack, "STALE")
             return
         current = snapshot_from_native(self)
         if (self.state is not HarnessState.RUNNING or current is None or
@@ -202,7 +229,7 @@ class DuplexNativeHarness(NativeHarness):
             return
         if cmd.action == "APPEND":
             self._push_steer(cmd.content)
-            self._duplex_received.add(cmd.message_id)
+            self._duplex_received.update(ids)
             self._duplex_version += 1
             self._ack(cmd.ack, "APPEND")
             return
@@ -222,7 +249,7 @@ class DuplexNativeHarness(NativeHarness):
             return  # keep the safe PAUSED state; do not resurrect cancelled work
         send_ack = asyncio.get_running_loop().create_future()
         await super()._on_send(_CmdSend(msg=InboxMessage(0, cmd.content, True), ack=send_ack))
-        self._duplex_received.add(cmd.message_id)
+        self._duplex_received.update(cmd.message_ids or (cmd.message_id,))
         self._ack(cmd.ack, "INTERRUPT")
         waiting, self._duplex_waiting = self._duplex_waiting, []
         for send in waiting:
@@ -258,6 +285,8 @@ class DuplexNativeHarness(NativeHarness):
         if self._duplex_steering is not None:
             self._duplex_steering.rewind()
         self._duplex_version += 1
+        self._duplex_intent = self._session.get_state("duplex_working_intent") or {}
+        self._duplex_tools.clear()
 
     @staticmethod
     def _reject_ack(ack, reason):
@@ -277,6 +306,9 @@ class DuplexNativeHarness(NativeHarness):
 
     async def _on_stop(self, cmd):
         self._reject_transaction("runtime stopped")
+        controller = getattr(self, "_duplex_controller", None)
+        if controller is not None:
+            await controller.aclose()
         await super()._on_stop(cmd)
 
     def _fail_remaining_commands(self, crashed_cmd, crash_exc):

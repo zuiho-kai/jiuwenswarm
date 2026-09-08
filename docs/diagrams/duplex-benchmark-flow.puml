@@ -31,16 +31,22 @@ if (评测集？) then (InterruptBench / U2A)
             :沿用原 call_llm 与原更新时序;
           else (并发扩展)
             :原 PromptAgent 构造更新前 / 后 prompts;
-            :ProcessWorker：stdio JSON\n独立 Python 3.12 执行 NativePeer;
+            :ProcessWorker：stdio JSON\n独立 Python 3.12，同题复用 NativePeer;
             :启动旧 prompt 的慢模型请求\n异步投递官方原始 update;
             note right
               更新仍在同一 K-action 边界。
               等待期间不执行新网页动作。
               独立 worker 的日志走 stderr。
+              reset / 失败 / 退出时关闭 NativePeer。
+              控制摘要读取原 prompt 的已提交历史。
             end note
             :应用 Native 策略，返回文本动作;
           endif
-          :原动作解析 → env.step → 保存轨迹\n原 evaluator_router 评分;
+          :原动作解析 → 原环境 env.step → 保存轨迹\n原 evaluator_router 评分;
+          note right
+            env.step 未纳入 Native 工具账本。
+            网页副作用与权威轨迹由原环境管理。
+          end note
         repeat while (还有更新阶段？) is (是) not (否)
       repeat while (还有策略？) is (是) not (否)
     repeat while (还有重复实验？) is (是) not (否)
@@ -55,8 +61,14 @@ else (AgentRadio / A2A)
           :上游 Coral 适配器与原 peer 执行器;
         else (Native 策略)
           :JiuwenAgentRadio 继承原安装与编排\n仅替换 peer 启动入口;
-          :原四 Agent、五阶段提示与恢复提示\n启动持久 NativePeer;
-          :Bash watcher 后台完成\n原 Coral 消息输出 → NativePeer.receive;
+          :原四 Agent、五阶段提示与恢复提示\n启动持久 DatabasePeer / NativePeer;
+          :Bash watcher 收到原 Coral 输出\nDatabasePeer.receive 写 Jiuwen DB;
+          note right
+            Coral：外部通信协议，不替换。
+            Jiuwen DB：本地持久收件账本。
+            外部消息 ID 映射为稳定本地 ID。
+          end note
+          :EventBus / poll → 原 MessageHandler\nmodel 经 InputController 合批\n其余走对应 Native 策略，成功后原 drain ACK;
           :按策略追加 / 取消重建 / 安全恢复\n继续任务直到答案产出或失败;
         endif
         :保留答案和 trial 产物\n原 verify_local.py 按 rubric 评分;
@@ -71,6 +83,6 @@ stop
 legend bottom
 此图描述已接入的代码流程，不表示已完成公开任务实测或获得性能收益。
 任一步骤失败会保留日志并终止；不跳过失败题以提高成绩。
-AgentRadio 仍走 Coral；Jiuwen DB 消息链路由另行集成测试覆盖。
+AgentRadio 的 Native 组经过 Coral + Jiuwen DB；原 L2 / L3 仍是上游执行器。
 endlegend
 @enduml

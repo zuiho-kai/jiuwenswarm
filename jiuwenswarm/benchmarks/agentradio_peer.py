@@ -14,7 +14,7 @@ from openjiuwen.core.foundation.tool import Tool, ToolCard
 from openjiuwen.core.runner import Runner
 from openjiuwen.agent_teams.harness.state import HarnessState
 
-from jiuwenswarm.benchmarks.duplex_runtime import Events, NativePeer, load_models
+from jiuwenswarm.benchmarks.duplex_runtime import Events, load_models
 
 
 class BashTool(Tool):
@@ -102,7 +102,9 @@ async def run(args):
                model=models["slow"].model_request_config.model_name,
                fast_model=models["fast"].model_request_config.model_name)
     tool = BashTool(Path.cwd(), events)
-    peer = NativePeer(name=os.environ.get("CORAL_AGENT_ID", "peer"), models=models,
+    from jiuwenswarm.benchmarks.duplex_database_peer import DatabasePeer
+    peer = DatabasePeer(database=Path(args.database), team=os.environ.get("CORAL_SESSION_ID", "agentradio"),
+        name=os.environ.get("CORAL_AGENT_ID", "peer"), models=models,
         policy=args.policy, system_prompt=Path("CLAUDE.md").read_text(), tools=[tool], events=events)
     tool.peer = peer
     resume_prompt = Path(args.resume_prompt).read_text(encoding="utf-8")
@@ -144,6 +146,7 @@ def main():
     parser.add_argument("--models", required=True)
     parser.add_argument("--policy", choices=["serial", "steer", "abort_restart", "model", "always_interrupt"], required=True)
     parser.add_argument("--metrics", required=True)
+    parser.add_argument("--database", default="/logs/agent/jiuwen-messages.sqlite3")
     parser.add_argument("--answer", default="/logs/agent/answer.txt")
     parser.add_argument("--resume-prompt", default="/tmp/jiuwen-bench-resume.txt")
     parser.add_argument("--timeout", type=float, default=7200)

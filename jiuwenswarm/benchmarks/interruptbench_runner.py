@@ -75,6 +75,15 @@ class ProcessWorker:
     def predict(self, config, prompt, current):
         payload = {"model": config.model, "gen_config": config.gen_config,
                    "prompt": prompt, "current": current}
+        response = self.request(payload)
+        if current and current["pending"]:
+            current["pending"]["delivered"] = True
+        return response["output"]
+
+    def reset(self):
+        self.request({"operation": "reset"})
+
+    def request(self, payload):
         try:
             self.process.stdin.write(json.dumps(payload) + "\n")
             self.process.stdin.flush()
@@ -86,9 +95,7 @@ class ProcessWorker:
         response = json.loads(line)
         if "error" in response:
             raise RuntimeError(response["error"])
-        if current and current["pending"]:
-            current["pending"]["delivered"] = True
-        return response["output"]
+        return response
 
     def close(self):
         try:
@@ -118,6 +125,13 @@ class NativeBrowserBridge:
         self.worker = None
         self.original_call = None
         self.native_python, self.models_file = native_python, models_file
+        self._peer = None
+        self._active_prompt = None
+
+    async def close_native(self):
+        if self._peer is not None:
+            peer, self._peer = self._peer, None
+            await peer.close()
 
     def on_interrupt(self, agent, task_id, before, after, update, boundary, mode):
         record = self.official_records[str(task_id)]
@@ -144,13 +158,17 @@ class NativeBrowserBridge:
 
         def reset(agent, config_file):
             bridge.pending.pop(id(agent), None)
+            if isinstance(bridge.worker, ProcessWorker):
+                bridge.worker.reset()
+            elif isinstance(bridge.worker, LoopThread):
+                bridge.worker.call(bridge.close_native())
             return original_reset(agent, config_file)
 
         def next_action(agent, trajectory, intent, meta_data, images=None, output_response=False):
             pending = bridge.pending.pop(id(agent), None)
             constructor = agent.prompt_constructor
             original_construct = constructor.construct
-            bridge.current = {"pending": pending, "after_prompt": None}
+            bridge.current = {"pending": pending, "after_prompt": None, "intent": intent}
 
             def construct(*args, **kwargs):
                 prompt = original_construct(*args, **kwargs)
@@ -198,6 +216,7 @@ class NativeBrowserBridge:
             agent_module.call_llm = bridge.original_call
             if isinstance(bridge.worker, LoopThread):
                 try:
+                    bridge.worker.call(bridge.close_native())
                     bridge.worker.call(Runner.stop())
                 finally:
                     bridge.worker.close()
@@ -217,18 +236,21 @@ class NativeBrowserBridge:
         models = {**self.models, "slow": config.model_copy(update={"model_request_config": request})}
         pending = current["pending"] if current else None
         changing = pending is not None and not pending["delivered"]
-        active_prompt = copy.deepcopy(current["after_prompt"] if pending and pending["delivered"] else prompt)
-        peer = NativePeer(name="interruptbench", models=models, policy=self.policy,
-            system_prompt="", tools=[], events=self.events, prompt=lambda: active_prompt)
-        await peer.start()
+        self._active_prompt = copy.deepcopy(current["after_prompt"] if pending and pending["delivered"] else prompt)
+        if self._peer is None:
+            self._peer = NativePeer(name="interruptbench", models=models, policy=self.policy,
+                system_prompt="", tools=[], events=self.events, prompt=lambda: self._active_prompt)
+            await self._peer.start()
+        peer = self._peer
+        peer.model.entered.clear()
         try:
-            await peer.send(pending["before"] if changing else "Continue the official browser task.")
+            await peer.send(pending["before"] if changing else (current or {}).get("intent", "Continue the official browser task."))
             if changing:
                 # Still at the same K-action boundary: no browser action can run
                 # while next_action is blocked here. Start the old model request
                 # and deliver the official event concurrently with that request.
                 await asyncio.wait_for(peer.model.entered.wait(), self.timeout)
-                active_prompt = copy.deepcopy(current["after_prompt"])
+                self._active_prompt = copy.deepcopy(current["after_prompt"])
                 await peer.receive(pending["update"], message_id=pending["message_id"], sender="user")
                 pending["delivered"] = True
             result = await peer.wait(timeout=self.timeout)
@@ -236,8 +258,9 @@ class NativeBrowserBridge:
             if not isinstance(output, str):
                 raise ValueError("Native model returned no textual browser action")
             return output
-        finally:
-            await peer.close()
+        except BaseException:
+            await self.close_native()
+            raise
 
 
 def main():

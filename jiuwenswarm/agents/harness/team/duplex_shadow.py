@@ -72,7 +72,7 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
     version_data = [id(active), id(checkpoint), phase, active.model_call_in_flight,
                     active.tool_started, active.pause_requested, goal, next_action]
     version = hashlib.sha256(json.dumps(version_data).encode()).hexdigest()[:20]
-    intent = getattr(harness, "_duplex_intent", {})
+    intent = {**getattr(harness, "_duplex_control_state", {}), **getattr(harness, "_duplex_intent", {})}
     return ControlSnapshot(
         context_version=f"{getattr(harness, '_duplex_version', 0)}:{version}", round_id=str(active.round_id),
         checkpoint_id=f"{active.round_id}:{checkpoint.iteration_index}",
@@ -80,6 +80,9 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
         next_action=intent.get("next_action") or next_action,
         current_hypothesis=intent.get("current_hypothesis", ""),
         constraints=tuple(intent.get("constraints", [])),
+        committed_output=intent.get("committed_output", ""),
+        intent_source=intent.get("intent_source", "unknown"),
+        pending_tools=tuple({"call_id": key, **value} for key, value in intent.get("pending_tools", {}).items()),
     )
 
 
@@ -200,7 +203,9 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     from jiuwenswarm.common.config import get_config
     from jiuwenswarm.agents.harness.team.duplex_native import DuplexNativeHarness
 
-    config = settings if settings is not None else (get_config().get("duplex_router", {}) or {})
+    config = settings if settings is not None else getattr(host, "duplex_settings", None)
+    if config is None:
+        config = get_config().get("duplex_router", {}) or {}
     native = native_from_runtime(host.harness)
     if (config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness)
             or not use_steer):
@@ -213,39 +218,72 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     message = content.message
     if message.message_id in native._duplex_received:
         return  # retry after an ACK write failure must not start another round
-    snapshot = snapshot_from_native(native)
-    if snapshot is None:
+    try:
+        timeout = float(config.get("timeout_seconds", 2.0))
+    except (ValueError, TypeError):
         return await original(host, str(content), use_steer=use_steer)
+    if (not math.isfinite(timeout) or not 0 < timeout <= 30 or
+            (policy != "always_interrupt" and not str(config.get("model_name") or "").strip())):
+        return await original(host, str(content), use_steer=use_steer)
+    controller = input_controller(host, config, original)
+    try:
+        return await controller.submit(content)
+    except asyncio.CancelledError:
+        await controller.aclose()
+        raise
+
+
+def input_controller(host, config, original):
+    from jiuwenswarm.agents.harness.team.duplex_controller import InputController
+
+    native = native_from_runtime(host.harness)
+    controller = getattr(native, "_duplex_controller", None)
+    if controller is not None and not controller.closed:
+        return controller
     model = str(config.get("model_name") or "")
-    status, action = "rule", "INTERRUPT"
-    if policy != "always_interrupt":
-        try:
-            timeout = float(config.get("timeout_seconds", 2.0))
-        except (ValueError, TypeError):
-            return await original(host, str(content), use_steer=use_steer)
-        if not model or not math.isfinite(timeout) or not 0 < timeout <= 30:
-            return await original(host, str(content), use_steer=use_steer)
-        router = ShadowObserver(host, model, timeout)
-        result = await observe(snapshot, (message,), classify=router._classify,
-                               current_snapshot=router._snapshot, timeout_seconds=timeout)
+    timeout = float(config.get("timeout_seconds", 2.0))
+    if not math.isfinite(timeout) or not 0 < timeout <= 30:
+        raise ValueError("invalid input controller timeout")
+    observer = ShadowObserver(host, model, timeout)
+
+    async def classify(snapshot, messages):
+        if config.get("policy") == "always_interrupt":
+            return dict(action="INTERRUPT", context_version=snapshot.context_version,
+                        round_id=snapshot.round_id, checkpoint_id=snapshot.checkpoint_id)
+        return await observer._classify(snapshot, messages)
+
+    async def apply(batch, decision):
+        batch = tuple(item for item in batch if item.message.message_id not in native._duplex_received)
+        if not batch:
+            return
+        if decision is None:
+            for item in batch:
+                await original(host, str(item), use_steer=True)
+                native._duplex_received.add(item.message.message_id)
+            return
         recorder = getattr(host, "record_duplex_observation", None)
         if recorder is not None:
-            recorder(result)
-        action, status = result.proposed_action, result.status
-        # observe may have recomputed against a newer snapshot.
-        version = result.context_version
-    else:
-        version = snapshot.context_version
-    effective = await native.route_input(content, version=version, action=action,
-                                         message_id=message.message_id)
-    if effective == "STALE":
-        # A decision racing a lifecycle command cannot interrupt the new round.
-        await original(host, str(content), use_steer=use_steer)
-        effective = "APPEND"
-    logger.info("duplex.route %s", json.dumps({"message_id": message.message_id,
-                "proposed_action": action, "effective_action": effective,
-                "status": status, "context_version": version,
-                "session_id": native.session_id, "member_name": host.blueprint.member_name}))
+            recorder(decision)
+        effective = await native.route_input("\n\n".join(str(item) for item in batch),
+            version=decision.context_version, action=decision.proposed_action,
+            message_id=batch[0].message.message_id,
+            message_ids=tuple(item.message.message_id for item in batch))
+        if effective == "STALE":
+            for item in batch:
+                if item.message.message_id not in native._duplex_received:
+                    await original(host, str(item), use_steer=True)
+                    native._duplex_received.add(item.message.message_id)
+            effective = "APPEND"
+        logger.info("duplex.route %s", json.dumps({
+            "message_ids": [item.message.message_id for item in batch],
+            "proposed_action": decision.proposed_action, "effective_action": effective,
+            "status": decision.status, "context_version": decision.context_version,
+            "session_id": native.session_id, "member_name": host.blueprint.member_name}))
+
+    controller = InputController(snapshot=observer._snapshot, classify=classify, apply=apply,
+                                 timeout=timeout)
+    native._duplex_controller = controller
+    return controller
 
 
 def install_shadow_observer() -> bool:
@@ -313,6 +351,8 @@ def install_shadow_observer() -> bool:
         return await deliver(self, content, use_steer=use_steer)
 
     TeamAgent.deliver_input = deliver_with_route
+    from jiuwenswarm.agents.harness.team.duplex_ingress import install_ingress
+    install_ingress(MessageHandler, deliver)
     from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
     user_input = AgentLifecycleHandler.on_user_input
 

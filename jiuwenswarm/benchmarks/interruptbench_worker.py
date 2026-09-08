@@ -20,9 +20,13 @@ async def serve(args, output):
         while line := await asyncio.to_thread(sys.stdin.readline):
             try:
                 request = json.loads(line)
-                config = SimpleNamespace(model=request["model"], gen_config=request["gen_config"])
-                answer = await bridge._predict(config, request["prompt"], request["current"])
-                response = {"output": answer}
+                if request.get("operation") == "reset":
+                    await bridge.close_native()
+                    response = {"reset": True}
+                else:
+                    config = SimpleNamespace(model=request["model"], gen_config=request["gen_config"])
+                    answer = await bridge._predict(config, request["prompt"], request["current"])
+                    response = {"output": answer}
             except Exception as error:
                 # Detailed SDK diagnostics go to stderr; stdout is protocol only.
                 response = {"error": f"Native worker failed: {type(error).__name__}; inspect native log"}
@@ -31,6 +35,7 @@ async def serve(args, output):
             output.write(json.dumps(response) + "\n")
             output.flush()
     finally:
+        await bridge.close_native()
         await Runner.stop()
 
 

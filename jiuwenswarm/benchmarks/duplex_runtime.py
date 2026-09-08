@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -102,7 +103,10 @@ class NativePeer:
                     tool_cards=[tool.card for tool in peer._tools], tool_instances=peer._tools)
 
         cls = DuplexNativeHarness if self.policy in ("model", "always_interrupt") else NativeHarness
-        return cls(Spec())
+        harness = cls(Spec())
+        if self.model.prompt is not None:
+            harness._duplex_context_provider = self.model.prompt
+        return harness
 
     async def start(self):
         await self.harness.start()
@@ -135,7 +139,7 @@ class NativePeer:
                         action=observation.proposed_action, usage=None)
 
     async def receive(self, content, *, message_id, sender="peer"):
-        async with self._lock:
+        async with self._lock if self.policy == "abort_restart" else nullcontext():
             if message_id in self._received:
                 return
             self.events.add("message_arrived", member=self.name, message_id=message_id)

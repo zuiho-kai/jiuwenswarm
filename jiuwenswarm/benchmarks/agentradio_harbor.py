@@ -72,7 +72,7 @@ class JiuwenAgentRadio(CoralMultiAgentPassive):
             "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
             '"$HOME/.local/bin/uv" venv --python 3.12 /tmp/jiuwen-bench-venv\n'
             '"$HOME/.local/bin/uv" pip install --python /tmp/jiuwen-bench-venv/bin/python '
-            "'openjiuwen @ git+https://gitcode.com/openJiuwen/agent-core.git@94e10cb6102c36fe78a64547957c0def97299273' ruamel.yaml\n"
+            "'openjiuwen[sqlite] @ git+https://gitcode.com/openJiuwen/agent-core.git@94e10cb6102c36fe78a64547957c0def97299273' ruamel.yaml\n"
             "tar -xzf /tmp/jiuwenswarm-bench.tar.gz -C /tmp/jiuwen-bench-venv/lib/python3.12/site-packages\n"
             "chmod 600 /tmp/jiuwen-bench-models.json\n"
             "chmod +x /tmp/coral-workspace/swe-atlas-agent/startup_passive.sh\n"
