@@ -576,6 +576,20 @@ debug_trace:
     redact_prompts: false           # 脱敏 prompt/completion（密钥字段始终打码）
     redact_completions: false
 
+# Optional desktop specialist, available to Core Agent and full-duplex delegation.
+# Restart AgentServer after changing this section. See docs/zh/cua-integration.md.
+cua:
+  enabled: false
+  command: cua-driver
+  capabilities: []                 # Read-only; add input / app_lifecycle explicitly.
+  delivery_mode: background        # foreground permits focus/cursor changes.
+  screenshot_multimodal: false     # true requires a vision + tool capable Core model.
+  snapshot_keep_last_k: 3
+  max_iterations: 25
+  timeout_s: 300
+  tool_timeout_s: 60
+  lock_wait_s: 30
+
 react:
   agent_name: main_agent
   enable_task_loop: true
@@ -1334,6 +1348,7 @@ modes:
     # coding_memory_read/write/edit 由 CodingMemoryRail 在 subagent 内部注册，不在此配置
     tools:
       - web_free_search
+      - cua_task                       # Only registered when cua.enabled is true.
       - web_fetch_webpage
       - web_paid_search
       - user_todos

@@ -7605,6 +7605,11 @@ class JiuWenSwarmDeepAdapter:
         """Get tool cards."""
         tool_cards = []
 
+        cua_tool = self._build_cua_task_tool(agent_id)
+        if cua_tool is not None:
+            self._register_agent_owned_tool(cua_tool, agent_id)
+            tool_cards.append(cua_tool.card)
+
         for wtool in [read_pdf]:
             self._register_shared_tool(wtool)
             tool_cards.append(wtool.card)
@@ -7805,6 +7810,26 @@ class JiuWenSwarmDeepAdapter:
             logger.warning("[JiuWenSwarmDeepAdapter] acp_chat registration failed: %s", exc)
 
         return tool_cards
+
+    def _build_cua_task_tool(self, agent_id: str) -> Any | None:
+        """Optional CUA specialist; shared by agent and code-mode builders."""
+        active_config = getattr(self, "_active_code_config", None)
+        config_base = active_config() if callable(active_config) else get_config()
+        # Keep disabled installations free from CUA imports/driver requirements.
+        raw = config_base.get("cua") or {}
+        if not isinstance(raw, dict):
+            raise ValueError("cua configuration must be a mapping")
+        if raw.get("enabled", False) is False:
+            return None
+        from jiuwenswarm.agents.harness.cua.worker import build_cua_task_tool
+
+        return build_cua_task_tool(
+            config_base,
+            lambda: getattr(self, "_active_request_model", None) or self._model,
+            workspace=self._workspace_dir or "./",
+            agent_id=agent_id,
+            language=self._resolve_runtime_language(),
+        )
 
     def _build_cron_tools(self) -> list[Any]:
         """Build cron tools from the shared runtime bridge."""

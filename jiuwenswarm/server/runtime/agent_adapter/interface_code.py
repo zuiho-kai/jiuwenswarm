@@ -395,6 +395,7 @@ _RAIL_BUILD_NAMES: dict[str, str] = {
 }
 
 _TOOL_BUILD_NAMES: dict[str, str] = {
+    "cua_task": "_build_cua_task_tool",
     "web_free_search": "_build_web_free_search_tool",
     "web_fetch_webpage": "_build_web_fetch_webpage_tool",
     "web_paid_search": "_build_paid_search_tool",

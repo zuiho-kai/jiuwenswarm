@@ -153,6 +153,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "*" = ["LICENSE"]
+"jiuwenswarm.agents.harness.cua" = ["NOTICE.md"]
 jiuwenswarm = [
     "channels/web/frontend/dist/**/*",
     "channels/web/frontend/dist/*",
