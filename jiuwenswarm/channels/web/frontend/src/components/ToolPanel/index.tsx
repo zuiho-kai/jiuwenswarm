@@ -280,17 +280,22 @@ export function ToolPanel({
       running: t('chat.applicationTasks.running'),
       completed: t('chat.applicationTasks.completed'),
       failed: t('chat.applicationTasks.failed'),
+      cancelling: t('chat.applicationTasks.cancelling'),
+      cancelled: t('chat.applicationTasks.cancelled'),
     }),
     [applicationTasks, t],
   );
   const planningTasks = useMemo(
-    () => [...applicationPlanningTasks, ...todoTeamTasks], [applicationPlanningTasks, todoTeamTasks],
+    () => [...applicationPlanningTasks, ...todoTeamTasks],
+    [applicationPlanningTasks, todoTeamTasks],
   );
   const teamPlanningTasks = useMemo(
-    () => [...applicationPlanningTasks, ...teamTasks], [applicationPlanningTasks, teamTasks],
+    () => [...applicationPlanningTasks, ...teamTasks],
+    [applicationPlanningTasks, teamTasks],
   );
   const teamPlanningProgress = useMemo(
-    () => [...applicationPlanningTasks, ...progressTasks], [applicationPlanningTasks, progressTasks],
+    () => [...applicationPlanningTasks, ...progressTasks],
+    [applicationPlanningTasks, progressTasks],
   );
   const applicationCompleted = applicationPlanningTasks.filter((task) => task.status === 'completed').length;
   const todoCompletedTasks = planningTasks.filter((task) => task.status === 'completed').length;
@@ -486,6 +491,7 @@ export function ToolPanel({
                   members={teamMembers}
                   totalTasks={teamTotalTasks + applicationPlanningTasks.length}
                   completedTasks={teamCompletedTasks + applicationCompleted}
+                  statusIconAtEnd={isTeam}
                 />
               ) : (
                 <TaskPlanningPanel
@@ -545,6 +551,8 @@ export function ToolPanel({
           maxCollapsedCount={4}
           onExpand={() => expandTo('planning')}
           onExpandAll={() => (isTeam ? setTeamPlanningExpanded(true) : setPlanningExpanded(true))}
+          onCollapseAll={() => (isTeam ? setTeamPlanningExpanded(false) : setPlanningExpanded(false))}
+          expanded={isTeam ? teamPlanningExpanded : planningExpanded}
           dataTestId={isTeam ? 'tool-panel-team-planning' : 'tool-panel-planning'}
         >
           <TaskPlanningPanel
@@ -554,6 +562,7 @@ export function ToolPanel({
             hideHeader
             hideExpandButton
             hideAssignee={!isTeam}
+            statusIconAtEnd={isTeam}
             title={t('chat.recentTasks')}
             maxCollapsedCount={4}
             {...planningProps}
@@ -573,6 +582,8 @@ export function ToolPanel({
           maxCollapsedCount={4}
           onExpand={() => expandTo('team')}
           onExpandAll={() => setTeamMembersExpanded(true)}
+          onCollapseAll={() => setTeamMembersExpanded(false)}
+          expanded={teamMembersExpanded}
           dataTestId="tool-panel-team-members"
           defaultCollapsed
           autoExpandOnContent
@@ -607,6 +618,8 @@ export function ToolPanel({
             expandTo('subagents');
           }}
           onExpandAll={() => setSubagentsExpanded(true)}
+          onCollapseAll={() => setSubagentsExpanded(false)}
+          expanded={subagentsExpanded}
           dataTestId="tool-panel-subagents"
           defaultCollapsed
           autoExpandOnContent
@@ -615,6 +628,7 @@ export function ToolPanel({
             tasks={subagentTasks}
             members={[]}
             hideAssignee
+            statusIconAtEnd
             maxCollapsedCount={4}
             expanded={subagentsExpanded}
             emptyText={t('subagent.empty')}
@@ -680,6 +694,8 @@ export function ToolPanel({
           maxCollapsedCount={4}
           onExpand={() => expandTo('artifacts')}
           onExpandAll={() => setArtifactsExpanded(true)}
+          onCollapseAll={() => setArtifactsExpanded(false)}
+          expanded={artifactsExpanded}
           dataTestId="tool-panel-artifacts"
           defaultCollapsed
           autoExpandOnContent

@@ -8,6 +8,8 @@ import FolderAssetIcon from '../../assets/work-mode/folder.svg?react';
 import FolderFoldAssetIcon from '../../assets/work-mode/folder-fold.svg?react';
 import { CodePreview } from '../ArtifactsPanel/CodePreview';
 import { MarkdownRenderer } from '../MarkdownRenderer';
+import { executeDesktopSave, type DesktopSaveApiResult } from '../../utils/desktopSave';
+import { FilePreviewPanel } from '../ui';
 
 type DefinitionFilePreviewProps = {
   files: DefinitionFileEntry[];
@@ -75,7 +77,7 @@ function TreeEntry({
       <button
         type="button"
         className={`agent-management-file-entry${selectedFilePath === entry.relativePath ? ' is-selected' : ''}${!isDirectory && !entry.previewable ? ' is-unsupported' : ''}${isSkillDefinition ? ' is-skill-definition' : ''}`}
-        style={{ paddingLeft: `calc(${depth} * var(--agent-management-file-indent) + var(--agent-management-file-pad))` }}
+        style={{ paddingLeft: `${depth * 24 + 2}px` }}
         onClick={() => (isDirectory ? onToggle(entry.relativePath) : onSelectFile(entry.relativePath))}
         aria-label={label}
         title={entry.relativePath}
@@ -137,10 +139,8 @@ export function DefinitionFilePreview({
   }, [fileContent]);
 
   useEffect(() => {
-    if (filesStatus === 'success' && selectedFilePath) {
-      setExpanded(findExpandedDirectories(files));
-    }
-  }, [files, filesStatus, selectedFilePath]);
+    if (filesStatus === 'success') setExpanded(findExpandedDirectories(files));
+  }, [files, filesStatus]);
 
   const toggleFolder = (path: string) => {
     setExpanded(current => {
@@ -162,13 +162,32 @@ export function DefinitionFilePreview({
     window.setTimeout(() => setCopyState('idle'), 1600);
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!fileContent) return;
+    const filename = getLabel(fileContent.relativePath);
     const blob = new Blob([fileContent.content], { type: 'text/plain;charset=utf-8' });
+    const pywebviewApi = (window as Window & { pywebview?: { api?: { download_file?: (url: string, filename: string) => DesktopSaveApiResult } } }).pywebview?.api;
+    if (pywebviewApi?.download_file) {
+      try{
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+        const outcome = await executeDesktopSave(() => pywebviewApi.download_file!(dataUrl, filename));
+        if (outcome === 'failed') {
+          window.alert(t('artifacts.downloadFailed', { name: filename }));
+        }
+      }catch {
+        window.alert(t('artifacts.downloadFailed', { name: filename }));
+      }
+      return;
+    }
     const url = window.URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = getLabel(fileContent.relativePath);
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -176,89 +195,95 @@ export function DefinitionFilePreview({
   };
 
   return (
-    <div className="agent-management-file-preview" data-testid="agent-file-preview">
-      <aside className="agent-management-file-tree" aria-label={t('agentManagement.files.treeLabel')}>
-        {filesStatus === 'loading' ? <div className="agent-management-file-state">{t('common.loading')}</div> : null}
-        {filesStatus === 'error' ? (
-          <div className="agent-management-file-state agent-management-file-state--error">
-            <p>{filesError || t('agentManagement.files.loadError')}</p>
-            <button type="button" className="agent-management-button agent-management-button--secondary" onClick={onRetryFiles}>
-              {t('common.retry')}
-            </button>
-          </div>
-        ) : null}
-        {filesStatus === 'success' && files.length === 0 ? <div className="agent-management-file-state">{t('agentManagement.files.empty')}</div> : null}
-        {filesStatus === 'success'
-          ? files.map(entry => (
-              <TreeEntry
-                key={entry.relativePath}
-                entry={entry}
-                depth={0}
-                expanded={expanded}
-                onToggle={toggleFolder}
-                selectedFilePath={selectedFilePath}
-                onSelectFile={onSelectFile}
-              />
-            ))
-          : null}
-      </aside>
-      <section className="agent-management-file-content" aria-live="polite">
-        {!selectedFilePath ? <div className="agent-management-file-state">{t('agentManagement.files.select')}</div> : null}
-        {selectedFilePath && !selectedIsPreviewable ? <div className="agent-management-file-state">{t('agentManagement.files.notPreviewable')}</div> : null}
-        {selectedFilePath && selectedIsPreviewable ? (
-          <>
-            <header className="agent-management-file-content__header">
-              <span title={selectedFilePath}>{getLabel(selectedFilePath)}</span>
-              <div className="agent-management-file-content__actions">
-                <button
-                  type="button"
-                  onClick={handleCopy}
-                  disabled={!fileContent || fileStatus !== 'success'}
-                  aria-label={t('agentManagement.files.copy')}
-                  title={t('agentManagement.files.copy')}
-                >
-                  <FileCopyIcon width={16} height={16} aria-hidden="true" />
-                  {copyState === 'copied' ? t('agentManagement.files.copied') : copyState === 'failed' ? t('agentManagement.files.copyFailed') : null}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDownload}
-                  disabled={!fileContent || fileStatus !== 'success'}
-                  aria-label={t('agentManagement.files.download')}
-                  title={t('agentManagement.files.download')}
-                >
-                  <ArrowDownToLine size={16} strokeWidth={1.5} aria-hidden="true" />
-                </button>
-              </div>
-            </header>
-            <div className="agent-management-file-content__body">
-              {fileStatus === 'loading' ? <div className="agent-management-file-state">{t('common.loading')}</div> : null}
-              {fileStatus === 'error' ? (
-                <div className="agent-management-file-state agent-management-file-state--error">{fileError || t('agentManagement.files.readError')}</div>
-              ) : null}
-              {fileStatus === 'success' &&
-              fileContent &&
-              selectedIsMarkdown ? (
-                <article className="agent-management-markdown">
-                  {markdownParts.frontMatter ? <pre className="agent-management-markdown__frontmatter">{markdownParts.frontMatter}</pre> : null}
-                  <MarkdownRenderer
-                    content={markdownParts.body || ' '}
-                    className="prose prose-sm max-w-none agent-management-markdown__body"
-                  />
-                </article>
-              ) : null}
-              {fileStatus === 'success' && fileContent && selectedIsPython ? (
-                <div className="agent-management-code-preview">
-                  <CodePreview content={fileContent.content} name={getLabel(fileContent.relativePath)} />
-                </div>
-              ) : null}
-              {fileStatus === 'success' && fileContent && selectedFilePath.toLowerCase().endsWith('.json') ? (
-                <pre className="agent-management-code">{formattedContent || ' '}</pre>
-              ) : null}
+    <FilePreviewPanel
+      className="agent-management-file-preview"
+      testId="agent-file-preview"
+      left={
+        <div className="agent-management-file-tree" aria-label={t('agentManagement.files.treeLabel')}>
+          {filesStatus === 'loading' ? <div className="file-preview-state">{t('common.loading')}</div> : null}
+          {filesStatus === 'error' ? (
+            <div className="file-preview-state file-preview-state--error">
+              <p>{filesError || t('agentManagement.files.loadError')}</p>
+              <button type="button" className="agent-management-button agent-management-button--secondary" onClick={onRetryFiles}>
+                {t('common.retry')}
+              </button>
             </div>
-          </>
-        ) : null}
-      </section>
-    </div>
+          ) : null}
+          {filesStatus === 'success' && files.length === 0 ? <div className="file-preview-state">{t('agentManagement.files.empty')}</div> : null}
+          {filesStatus === 'success'
+            ? files.map(entry => (
+                <TreeEntry
+                  key={entry.relativePath}
+                  entry={entry}
+                  depth={0}
+                  expanded={expanded}
+                  onToggle={toggleFolder}
+                  selectedFilePath={selectedFilePath}
+                  onSelectFile={onSelectFile}
+                />
+              ))
+            : null}
+        </div>
+      }
+      right={
+        <div className="agent-management-file-content">
+          {!selectedFilePath ? <div className="file-preview-state">{t('agentManagement.files.select')}</div> : null}
+          {selectedFilePath && !selectedIsPreviewable ? <div className="file-preview-state">{t('agentManagement.files.notPreviewable')}</div> : null}
+          {selectedFilePath && selectedIsPreviewable ? (
+            <>
+              <header className="file-preview-content__header">
+                <span className="file-preview-content__header-title" title={selectedFilePath}>{getLabel(selectedFilePath)}</span>
+                <div className="file-preview-content__header-actions">
+                  <button
+                    type="button"
+                    onClick={handleCopy}
+                    disabled={!fileContent || fileStatus !== 'success'}
+                    aria-label={t('agentManagement.files.copy')}
+                    title={t('agentManagement.files.copy')}
+                  >
+                    <FileCopyIcon width={16} height={16} aria-hidden="true" />
+                    {copyState === 'copied' ? t('agentManagement.files.copied') : copyState === 'failed' ? t('agentManagement.files.copyFailed') : null}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={!fileContent || fileStatus !== 'success'}
+                    aria-label={t('agentManagement.files.download')}
+                    title={t('agentManagement.files.download')}
+                  >
+                    <ArrowDownToLine size={16} strokeWidth={1.5} aria-hidden="true" />
+                  </button>
+                </div>
+              </header>
+              <div className="file-preview-content__body">
+                {fileStatus === 'loading' ? <div className="file-preview-state">{t('common.loading')}</div> : null}
+                {fileStatus === 'error' ? (
+                  <div className="file-preview-state file-preview-state--error">{fileError || t('agentManagement.files.readError')}</div>
+                ) : null}
+                {fileStatus === 'success' &&
+                fileContent &&
+                selectedIsMarkdown ? (
+                  <article className="agent-management-markdown">
+                    {markdownParts.frontMatter ? <pre className="agent-management-markdown__frontmatter">{markdownParts.frontMatter}</pre> : null}
+                    <MarkdownRenderer
+                      content={markdownParts.body || ' '}
+                      className="prose prose-sm max-w-none agent-management-markdown__body"
+                    />
+                  </article>
+                ) : null}
+                {fileStatus === 'success' && fileContent && selectedIsPython ? (
+                  <div className="agent-management-code-preview">
+                    <CodePreview content={fileContent.content} name={getLabel(fileContent.relativePath)} />
+                  </div>
+                ) : null}
+                {fileStatus === 'success' && fileContent && selectedFilePath.toLowerCase().endsWith('.json') ? (
+                  <pre className="agent-management-code">{formattedContent || ' '}</pre>
+                ) : null}
+              </div>
+            </>
+          ) : null}
+        </div>
+      }
+    />
   );
 }

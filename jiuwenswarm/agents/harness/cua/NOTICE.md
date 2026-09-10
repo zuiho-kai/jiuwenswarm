@@ -26,6 +26,9 @@ Jiuwen-specific changes:
   labelled `unverified`, never an authoritative completion claim.
 - Preserve host tool policies, deny unresolved nested approval requests, and
   expose only the operator-selected capability catalog.
+- After merging Xiangyu at dac9611ba, resolve effective Global / User / Session
+  permissions before each invocation using the host composition function. The
+  SDK pin follows Xiangyu (14a7fe2d0a2bf0cf2a25abd90f05f5ae6a9bf2d5).
 
 Upstream's persistent CUA resume protocol and desktop demo suite are not included.
 This implementation's lifecycle, configuration and MCP bridge are maintained in

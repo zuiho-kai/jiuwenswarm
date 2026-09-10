@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# pylint: disable=protected-access
+
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -1148,6 +1150,7 @@ def test_registers_only_realtime_support_methods() -> None:
         "video.transcribe",
         "video.qwen.tool",
         "video.search.status",
+        "video.search.control",
         "tts.synthesize",
         "tts.stream.start",
         "tts.stream.cancel",

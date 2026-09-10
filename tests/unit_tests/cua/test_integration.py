@@ -97,6 +97,31 @@ async def test_no_nested_approval_is_never_auto_approved():
     assert not (await worker._reject_unhosted_confirmation(None)).approved
 
 
+@pytest.mark.asyncio
+async def test_execution_uses_latest_permission_snapshot(monkeypatch, tmp_path):
+    session = fake_session(monkeypatch)
+    model, _client = scripted_model(
+        [
+            create_tool_call_response("mcp_cua-driver_list_windows", "{}"),
+            create_text_response("Desktop inspection was denied."),
+        ]
+    )
+    permissions = {"tools": {"mcp_cua-driver_list_windows": "allow"}}
+    tool = worker.CuaTaskTool(
+        CuaConfig(enabled=True),
+        lambda: model,
+        workspace=str(tmp_path),
+        agent_id="permission-reload",
+        permissions_getter=lambda: permissions,
+    )
+    # A queued task must see a denial introduced after its tool was created.
+    permissions["tools"]["mcp_cua-driver_list_windows"] = "deny"
+    result = await tool.run("Read the desktop window titles")
+    assert result["status"] == "finished", result
+    calls = [call.args[0] for call in session.call_tool.await_args_list]
+    assert calls == ["start_session", "end_session"]
+
+
 def fake_session(monkeypatch, *, fail_start=False):
     names = [
         "list_windows",
@@ -317,6 +342,37 @@ def test_code_and_agent_builders_expose_cua_only_when_enabled(monkeypatch, tmp_p
     assert direct.card.parallel_safe is False
     configuration["cua"]["enabled"] = False
     assert adapter._build_cua_task_tool("agent-a") is None
+
+
+def test_adapter_reads_user_and_session_permissions_at_execution(monkeypatch, tmp_path):
+    from jiuwenswarm.server.runtime.agent_adapter import interface_deep
+    from jiuwenswarm.agents.harness.common.rails.permissions import permissions_layers
+
+    config = {"cua": {"enabled": True}, "permissions": {"enabled": True}}
+    user = {"tools": {"mcp_cua-driver_click": "deny"}}
+    session = {"tools": {"mcp_cua-driver_get_window_state": "allow"}}
+    monkeypatch.setattr(interface_deep, "get_config", lambda: config)
+    monkeypatch.setattr(permissions_layers, "load_user_permissions", lambda: user)
+
+    def load_session(session_id):
+        assert session_id == "cua-parent-session"
+        return session
+
+    monkeypatch.setattr(permissions_layers, "load_session_permissions", load_session)
+    adapter = SimpleNamespace(
+        _model=object(),
+        _workspace_dir=str(tmp_path),
+        _parent_session_id="cua-parent-session",
+        _resolve_runtime_language=lambda: "cn",
+    )
+    tool = interface_deep.JiuWenSwarmDeepAdapter._build_cua_task_tool(adapter, "parent")
+    first = tool._permissions_getter()
+    assert first["tools"]["mcp_cua-driver_click"] == "deny"
+    assert first["tools"]["mcp_cua-driver_get_window_state"] == "allow"
+    user["tools"]["mcp_cua-driver_type_text"] = "deny"
+    second = tool._permissions_getter()
+    assert second["tools"]["mcp_cua-driver_type_text"] == "deny"
+    assert "mcp_cua-driver_type_text" not in first["tools"]
 
 
 @pytest.mark.asyncio

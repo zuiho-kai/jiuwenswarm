@@ -165,12 +165,14 @@ class CuaTaskTool(LocalFunction):
         agent_id: str,
         language: str = "cn",
         permissions: dict[str, Any] | None = None,
+        permissions_getter: Callable[[], dict[str, Any]] | None = None,
     ):
         self._cua_config = config
         self._model_getter = model_getter
         self._workspace = workspace
         self._language = "en" if language == "en" else "cn"
         self._permissions = deepcopy(permissions or {})
+        self._permissions_getter = permissions_getter
         super().__init__(
             card=ToolCard(
                 id=f"{agent_id}.cua_task",
@@ -224,6 +226,13 @@ class CuaTaskTool(LocalFunction):
                 )
             async with desktop_lease(self._cua_config.lock_wait_s):
                 async with asyncio.timeout(self._cua_config.timeout_s):
+                    permissions = (
+                        self._permissions_getter()
+                        if self._permissions_getter is not None
+                        else self._permissions
+                    )
+                    if not isinstance(permissions, dict):
+                        raise ValueError("CUA permission snapshot must be a mapping")
                     async with connect_desktop(self._cua_config, run_id) as tools:
                         worker = create_worker(
                             model,
@@ -232,7 +241,7 @@ class CuaTaskTool(LocalFunction):
                             run_id,
                             self._workspace,
                             self._language,
-                            self._permissions,
+                            permissions,
                         )
                         try:
                             # A child task inherits but cannot overwrite the parent's

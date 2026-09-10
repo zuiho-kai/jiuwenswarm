@@ -324,7 +324,7 @@ class TestSessionAdapter:
             lambda sid, cache_bust=False: {"mode": "team"},
         )
         monkeypatch.setattr(
-            "jiuwenswarm.server.runtime.session.kv_cache.kv_cache_lifecycle.evict_session_kv_cache",
+            "openjiuwen.core.session.agent.create_agent_session",
             lambda **kwargs: evict_calls.append(kwargs),
         )
         resp = await SessionAdapter().handle(
@@ -349,7 +349,7 @@ class TestSessionAdapter:
             lambda sid, sessions_root=None: (missing_dir, None),
         )
         monkeypatch.setattr(
-            "jiuwenswarm.server.runtime.session.kv_cache.kv_cache_lifecycle.evict_session_kv_cache",
+            "openjiuwen.core.session.agent.create_agent_session",
             lambda **kwargs: evict_calls.append(kwargs),
         )
         resp = await SessionAdapter().handle(
@@ -375,12 +375,19 @@ class TestSessionAdapter:
             lambda sid, sessions_root=None: (session_root, None),
         )
 
-        async def fake_evict(**kwargs):
-            evict_calls.append(kwargs)
+        class _Session:
+            async def release_kvc(self):
+                evict_calls.append(
+                    {
+                        "session_id": "sess-del",
+                        "parent_session_id": "sess-del",
+                    }
+                )
+                return True
 
         monkeypatch.setattr(
-            "jiuwenswarm.server.runtime.session.kv_cache.kv_cache_lifecycle.evict_session_kv_cache",
-            fake_evict,
+            "openjiuwen.core.session.agent.create_agent_session",
+            lambda **_kwargs: _Session(),
         )
         resp = await SessionAdapter().handle(
             _request(ReqMethod.SESSION_DELETE, {"session_id": "sess-del"})
@@ -949,7 +956,7 @@ async def test_config_adapter_keeps_browser_config_in_agentserver_directory(monk
     """path.* must use the current AgentServer config, never Gateway config."""
     from jiuwenswarm.common import config as config_module
 
-    current = {"browser": {"chrome_path": "/agent/chrome", "browser_type": "msedge", "headless": False}}
+    current = {"browser": {"chrome_path": "/agent/chrome", "headless": False}}
     updates: list[dict] = []
     monkeypatch.setattr(config_module, "get_config", lambda: current)
     monkeypatch.setattr(config_module, "update_browser_in_config", lambda payload: updates.append(payload))
@@ -957,11 +964,11 @@ async def test_config_adapter_keeps_browser_config_in_agentserver_directory(monk
 
     got = await adapter.handle(_request(ReqMethod.PATH_GET))
     changed = await adapter.handle(
-        _request(ReqMethod.PATH_SET, {"chrome_path": "/agent/new-chrome", "browser_type": "chrome", "headless": True})
+        _request(ReqMethod.PATH_SET, {"chrome_path": "/agent/new-chrome", "headless": True})
     )
 
-    assert got.payload == {"chrome_path": "/agent/chrome", "browser_type": "msedge", "headless": False}
-    assert updates == [{"chrome_path": "/agent/new-chrome", "browser_type": "chrome", "headless": True}]
+    assert got.payload == {"chrome_path": "/agent/chrome", "headless": False}
+    assert updates == [{"chrome_path": "/agent/new-chrome", "headless": True}]
     assert changed.metadata["config_changed"] is True
     assert changed.metadata["browser_runtime_restart"] is True
 
@@ -974,7 +981,6 @@ async def test_config_adapter_resolves_platform_browser_path_for_runtime_restart
     current = {
         "browser": {
             "chrome_path": {"default": "  /agent/chrome  "},
-            "browser_type": "chrome",
             "headless": True,
         }
     }
@@ -984,7 +990,6 @@ async def test_config_adapter_resolves_platform_browser_path_for_runtime_restart
 
     assert response.payload == {
         "chrome_path": "/agent/chrome",
-        "browser_type": "chrome",
         "headless": True,
     }
 
