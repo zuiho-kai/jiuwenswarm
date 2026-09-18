@@ -47,13 +47,15 @@ class Endpoint:
         self.fast_gate.set()
         self.model_gate = asyncio.Event()
         self.model_entered = asyncio.Event()
+        self.block_stream_call = None
         self.fast_entered = asyncio.Event()
         self.block_model = True
         self.block_prompt = None
         self.tool_first = True
-        self.intent_first = False
         self.repeat_tool_without_result = False
         self.final_content = "Finished using PostgreSQL."
+        self.on_slow_request = None
+        self.slow_responder = None
 
     async def handle(self, request):
         body = await request.json()
@@ -65,8 +67,10 @@ class Endpoint:
                              "finish_reason": "stop"}], "usage": {"total_tokens": 1}})
         self.calls.append(body)
         model = body["model"]
+        if model == "slow" and self.on_slow_request is not None:
+            self.on_slow_request()
         call = sum(c["model"] == model for c in self.calls)
-        slow_call = call - int(self.intent_first)
+        slow_call = call
         message = {"role": "assistant", "content": self.final_content}
         if model == "fast":
             self.fast_entered.set()
@@ -75,15 +79,11 @@ class Endpoint:
                 return web.json_response({"error": {"message": "scripted failure"}}, status=500)
             function = next(t["function"] for t in body["tools"]
                             if t["function"]["name"] == "structured_output")
-            props = function["parameters"]["properties"]
-            result = {key: props[key]["enum"][0]
-                      for key in ("context_version", "round_id", "checkpoint_id")}
-            result["action"] = self.fast_action
+            assert set(function["parameters"]["properties"]) == {"action"}
+            result = {"action": self.fast_action}
             message = self.tool_message("structured_output", result)
-        elif self.intent_first and call == 1:
-            message = self.tool_message("update_working_intent", {
-                "goal": "Order event system", "current_hypothesis": "Use Kafka",
-                "next_action": "Implement producer", "constraints": ["Existing infrastructure only"]})
+        elif self.slow_responder is not None:
+            message = self.slow_responder(body)
         elif self.tool_first and (slow_call == 1 or (self.repeat_tool_without_result and not any(
                 m.get("role") == "tool" and "committed exactly once" in str(m.get("content"))
                 for m in body["messages"]))):
@@ -107,6 +107,8 @@ class Endpoint:
         chunk = {"id": "test", "object": "chat.completion.chunk", "model": model,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
         await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+        if model == "slow" and call == self.block_stream_call:
+            await self.model_gate.wait()
         chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason":
                              "tool_calls" if "tool_calls" in message else "stop"}]
         await response.write(("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
@@ -129,10 +131,13 @@ class WriteOnce(Tool):
         self.gate = asyncio.Event()
         self.gate.set()
         self.cancelled = 0
+        self.on_commit = None
 
     async def invoke(self, inputs, **kwargs):
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write("committed\n")
+        if self.on_commit is not None:
+            self.on_commit()
         self.entered.set()
         try:
             await self.gate.wait()
@@ -168,7 +173,6 @@ async def wait_until(predicate, timeout=6):
 @pytest_asyncio.fixture
 async def world(tmp_path, monkeypatch, request):
     from jiuwenswarm.common import config
-    monkeypatch.setenv("JIUWEN_DUPLEX_LEDGER_PATH", str(tmp_path / "tool-ledger.sqlite3"))
 
     settings = {"duplex_router": {"mode": "active", "model_name": "fast", "timeout_seconds": 2}}
     settings["duplex_router"].update(getattr(request, "param", {}))
@@ -244,15 +248,62 @@ async def send_message(world, text="Customer forbids Kafka. Use PostgreSQL."):
     return await world.manager.send_message(content=text, to_member_name="A2")
 
 
-async def finish_routes(native):
-    controller = getattr(native, "_duplex_controller", None)
-    if controller is not None and controller.task is not None:
-        await asyncio.shield(controller.task)
 
 
 async def poll_and_apply(world):
     await world.handler.on_poll_mailbox(None)
-    await finish_routes(world.native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["model", "tool"])
+async def test_monitor_correction_invalidates_kafka_plan_before_redis_replan(world, phase):
+    """Real pause/continue: a later lifecycle rollback must not revive a wrong plan."""
+    from openjiuwen.harness.schema.task import TaskPlan, TodoItem
+
+    w = world
+    original = "Implement the order queue using Redis; retain idempotency."
+    correction = "Monitor: the user asked for Redis. Your Kafka plan is wrong."
+    resumed = []
+
+    def install_wrong_plan():
+        state = w.native.load_state(w.native._session)
+        state.task_plan = TaskPlan(goal="Build the queue with Kafka", tasks=[
+            TodoItem(id="kafka", content="Install Kafka and write a Kafka producer")])
+        w.native.save_state(w.native._session, state)
+
+    def inspect_request():
+        active = w.native.active_round
+        if active.round_id > 1:
+            resumed.append((w.native.load_state(w.native._session).task_plan,
+                            active.original_query,
+                            active.pre_round_snapshot.deep_agent_state["task_plan"]))
+
+    w.tool.on_commit = install_wrong_plan
+    w.endpoint.on_slow_request = inspect_request
+    if phase == "tool":
+        w.endpoint.block_model = False
+        w.tool.gate.clear()
+    await w.harness.send(original)
+    await asyncio.wait_for((w.tool.entered if phase == "tool" else w.endpoint.model_entered).wait(), 6)
+    mid = await send_message(w, correction)
+    drain = asyncio.create_task(poll_and_apply(w))
+    if phase == "tool":
+        await wait_until(lambda: w.harness.state is HarnessState.PAUSING)
+        w.tool.gate.set()
+    await asyncio.wait_for(drain, 6)
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+    assert resumed
+    assert all(plan is None and snapshot_plan is None for plan, _, snapshot_plan in resumed)
+    assert all("[Execution plan invalidated]" in query and query != original
+               for _, query, _ in resumed)
+    recovered = json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
+    assert original in recovered and correction in recovered
+    assert "do not resume them" in recovered
+    assert "Irreversible operation committed exactly once" in recovered
+    assert recovered.count(mid) == 1
+    assert w.tool.path.read_text() == "committed\n"
+    assert w.tool.cancelled == 0
+    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
 
 
 @pytest.mark.asyncio
@@ -268,18 +319,13 @@ async def test_model_interrupt_keeps_original_task_tool_result_and_db_ack(world)
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
     assert w.tool.path.read_text() == "committed\n"
     assert w.tool.cancelled == 0
-    import sqlite3
-    from contextlib import closing
-    with closing(sqlite3.connect(w.native._duplex_ledger.path)) as ledger:
-        receipts = ledger.execute("SELECT state,result FROM calls WHERE tool='write_once'").fetchall()
-    assert len(receipts) == 1 and receipts[0][0] == "committed"
-    assert "committed exactly once" in receipts[0][1]
     slow = [c for c in w.endpoint.calls if c["model"] == "slow"]
     recovered = json.dumps(slow[-1]["messages"])
     assert "Implement the order event system" in recovered
     assert "Irreversible operation committed exactly once" in recovered
     assert mid in recovered and "Customer forbids Kafka" in recovered
     assert "Obsolete Kafka answer" not in recovered
+    assert "Request cancelled by user" not in recovered
     assert any(getattr(c, "type", None) == "round_aborted" for c in w.chunks)
     assert any(c["model"] == "fast" for c in w.endpoint.calls)
 
@@ -299,7 +345,39 @@ async def test_interrupt_first_model_call_preserves_original_query(world):
     assert "include migration steps" in recovered
     assert mid in recovered and "Customer forbids Kafka" in recovered
     assert "Obsolete Kafka answer" not in recovered
+    assert "Request cancelled by user" not in recovered
     assert not w.tool.path.exists()
+    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tool_call", [False, True])
+async def test_interrupt_discards_partial_stream_without_executing_its_tool(world, with_tool_call):
+    w = world
+    original = "Plan order events with Kafka; include migration steps."
+    draft = (w.endpoint.tool_message("write_once", {}) if with_tool_call
+             else {"role": "assistant"})
+    draft["content"] = "Obsolete Kafka draft."
+    replies = iter([draft, {"role": "assistant", "content": "Finished using PostgreSQL."}])
+    w.endpoint.slow_responder = lambda body: next(replies)
+    w.endpoint.block_stream_call = 1
+    await w.harness.send(original)
+    await wait_until(lambda: any(
+        getattr(c, "type", None) == "llm_output"
+        and "Obsolete Kafka draft" in str(c.payload) for c in w.chunks))
+    assert not w.tool.path.exists()
+    mid = await send_message(w)
+    await asyncio.wait_for(poll_and_apply(w), 6)
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+    slow = [c for c in w.endpoint.calls if c["model"] == "slow"]
+    assert len(slow) == 2
+    recovered = json.dumps(slow[-1]["messages"])
+    assert recovered.count(original) == 1 and recovered.count(mid) == 1
+    assert "Obsolete Kafka draft" not in recovered
+    assert "Request cancelled by user" not in recovered
+    assert all(m["role"] != "tool" and not m.get("tool_calls") for m in slow[-1]["messages"])
+    assert not w.tool.path.exists()
+    assert any(getattr(c, "type", None) == "round_aborted" for c in w.chunks)
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
 
 
@@ -315,9 +393,7 @@ async def test_interrupt_during_tool_waits_for_commit_and_does_not_repeat(world)
     drain = asyncio.create_task(poll_and_apply(w))
     await wait_until(lambda: w.harness.state is HarnessState.PAUSING)
     assert not drain.done()
-    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
-    _, accepted = w.native._duplex_inbox.load(w.native.durable_scope)
-    assert any(item[0] == mid for item in accepted)
+    assert await w.manager.get_messages(to_member_name="A2", unread_only=True)
     assert w.native.active_round.round_id == before
     w.tool.gate.set()
     await asyncio.wait_for(drain, 6)
@@ -390,22 +466,45 @@ async def test_append_survives_a_later_interrupt_before_it_is_consumed(world):
 
 
 @pytest.mark.asyncio
-async def test_append_arriving_during_final_model_call_gets_a_continuation(world):
+async def test_admitted_append_survives_repeated_interrupts(world):
     w = world
+    original = "Implement the order system; retain idempotency."
+    w.tool.gate.clear()
+    w.endpoint.repeat_tool_without_result = True
+    await w.harness.send(original)
+    await asyncio.wait_for(w.tool.entered.wait(), 6)
     w.endpoint.fast_action = "APPEND"
-    await w.harness.send("Implement the order system.")
-    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
-    first = await send_message(w, "Also include latency figures.")
+    appended = await send_message(w, "Also include latency figures.")
     await asyncio.wait_for(poll_and_apply(w), 6)
-    w.endpoint.model_gate.set()
+    w.tool.gate.set()
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+    admitted = [c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"]
+    assert appended in json.dumps(admitted)
+
+    w.endpoint.fast_action = "INTERRUPT"
+    w.endpoint.block_prompt = "Customer forbids Kafka"
+    w.endpoint.model_entered.clear()
+    first = await send_message(w)
+    await asyncio.wait_for(poll_and_apply(w), 6)
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+    w.endpoint.block_prompt = None
+    second = await send_message(w, "Keep PostgreSQL, but change the delivery plan to an outbox.")
+    await asyncio.wait_for(poll_and_apply(w), 6)
     await wait_until(lambda: w.harness.state is HarnessState.IDLE)
     recovered = json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
-    assert recovered.count(first) == 1
+    for content in (original, appended, first, second, "Irreversible operation committed exactly once"):
+        assert recovered.count(content) == 1
+    assert "Request cancelled by user" not in recovered
+    assert w.native._st.round_id_counter == 3
     assert w.tool.path.read_text() == "committed\n"
+    assert w.tool.cancelled == 0
+    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
+
+
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_pause_supersedes_restart_and_keeps_durable_unapplied_input(world):
+async def test_lifecycle_pause_supersedes_restart_and_leaves_message_unread(world):
     w = world
     w.tool.gate.clear()
     w.endpoint.block_model = False
@@ -420,12 +519,58 @@ async def test_lifecycle_pause_supersedes_restart_and_keeps_durable_unapplied_in
     w.tool.gate.set()
     await wait_until(lambda: w.harness.state is HarnessState.PAUSED)
     assert w.native._st.round_id_counter == 1
-    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
-    checkpoint, accepted = w.native._duplex_inbox.load(w.native.durable_scope)
-    assert checkpoint["suspended"] is True
-    assert accepted and accepted[0][0] not in checkpoint.get("covered", [])
+    assert await w.manager.get_messages(to_member_name="A2", unread_only=True)
     assert w.tool.path.read_text() == "committed\n"
     assert w.tool.cancelled == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_pause_after_internal_interrupt_keeps_admitted_correction(world):
+    w = world
+    original = "Implement the order system; retain idempotency."
+    await w.harness.send(original)
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+    w.endpoint.block_prompt = "Customer forbids Kafka"
+    w.endpoint.model_entered.clear()
+    mid = await send_message(w)
+    await asyncio.wait_for(poll_and_apply(w), 6)
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+    await w.harness.pause()
+    assert w.harness.state is HarnessState.PAUSED
+    w.endpoint.block_prompt = None
+    await w.harness.resume()
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+    recovered = json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
+    assert recovered.count(original) == 1
+    assert recovered.count(mid) == 1 and "Customer forbids Kafka" in recovered
+    assert "Irreversible operation committed exactly once" in recovered
+    assert w.tool.path.read_text() == "committed\n"
+    assert w.tool.cancelled == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["abort", "stop"])
+async def test_explicit_cancel_supersedes_pending_interrupt_without_restart(world, control):
+    w = world
+    w.tool.gate.clear()
+    w.endpoint.block_model = False
+    await w.harness.send("Implement the order system.")
+    await asyncio.wait_for(w.tool.entered.wait(), 6)
+    await send_message(w)
+    drain = asyncio.create_task(poll_and_apply(w))
+    await wait_until(lambda: w.harness.state is HarnessState.PAUSING)
+    if control == "abort":
+        await w.harness.abort(immediate=True)
+        assert w.harness.state is HarnessState.IDLE
+    else:
+        await w.harness.stop()
+        assert w.harness.state is HarnessState.TERMINATED
+    with pytest.raises(DeliverySuperseded):
+        await asyncio.wait_for(drain, 3)
+    assert w.native._st.round_id_counter == 1
+    assert w.native._duplex_pending is None
+    assert await w.manager.get_messages(to_member_name="A2", unread_only=True)
+    assert w.tool.cancelled == 1
 
 
 @pytest.mark.asyncio
@@ -434,13 +579,11 @@ async def test_stale_supervisor_command_cannot_interrupt_newer_context(world):
     await w.harness.send("Implement the order system.")
     await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
     old = snapshot_from_native(w.native)
-    w.native.commit_working_intent({"goal": "Order system", "current_hypothesis": "PostgreSQL",
-                                   "next_action": "Use existing database", "constraints": ["No Kafka"]})
-    result = await w.native.route_input("old decision", version=old.context_version,
-                                       action="INTERRUPT", message_id="old")
+    await w.harness.send("Also include migration steps.", immediate=True)
+    result = await w.native.interrupt("old decision", version=old.context_version,
+                                      message_id="old")
     assert result == "STALE"
     assert w.native.active_round.round_id == int(old.round_id)
-    assert snapshot_from_native(w.native).current_hypothesis == "PostgreSQL"
 
 
 @pytest.mark.asyncio
@@ -467,7 +610,7 @@ async def test_failed_db_ack_retry_does_not_reexecute_delivery(world, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_user_input_uses_same_atomic_controller(world):
+async def test_user_input_uses_same_router(world):
     from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
     from openjiuwen.agent_teams.agent.coordination.event_bus import InnerEventMessage, InnerEventType
     w = world
@@ -543,90 +686,83 @@ async def test_benchmark_native_peer_executes_recovery_and_naive_restart(world, 
 
 
 @pytest.mark.asyncio
-async def test_database_peer_merges_updates_and_acks_original_rows(world, tmp_path):
-    from jiuwenswarm.benchmarks.duplex_database_peer import DatabasePeer
+@pytest.mark.parametrize("policy", ["steer", "model"])
+async def test_three_database_peers_keep_distinct_listeners_and_deliver_without_waiting(world, tmp_path, policy):
     from jiuwenswarm.benchmarks.duplex_runtime import Events
+    from jiuwenswarm.benchmarks.duplex_database_peer import DatabasePeer
 
     w = world
+    w.endpoint.tool_first = False
+    w.endpoint.block_model = False
     fast = w.host.tiny_agent_model_resolver("fast")
     slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
         update={"model_name": "slow"})})
-    w.endpoint.tool_first = False
-    w.endpoint.fast_gate.clear()
-    peer = DatabasePeer(database=tmp_path / "official.db", team="official", name="agent-1",
-        models={"slow": slow, "fast": fast}, policy="model", system_prompt="Complete the task.",
-        tools=[], events=Events(tmp_path / "db-events.jsonl"))
-    inputs = []
-    outside = set_session_id("")  # stand-alone benchmark has no inherited team session
+    events = Events(tmp_path / "team-events.jsonl")
+    peers = [DatabasePeer(database=tmp_path / "team.sqlite3", team="three_" + policy,
+        name=name, models={"slow": slow, "fast": fast}, policy=policy,
+        system_prompt=f"You are {name}.", tools=[], events=events)
+        for name in ("implementer", "diagnoser", "reviewer")]
     try:
-        await peer.start()
-        await peer.send("Use Kafka for the order system.")
-        await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
-        state = peer.harness._duplex_control_state
-        assert state["goal"] == "Use Kafka for the order system."
-        assert state["intent_source"] == "committed_state"
-        assert state["current_hypothesis"] == ""
-        inputs.append(asyncio.create_task(peer.receive("Use PostgreSQL instead.", message_id="one")))
-        await asyncio.wait_for(w.endpoint.fast_entered.wait(), 6)
-        inputs.append(asyncio.create_task(peer.receive("Keep the existing schema.", message_id="two")))
-        await wait_until(lambda: sum(c["model"] == "fast" for c in w.endpoint.calls) >= 2)
-        latest = json.dumps([c for c in w.endpoint.calls if c["model"] == "fast"][-1])
-        assert "PostgreSQL" in latest and "existing schema" in latest
-        rows = await peer.messages()
-        assert len(rows) == 2
-        await asyncio.wait_for(asyncio.gather(*inputs), 6)
-        assert all(row.is_read for row in await peer.messages())
-        w.endpoint.fast_gate.set()
-        await asyncio.wait_for(asyncio.gather(*inputs), 6)
-        await peer.wait(timeout=6)
-        rows = await peer.messages()
-        assert all(row.is_read for row in rows)
-        count = len(peer.events.records)
-        await peer.receive("Use PostgreSQL instead.", message_id="one")
-        assert len(peer.events.records) == count
+        for peer in peers:
+            await peer.start()
+        for i, peer in enumerate(peers):
+            # Returns after DB write + enqueue, without waiting for the
+            # receiver's Native round or any fast-model decision.
+            await asyncio.wait_for(peer.send_to(peers[(i + 1) % 3].name,
+                f"Finding from {peer.name}: requirement is Redis."), 3)
+        await asyncio.wait_for(asyncio.gather(*(p.wait(timeout=6) for p in peers)), 7)
+        await wait_until(lambda: all(not p._unacknowledged for p in peers))
+        arrivals = [e for e in events.records if e["event"] == "message_arrived"]
+        acks = [e for e in events.records if e["event"] == "message_accepted"]
+        assert len(arrivals) == len(acks) == 3
+        assert {e["member"] for e in arrivals} == {p.name for p in peers}
+        assert all("phase" in e for e in arrivals)
+        assert len([e for e in events.records if e["event"] == "delivery_effective"]) == 3
+        assert len({e["message_id"] for e in acks}) == 3
     finally:
-        for task in inputs:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*inputs, return_exceptions=True)
-        await peer.close()
-        reset_session_id(outside)
+        for peer in reversed(peers):
+            if peer.db is not None:
+                await peer.close()
 
 
 @pytest.mark.asyncio
-async def test_input_dispatch_does_not_block_lifecycle_event(world):
-    from openjiuwen.agent_teams.agent.coordination.event_bus import (
-        EventBus, InnerEventMessage, InnerEventType,
-    )
-    from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
+@pytest.mark.parametrize("policy", ["steer", "model"])
+async def test_workload_team_runs_real_native_tools_and_natural_db_messages(world, tmp_path, policy):
+    """Scripted models test the runner only; this is not an official task score."""
+    from jiuwenswarm.benchmarks.duplex_runtime import Events
+    from jiuwenswarm.benchmarks.duplex_workload_team import WorkloadTeam
 
     w = world
-    w.endpoint.fast_gate.clear()
-    await w.harness.send("Implement Kafka")
-    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
-    lifecycle = asyncio.Event()
-    handler = AgentLifecycleHandler(w.host, w.handler._blueprint, w.handler._infra, NS())
+    names = ["implementer", "diagnoser", "reviewer"]
+    w.endpoint.fast_action = "APPEND"
 
-    async def dispatch(event):
-        if event.event_type == InnerEventType.USER_INPUT:
-            await handler.on_user_input(event)
-        else:
-            lifecycle.set()
+    def respond(body):
+        prompt = json.dumps(body["messages"])
+        member = next(n for n in names if f"Your name: {n}." in prompt)
+        sent = any(m.get("role") == "assistant" and any(t["function"]["name"] == "SendMessage"
+            for t in m.get("tool_calls", [])) for m in body["messages"])
+        if not sent:
+            return Endpoint.tool_message("SendMessage", {"recipient": names[(names.index(member) + 1) % 3],
+                "content": f"Evidence from {member}: Redis is required."})
+        return {"role": "assistant", "content": f"{member} finished its check."}
 
-    bus = EventBus(role=TeamRole.LEADER)
-    await bus.start(wake_callback=dispatch)
-    try:
-        await bus.enqueue(InnerEventMessage(event_type=InnerEventType.USER_INPUT,
-            payload={"content": "Use PostgreSQL instead", "message_id": "nonblocking-input"}))
-        await asyncio.wait_for(w.endpoint.fast_entered.wait(), 6)
-        await bus.enqueue(InnerEventMessage(event_type=InnerEventType.REFRESH_TEAM_CONTEXT))
-        await asyncio.wait_for(lifecycle.wait(), 2)
-        assert not w.endpoint.fast_gate.is_set()
-        assert not hasattr(bus, "_duplex_input_tasks")
-    finally:
-        w.endpoint.fast_gate.set()
-        await bus.stop()
-        await finish_routes(w.native)
+    w.endpoint.slow_responder = respond
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    events = Events(tmp_path / "workload-events.jsonl")
+    team = WorkloadTeam(suite="development", task="Use Redis for the queue.", models={"slow": slow, "fast": fast},
+        policy=policy, environment=NS(instructions=""), output=tmp_path, events=events,
+        timeout=15, max_model_calls=10)
+    result = await asyncio.wait_for(team.run(), 20)
+    assert result["status"] == "completed", result
+    assert len([e for e in events.records if e["event"] == "message_sent"]) == 3
+    assert len([e for e in events.records if e["event"] == "message_accepted"]) == 3
+    assert {e["member"] for e in events.records if e["event"] == "agent_final"} == set(names)
+
+
+
+
 
 
 @pytest.mark.asyncio
@@ -845,16 +981,14 @@ async def test_four_strategies_at_same_tool_boundary(world, group, use_steer, re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("world", [{"mode": "shadow"}], indirect=True)
-async def test_shadow_real_team_harness_observes_plain_messages_without_changing_execution(world):
+async def test_inactive_mode_uses_original_native_without_fast_call(world):
     w = world
     assert not isinstance(w.native, DuplexNativeHarness)
     await w.harness.send("Implement the order system.")
     await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
     await send_message(w)
     await poll_and_apply(w)
-    observer = w.handler._duplex_shadow_observer
-    await asyncio.wait_for(observer._task, 6)
-    assert any(c["model"] == "fast" for c in w.endpoint.calls)
+    assert not any(c["model"] == "fast" for c in w.endpoint.calls)
     assert w.harness.state is HarnessState.RUNNING
     assert w.native.active_round.round_id == 1
     assert not any(t["function"]["name"] == "update_working_intent"
@@ -862,16 +996,232 @@ async def test_shadow_real_team_harness_observes_plain_messages_without_changing
 
 
 @pytest.mark.asyncio
-async def test_slow_model_publishes_working_intent_used_by_real_fast_request(world):
+@pytest.mark.parametrize("scenario", ["ordinary", "append", "timeout", "error", "missing_model", "serial"])
+async def test_slow_requests_match_original_sdk_when_not_interrupting(world, tmp_path, scenario):
+    """Compare actual HTTP messages/tools/round counts, not just final answers."""
+    from jiuwenswarm.benchmarks.duplex_runtime import Events, NativePeer
+    from jiuwenswarm.agents.harness.team.duplex_shadow import RoutedInput, deliver_routed
+    from jiuwenswarm.common.duplex_router import InboundMessage
+
     w = world
-    w.endpoint.intent_first = True
-    await w.harness.send("Implement the order system.")
-    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
-    await send_message(w)
-    await poll_and_apply(w)
-    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
-    fast = next(c for c in w.endpoint.calls if c["model"] == "fast")
-    prompt = json.dumps(fast["messages"])
-    assert "Use Kafka" in prompt and "Existing infrastructure only" in prompt
-    assert "Irreversible operation committed exactly once" not in prompt
-    assert w.tool.path.read_text() == "committed\n"
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    observed = []
+    for policy in ("steer", "model"):
+        w.endpoint.calls.clear()
+        w.endpoint.block_model = False
+        w.endpoint.fast_action = "APPEND"
+        w.endpoint.fast_error = scenario == "error"
+        w.endpoint.fast_gate.set()
+        if scenario == "timeout":
+            w.endpoint.fast_gate.clear()
+        tool = WriteOnce(tmp_path / f"{policy}-effects.txt")
+        if scenario != "ordinary":
+            tool.gate.clear()
+        peer = NativePeer(name="parity", models={"slow": slow, "fast": fast}, policy=policy,
+            system_prompt="Implement the task.", tools=[tool],
+            events=Events(tmp_path / f"{policy}.jsonl"))
+        await peer.start()
+        try:
+            await peer.send("Implement order events.")
+            if scenario != "ordinary":
+                await asyncio.wait_for(tool.entered.wait(), 6)
+                content = "Also include migration steps."
+                if policy == "model":
+                    await deliver_routed(peer, RoutedInput(content, InboundMessage("m1", "user", content)),
+                        use_steer=True, original=peer._original,
+                        settings={"mode": "active", "model_name": "" if scenario == "missing_model" else "fast",
+                                  "policy": "serial" if scenario == "serial" else "model",
+                                  "timeout_seconds": 0.05 if scenario == "timeout" else 2})
+                else:
+                    await peer.harness.send(content, immediate=scenario != "serial")
+                tool.gate.set()
+            await peer.wait(timeout=6)
+            requests = [c for c in w.endpoint.calls if c["model"] == "slow"]
+            # The scripted server generates random tool call IDs. Normalize
+            # only those identities, preserving all prompts and tool arguments.
+            identities = {}
+            for request in requests:
+                for message in request["messages"]:
+                    for call in message.get("tool_calls", []):
+                        identities.setdefault(call["id"], f"call-{len(identities)}")
+            payload = json.dumps([{"messages": c["messages"], "tools": c.get("tools")} for c in requests],
+                                 sort_keys=True)
+            for key, value in identities.items():
+                payload = payload.replace(key, value)
+            observed.append((payload, peer.harness._st.round_id_counter))
+            assert tool.path.read_text() == "committed\n"
+            assert "update_working_intent" not in payload
+        finally:
+            tool.gate.set()
+            await peer.close()
+    assert observed[1] == observed[0]
+
+@pytest.mark.asyncio
+async def test_live_verifier_forces_one_structured_request(world):
+    from jiuwenswarm.benchmarks.duplex_live_review import verify_finding
+
+    fast = world.host.tiny_agent_model_resolver('fast')
+    slow = fast.model_copy(update={'model_request_config': fast.model_request_config.model_copy(
+        update={'model_name': 'slow'})})
+    original_config = slow.model_request_config.model_dump()
+    world.endpoint.calls.clear()
+
+    def respond(body):
+        assert body['tool_choice'] == {'type': 'function', 'function': {'name': 'structured_output'}}
+        return Endpoint.tool_message('structured_output', {
+            'supported': True, 'evidence': "queue = 'Kafka'",
+            'correction': 'Use Redis.', 'reason': 'The user required Redis.'})
+
+    world.endpoint.slow_responder = respond
+    result = await verify_finding(slow, {'task': 'Use Redis.', 'command': "queue = 'Kafka'"},
+        {'evidence': "The command uses `queue = 'Kafka'`, which violates the requirement.",
+         'explanation': 'Wrong queue backend.', 'correction': 'Use Redis.'})
+    assert result['status'] == 'problem'
+    assert len([c for c in world.endpoint.calls if c['model'] == 'slow']) == 1
+    assert slow.model_request_config.model_dump() == original_config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('policy', ['steer', 'model'])
+@pytest.mark.parametrize('repair', [False, True])
+async def test_final_verification_ends_without_extra_model_call(world, tmp_path, monkeypatch, policy, repair):
+    from jiuwenswarm.benchmarks.duplex_metrics import Events
+    from jiuwenswarm.benchmarks.duplex_workload_team import WorkloadTeam
+    from jiuwenswarm.benchmarks import duplex_live_review
+
+    artifact = tmp_path / 'output.txt'
+
+    class Environment:
+        live_review = True
+        owner = 'implementer'
+        roles = {'implementer': 'Save and verify output.', 'reviewer': 'Monitor.'}
+        instructions = ''
+
+        async def execute(self, member, command, seconds):
+            if command.startswith('save '):
+                artifact.write_text(command[5:])
+            if command == 'check' and artifact.read_text() != 'correct':
+                return 'exit_code=1\nAssertionError: wrong output'
+            return 'exit_code=0\nchecks passed'
+
+        async def review_evidence(self, command, output):
+            return {'revision': artifact.read_text(), 'command': command, 'tool_output': output}
+
+        async def submission_state(self):
+            return {'ready': artifact.exists(), 'reason': 'Missing output',
+                    'revision': artifact.read_text() if artifact.exists() else ''}
+
+    async def review(model, evidence, **kwargs):
+        return {'status': 'ok', 'evidence': '', 'correction': ''}
+
+    monkeypatch.setattr(duplex_live_review, 'model_review', review)
+    requests = []
+
+    def respond(body):
+        requests.append(body)
+        step = len(requests)
+        assert 'Runtime budget:' not in json.dumps(body['messages'])
+        if step == 1:
+            return Endpoint.tool_message('Bash', {'command': 'save wrong' if repair else 'save correct'})
+        if repair and step == 3:
+            return Endpoint.tool_message('Bash', {'command': 'save correct'})
+        assert step == 2 or (repair and step == 4), 'Unnecessary model call after final verification'
+        return Endpoint.tool_message('VerifyAndFinish', {'command': 'check', 'summary': 'Saved and checked.'})
+
+    world.endpoint.slow_responder = respond
+    fast = world.host.tiny_agent_model_resolver('fast')
+    slow = fast.model_copy(update={'model_request_config': fast.model_request_config.model_copy(
+        update={'model_name': 'slow'})})
+    events = Events(tmp_path / ('submit-' + policy + '.jsonl'))
+    team = WorkloadTeam(suite='development', task='Save correct output.', models={'slow': slow, 'fast': fast},
+                        policy=policy, environment=Environment(), output=tmp_path / policy,
+                        events=events, timeout=12, max_model_calls=6)
+    result = await team.run()
+    assert result['status'] == 'completed', result
+    assert len(requests) == (4 if repair else 2)
+    assert sum(e['event'] == 'submission_accepted' for e in events.records) == 1
+    assert sum(e['event'] == 'submission_rejected' for e in events.records) == int(repair)
+    starts = [e for e in events.records if e['event'] == 'model_start']
+    assert all(len(e['semantic_request_sha256']) == 64 for e in starts)
+    assert all(e['first_chunk_seconds'] is not None and e['first_output_seconds'] is not None
+               for e in events.records if e['event'] == 'model_end')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('policy', ['steer', 'model'])
+async def test_live_monitor_automatically_routes_real_artifact_correction(world, tmp_path, monkeypatch, policy):
+    from jiuwenswarm.benchmarks.duplex_metrics import Events
+    from jiuwenswarm.benchmarks.duplex_workload_team import WorkloadTeam
+    from jiuwenswarm.benchmarks import duplex_live_review
+
+    w = world
+    second_model = asyncio.Event()
+    w.endpoint.block_stream_call = 2
+    w.endpoint.model_gate.clear()
+    artifact = tmp_path / 'queue.txt'
+
+    class Environment:
+        live_review = True
+        owner = 'implementer'
+        roles = {'implementer': 'Write the requested queue configuration.', 'reviewer': 'Monitor.'}
+        instructions = ''
+
+        async def execute(self, member, command, seconds):
+            artifact.write_text('Redis' if 'Redis' in command else 'Kafka')
+            return 'exit_code=0\nqueue=' + artifact.read_text()
+
+        async def review_evidence(self, command, output):
+            return {'revision': artifact.read_text(), 'command': command, 'tool_output': output}
+
+    async def review(model, evidence, *, verification_model):
+        assert verification_model.model_request_config.model_name == 'slow'
+        if evidence['revision'] == 'Kafka':
+            await second_model.wait()
+            return {'status': 'problem', 'evidence': evidence['tool_output'],
+                    'correction': 'The actual Kafka configuration violates the user requirement. Use Redis.'}
+        return {'status': 'ok', 'evidence': '', 'correction': ''}
+
+    monkeypatch.setattr(duplex_live_review, 'model_review', review)
+
+    def respond(body):
+        assert all(tool["function"]["name"] != "SendMessage" for tool in body.get("tools", []))
+        assert "A passive reviewer" in json.dumps(body["messages"])
+        prompt = json.dumps(body['messages'])
+        if 'queue=Redis' in prompt:
+            return {'role': 'assistant', 'content': 'Redis configuration verified.'}
+        if 'Observed problem at artifact' in prompt:
+            return Endpoint.tool_message('Bash', {'command': 'write Redis'})
+        if 'queue=Kafka' in prompt:
+            second_model.set()
+            return {'role': 'assistant', 'content': 'Continue obsolete Kafka plan.'}
+        return Endpoint.tool_message('Bash', {'command': 'write Kafka'})
+
+    w.endpoint.slow_responder = respond
+    fast = w.host.tiny_agent_model_resolver('fast')
+    slow = fast.model_copy(update={'model_request_config': fast.model_request_config.model_copy(
+        update={'model_name': 'slow'})})
+    events = Events(tmp_path / ('live-' + policy + '.jsonl'))
+    team = WorkloadTeam(suite='development', task='Use Redis for the queue.',
+        models={'slow': slow, 'fast': fast}, policy=policy, environment=Environment(),
+        output=tmp_path / policy, events=events, timeout=15, max_model_calls=8)
+    job = asyncio.create_task(team.run())
+    try:
+        await wait_until(lambda: any(e['event'] == 'delivery_effective' for e in events.records))
+        if policy == 'steer':
+            w.endpoint.model_gate.set()
+        result = await asyncio.wait_for(job, 18)
+        assert result['status'] == 'completed', result
+        assert artifact.read_text() == 'Redis'
+        deliveries = [e for e in events.records if e['event'] == 'delivery_effective']
+        assert sum(e['action'] == 'INTERRUPT' for e in deliveries) == (1 if policy == 'model' else 0)
+        assert not any(e['event'] == 'model_start' and e.get('member') == 'reviewer' for e in events.records)
+        if policy == 'model':
+            assert any(e['event'] == 'route_input' and 'write Kafka' in e['last_action']
+                       and 'write Kafka' not in e['next_action'] for e in events.records)
+    finally:
+        w.endpoint.model_gate.set()
+        if not job.done():
+            job.cancel()
+        await asyncio.gather(job, return_exceptions=True)

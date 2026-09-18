@@ -1,3 +1,7 @@
+> 2026-09-16 实测记录：[InterruptBench 用户更新回放](duplex-interruptbench-replay-20260916.md)已完成 24 次试验；[办公与开发测试题对照](duplex-office-code-run.md)已完成四次试验。两者的评分范围与官方完整数据集不同，详见各报告。此前选型见[办公与开发多 Agent 数据集](duplex-office-development-datasets.md)。
+>
+> 当前 Native 接入已收缩为 [最简路由](duplex-simplification.md)：不再使用工具账本、浏览器动作收据或进程恢复。下文既有验证数字为历史记录，最新结果以上述实测报告为准。
+
 # 全双工公开评测接入
 
 需求来源是工作区 `jiuwen/全双工快慢Agent_完整调研与方案.md` 和

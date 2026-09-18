@@ -1,40 +1,59 @@
 @startuml duplex-routing-flow
-title 一条新消息的处理流程
 skinparam defaultFontName Microsoft YaHei
-skinparam defaultFontSize 17
+skinparam defaultFontSize 16
 skinparam shadowing false
-skinparam backgroundColor #FFFFFF
+skinparam backgroundColor white
+skinparam sequenceMessageAlign center
 skinparam ArrowColor #52647A
-skinparam activityBackgroundColor #E1F0FF
-skinparam activityBorderColor #6A8BAB
-skinparam activityDiamondBackgroundColor #FFF1CC
-skinparam noteBackgroundColor #F5F6F8
-skinparam noteBorderColor #B8C1CC
-
-start
-:① 慢 Agent 正在干活\n此时收到一条新消息;
-:② 接住消息，交给快模型判断;
-note right
-  慢 Agent 此时继续工作
-  又来消息就合起来重新判断
+skinparam ParticipantBackgroundColor #E1F0FF
+hide footbox
+title 双工流程：正常执行与新消息处理并行\n没有新消息时只走 A；新消息到达才触发 B
+actor "用户 / 其他 Agent" as sender
+participant "原 Jiuwen 入口" as inlet
+participant "快模型路由器" as router
+participant "原 SDK 执行器" as sdk
+participant "慢模型 / 工具" as slow
+note over sender, slow
+  A 持续执行任务；B 可在 A 生成或执行工具期间触发。
+  两条流程分别编号，B 判断时 A 继续运行。
 end note
-if (③ 新消息需要马上改变当前工作吗？) then (不需要)
-  :④A 当前步骤继续\n下一次模型调用前加入新消息;
-else (需要)
-  :④B 安全停下当前工作\n加入新消息，保留已完成的结果;
-  note right
-    谁来停？慢 Agent 自己的执行器。
-    正在生成：取消当前生成，从安全点继续。
-    工具已经开始：先等工具完成，保留结果。
-  end note
-endif
-:⑤ 同一个慢 Agent\n按新消息继续任务;
-stop
 
-legend bottom
-  **快模型只判断；慢 Agent 的执行器负责真正停下和继续。**
-  判断超时或失败，按原方案走 SDK steer。
-  图中只展开一次消息处理；慢 Agent 继续后仍可接收新消息。
-  去重、版本检查、已读确认等保护细节由代码处理，不展开成主流程。
-endlegend
+par A · 正常流程：执行原任务
+autonumber 1 "<b>A0</b>"
+loop 任务未完成且未暂停：每次慢模型调用
+  sdk -> slow : 调用慢模型
+  slow -> slow : 生成答案；需要时执行工具并收集结果
+  note over sdk, slow : 任务还需继续 → 重复 A；任务完成 → 结束
+end
+
+else B · 新请求流程：新消息到达才触发
+autonumber 1 "<b>B0</b>"
+opt 用户补充输入 / A2A 普通消息到达
+sender -> inlet : 新消息
+note over inlet, sdk : 以下展开可路由且有活动任务的情况；其余沿用原 SDK 投递
+inlet -> router : 消息原文 + 已有任务 / 计划
+note over router, slow : 快模型判断一次；A 的模型 / 工具继续运行
+alt APPEND，或判断失败 / 超时 / 过期
+  router -> sdk : 原 steer(新消息)
+  sdk --> inlet : 投递成功
+  inlet --> sender : 原接收确认 / A2A 已读
+  note over sdk, slow
+    A 继续当前执行；新消息进入原 steer 队列。
+    A 下一次原有模型调用前接纳新消息。
+    这条消息不额外启动一轮模型调用。
+  end note
+else INTERRUPT（应用前状态仍有效）
+  router -> sdk : 内部暂停
+  alt 模型生成中
+    sdk -> slow : 取消当前生成
+  else 工具执行中
+    sdk -> sdk : 等待工具完成
+  end
+  router -> sdk : 作废旧计划，写入重新规划指令和新消息
+  sdk -> slow : 保留有效需求与工具结果，重新规划后回到 A
+  sdk --> inlet : 投递成功
+  inlet --> sender : 原接收确认 / A2A 已读
+end
+end
+end
 @enduml

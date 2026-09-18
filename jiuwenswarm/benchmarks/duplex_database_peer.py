@@ -27,6 +27,8 @@ class DatabasePeer(NativePeer):
         self.database, self.team = Path(database), team
         self.db = None
         self._receipts = {}
+        self._arrivals = set()
+        self._unacknowledged = set()
         self.duplex_settings = {"mode": "active", "policy": self.policy,
                                 "model_name": "fast"}
 
@@ -41,13 +43,34 @@ class DatabasePeer(NativePeer):
         from openjiuwen.agent_teams.agent.team_agent import TeamAgent
         if self.policy == "abort_restart":
             return await super().receive(str(content), message_id=content.message.message_id)
-        return await TeamAgent.deliver_input(self, content,
-                                            use_steer=use_steer and self.policy != "serial")
+        phase = self.execution_phase()
+        result = await TeamAgent.deliver_input(self, content,
+                                              use_steer=use_steer and self.policy != "serial")
+        self.events.add("delivery_effective", member=self.name,
+            message_id=getattr(getattr(content, "message", None), "message_id", None), phase=phase,
+            action="INTERRUPT" if result == "INTERRUPT" else (
+                "IDLE_START" if phase == "idle" else "SERIAL" if self.policy == "serial" else "APPEND"))
+        return result
+
+    def execution_phase(self):
+        active = self.harness.active_round
+        return active.iter_phase.value if active is not None else self.harness.state.value
+
+    @team_context
+    async def send_to(self, recipient, content):
+        """Persist and wake through the SDK; do not wait on the receiver's model."""
+        identity = await self.manager.send_message(content=content, to_member_name=recipient)
+        if identity is None:
+            raise RuntimeError("SDK could not persist the teammate message")
+        self.events.add("message_sent", member=self.name, recipient=recipient,
+                        message_id=identity, content=content)
+        return identity
 
     @team_context
     async def start(self):
         from filelock import FileLock
         from openjiuwen.agent_teams.messager import InProcessMessager
+        from openjiuwen.agent_teams.messager.base import MessagerTransportConfig
         from openjiuwen.agent_teams.tools.database import DatabaseConfig, DatabaseType, TeamDatabase
         from openjiuwen.agent_teams.tools.message_manager import TeamMessageManager
         from openjiuwen.agent_teams.agent.coordination.handlers.message import MessageHandler
@@ -57,10 +80,6 @@ class DatabasePeer(NativePeer):
         from jiuwenswarm.agents.harness.team.duplex_shadow import install_shadow_observer
 
         install_shadow_observer()
-        # Stable across worker restarts, isolated across databases, members and
-        # benchmark policies. Bind before Native restores its durable inbox.
-        self.harness.durable_scope = "agentradio:" + uuid.uuid5(uuid.NAMESPACE_URL,
-            f"{self.database.resolve()}/{self.team}/{self.name}/{self.policy}").hex
         await super().start()
         if self.db is not None:  # abort reference rebuilds only its executor
             return
@@ -82,7 +101,10 @@ class DatabasePeer(NativePeer):
                     agent_card=AgentCard(id=self.name, name=self.name).model_dump_json())
         finally:
             await asyncio.to_thread(lock.release)
-        self.messager = InProcessMessager()
+        # Default node_id is empty: using it for several peers silently
+        # replaces the preceding subscriber on the process-global SDK bus.
+        self.messager = InProcessMessager(config=MessagerTransportConfig(
+            node_id=f"{self.team}/{self.name}", team_name=self.team))
         self.manager = TeamMessageManager(team_name=self.team, db=self.db,
             messager=self.messager, member_name=self.name)
         self.bus = EventBus(role=TeamRole.LEADER)
@@ -102,10 +124,14 @@ class DatabasePeer(NativePeer):
                         await peer.handler.on_poll_mailbox(event)
                     else:
                         await peer.handler.on_message_or_broadcast(event)
-                    for identity, future in tuple(peer._receipts.items()):
+                    for identity in tuple(peer._unacknowledged):
                         row = await peer.db.message.get_message(identity)
-                        if row is not None and row.is_read and not future.done():
-                            future.set_result(None)
+                        if row is not None and row.is_read:
+                            peer._unacknowledged.discard(identity)
+                            peer.events.add("message_accepted", member=peer.name, message_id=identity)
+                            future = peer._receipts.get(identity)
+                            if future is not None and not future.done():
+                                future.set_result(None)
                 except Exception as error:
                     for future in tuple(peer._receipts.values()):
                         if not future.done():
@@ -114,7 +140,18 @@ class DatabasePeer(NativePeer):
 
         self.topic = TeamTopic.MESSAGE.build(self.team, self.team)
         await self.bus.start(wake_callback=Dispatch().dispatch)
-        await self.messager.subscribe(self.topic, self.bus.enqueue)
+        async def arrived(event):
+            payload = event.payload
+            if payload.get("to_member_name") == self.name:
+                identity = payload["message_id"]
+                if identity not in self._arrivals:
+                    self._arrivals.add(identity)
+                    self._unacknowledged.add(identity)
+                    self.events.add("message_arrived", member=self.name, message_id=identity,
+                        sender=payload.get("from_member_name"), phase=self.execution_phase())
+            await self.bus.enqueue(event)
+
+        await self.messager.subscribe(self.topic, arrived)
 
     @team_context
     async def receive(self, content, *, message_id, sender="coral"):
@@ -131,7 +168,6 @@ class DatabasePeer(NativePeer):
             raise ValueError("external message identity reused with different content")
         elif row.is_read:
             return
-        self.events.add("message_arrived", member=self.name, message_id=identity)
         future = self._receipts.setdefault(identity, asyncio.get_running_loop().create_future())
         await self.messager.publish(topic_id=self.topic, message=EventMessage.from_event(MessageEvent(
             message_id=identity, team_name=self.team, from_member_name=sender, to_member_name=self.name)))
@@ -140,7 +176,6 @@ class DatabasePeer(NativePeer):
             await asyncio.shield(future)
         finally:
             self._receipts.pop(identity, None)
-        self.events.add("message_accepted", member=self.name, message_id=identity)
 
     @team_context
     async def messages(self):

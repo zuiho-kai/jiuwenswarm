@@ -4,7 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -16,12 +16,11 @@ from jiuwenswarm.agents.harness.team import duplex_shadow as shadow
 
 def snapshot():
     return ControlSnapshot("v1", "r1", "c1", "model", goal="Order event system",
-                           current_hypothesis="Use Kafka")
+                           next_action="Use Kafka")
 
 
 def decision(s, action="INTERRUPT"):
-    return dict(action=action, context_version=s.context_version,
-                round_id=s.round_id, checkpoint_id=s.checkpoint_id)
+    return {"action": action}
 
 
 MESSAGES = (InboundMessage("m204", "A1", "Customer forbids Kafka"),)
@@ -39,15 +38,15 @@ async def test_interrupt_is_observed_only():
 
 
 @pytest.mark.asyncio
-async def test_stale_decision_is_recomputed_from_latest_snapshot():
+async def test_stale_decision_falls_back_without_reclassification():
     old = snapshot()
     new = replace(old, context_version="v2", round_id="r2", checkpoint_id="c2")
     classify = AsyncMock(side_effect=[decision(old), decision(new, "APPEND")])
     result = await observe(old, MESSAGES, classify=classify, current_snapshot=lambda: new)
-    assert result.attempts == 2
-    assert result.context_version == "v2"
-    assert result.proposed_action == "APPEND"
-    assert classify.await_args_list[1].args[0] == new
+    assert result.attempts == 1
+    assert result.status == "stale"
+    assert result.proposed_action == "UNDECIDED"
+    classify.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -65,7 +64,7 @@ async def test_continually_changing_context_is_discarded():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response", [None, "INTERRUPT", {},
-    dict(action="DELETE", context_version="v1", round_id="r1", checkpoint_id="c1"),
+    dict(action="DELETE"),
     dict(action="INTERRUPT", context_version="v0", round_id="r1", checkpoint_id="c1")])
 async def test_invalid_response_produces_no_decision(response):
     s = snapshot()
@@ -114,12 +113,28 @@ def test_native_snapshot_excludes_history_and_tracks_phase_and_checkpoint():
     before = shadow.snapshot_from_native(harness)
     assert before.next_action == "Implement Kafka"
     assert "SECRET_REASONING" not in prompt_for(before, MESSAGES)
-    assert before.current_hypothesis == ""
-    assert before.tool_has_side_effects is None
+    payload = json.loads(prompt_for(before, MESSAGES))
+    assert set(payload["snapshot"]) == {"goal", "next_action", "last_action", "phase"}
     harness.active_round.iter_phase = "tool"
     assert before.context_version != shadow.snapshot_from_native(harness).context_version
     harness.active_round = None
     assert shadow.snapshot_from_native(harness) is None
+
+
+def test_actual_tool_action_reaches_router_and_changes_snapshot_version():
+    harness = native_state()
+    actual = "Running Bash: install Kafka"
+    completed = ""
+    harness._duplex_action_provider = lambda: actual
+    harness._duplex_last_action_provider = lambda: completed
+    before = shadow.snapshot_from_native(harness)
+    assert actual in before.next_action
+    actual = ""
+    completed = "Completed Bash: write Redis configuration"
+    after = shadow.snapshot_from_native(harness)
+    assert after.context_version != before.context_version
+    assert completed in after.last_action
+    assert completed not in after.next_action
 
 
 class Host:
@@ -128,31 +143,6 @@ class Host:
         self.blueprint = NS(member_name="A2")
 
 
-@pytest.mark.asyncio
-async def test_observer_coalesces_and_closes_without_dropping_at_arbitrary_limit(monkeypatch):
-    info = Mock()
-    monkeypatch.setattr(shadow.logger, "info", info)
-    host = Host()
-    observer = shadow.ShadowObserver(host, "small", 2)
-    observer._snapshot = snapshot
-    entered = asyncio.Event()
-
-    async def blocked(*_):
-        entered.set()
-        await asyncio.Event().wait()
-
-    observer._classify = blocked
-    observer.submit(MESSAGES[0])
-    observer.submit(MESSAGES[0])
-    await entered.wait()
-    for index in range(40):
-        observer.submit(InboundMessage(str(index), "A1", "new evidence"))
-    assert len(observer._pending) == 40
-    assert observer._inflight == {"m204"}
-    assert info.call_count == 0
-    await observer.aclose()
-    assert observer._task.done()
-    assert not observer._pending
 
 
 def make_handler(messages, *, fail_second=False):
@@ -187,10 +177,8 @@ async def test_real_sdk_drain_preserves_delivery_ack_and_broadcast_objects(monke
     shadow.install_shadow_observer()
     messages = [message("direct"), message("broadcast", True)]
     handler, host, mm, delivered = make_handler(messages)
-    seen = []
-    monkeypatch.setattr(shadow, "_submit", lambda h, m, *_: seen.append(m.message_id))
     await handler._process_unread_messages("A2")
-    assert seen == ["direct", "broadcast"]
+    assert [item.message.message_id for item in delivered] == ["direct", "broadcast"]
     assert len(delivered) == 2
     mm.mark_messages_read.assert_awaited_once_with(messages, "A2")
     mm.mark_message_read.assert_not_awaited()
@@ -200,7 +188,6 @@ async def test_real_sdk_drain_preserves_delivery_ack_and_broadcast_objects(monke
 async def test_real_sdk_failed_delivery_leaves_undelivered_message_unread(monkeypatch):
     messages = [message("direct"), message("broadcast", True)]
     handler, host, mm, delivered = make_handler(messages, fail_second=True)
-    monkeypatch.setattr(shadow, "_submit", lambda *_: None)
     with pytest.raises(RuntimeError, match="delivery failed"):
         await handler._process_unread_messages("A2")
     mm.mark_messages_read.assert_awaited_once_with([messages[0]], "A2")
@@ -211,39 +198,8 @@ async def test_real_sdk_failed_delivery_leaves_undelivered_message_unread(monkey
     mm.mark_messages_read.assert_awaited_with([messages[1]], "A2")
 
 
-@pytest.mark.asyncio
-async def test_router_setup_failure_cannot_block_delivery(monkeypatch):
-    handler, host, mm, delivered = make_handler([message("m1")])
-
-    def broken(*_):
-        raise ValueError("invalid config")
-
-    monkeypatch.setattr(shadow, "_submit", broken)
-    await handler._process_unread_messages("A2")
-    assert len(delivered) == 1
-    mm.mark_messages_read.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_submit_gates_and_fast_model_never_delays_real_drain(monkeypatch):
-    from openjiuwen.agent_teams.harness import native_harness
-    from jiuwenswarm.common import config
-
-    monkeypatch.setattr(native_harness, "NativeHarness", type(native_state()))
-    cfg = {"duplex_router": {"mode": "off", "model_name": "small"}}
-    monkeypatch.setattr(config, "get_config", lambda: cfg)
-    handler, host, mm, delivered = make_handler([message("m1")])
-    await handler._process_unread_messages("A2")
-    assert not hasattr(handler, "_duplex_shadow_observer")
-    cfg["duplex_router"]["mode"] = "shadow"
-    async def wait_forever(*_):
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(shadow.ShadowObserver, "_classify", wait_forever)
-    handler._read_all_unread = AsyncMock(side_effect=[[message("m2")], []])
-    await asyncio.wait_for(handler._process_unread_messages("A2"), timeout=0.2)
-    assert len(delivered) == 2
-    await handler._duplex_shadow_observer.aclose()
 
 
 def test_install_is_idempotent():
@@ -254,18 +210,6 @@ def test_install_is_idempotent():
     assert MessageHandler._format_message is installed
 
 
-@pytest.mark.asyncio
-async def test_team_disposal_cancels_shadow_worker():
-    from openjiuwen.agent_teams.agent.team_agent import TeamAgent
-    host = Host()
-    observer = shadow.ShadowObserver(host, "small", 2)
-    observer._classify = AsyncMock(side_effect=RuntimeError("test"))
-    observer.submit(MESSAGES[0])
-    owner = NS(coordination=NS(dispatcher=NS(message=NS(_duplex_shadow_observer=observer))),
-               infra=NS(tiny_agents={}))
-    await TeamAgent._dispose_tiny_agents(owner)
-    assert observer._task.done()
-    assert not observer._pending
 
 
 @pytest.mark.asyncio
@@ -296,27 +240,3 @@ def test_prompt_preserves_full_messages_and_tail_constraints():
     assert len(payload["messages"]) == 32
     assert all(m["content"] == messages[i].content for i, m in enumerate(payload["messages"]))
     assert all(m["content"].endswith("DO NOT SEND") for m in payload["messages"])
-
-
-@pytest.mark.parametrize("mode,human,template,protocol,native", [
-    ("off", False, False, "text", True),
-    ("active", False, False, "text", True),
-    ("shadow", True, False, "text", True),
-    ("shadow", False, True, "text", True),
-    ("shadow", False, False, "json", True),
-    ("shadow", False, False, "text", False),
-    ("shadow", False, False, "approval", True),
-])
-def test_control_and_unsupported_inputs_never_enter_router(monkeypatch, mode, human, template,
-                                                          protocol, native):
-    from openjiuwen.agent_teams.harness import native_harness
-    from jiuwenswarm.common import config
-    monkeypatch.setattr(native_harness, "NativeHarness", type(native_state()) if native else str)
-    monkeypatch.setattr(config, "get_config", lambda: {
-        "duplex_router": {"mode": mode, "model_name": "small"}})
-    host = Host()
-    handler = NS(_round=host)
-    msg = message("control")
-    msg.protocol = protocol
-    shadow._submit(handler, msg, NS(body="control", is_template=template), human)
-    assert not hasattr(handler, "_duplex_shadow_observer")

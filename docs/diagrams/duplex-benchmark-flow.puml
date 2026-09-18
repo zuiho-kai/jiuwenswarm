@@ -38,16 +38,11 @@ if (评测集？) then (InterruptBench / U2A)
               等待期间不执行新网页动作。
               独立 worker 的日志走 stderr。
               reset / 失败 / 退出时关闭 NativePeer。
-              控制摘要读取原 prompt 的已提交历史。
+              快模型读取已有任务信息，不要求慢模型生成摘要。
             end note
             :应用 Native 策略，返回文本动作;
           endif
           :原动作解析 → 原环境 env.step → 保存轨迹\n原 evaluator_router 评分;
-          note right
-            Native 组：执行前在同一工具账本预登记。
-            原轨迹追加后提交动作结果并关联 Native 检查点。
-            结果不明或浏览器环境变化：停止恢复，不盲目重做。
-          end note
         repeat while (还有更新阶段？) is (是) not (否)
       repeat while (还有策略？) is (是) not (否)
     repeat while (还有重复实验？) is (是) not (否)
@@ -69,7 +64,7 @@ else (AgentRadio / A2A)
             Jiuwen DB：本地持久收件账本。
             外部消息 ID 映射为稳定本地 ID。
           end note
-          :EventBus / poll → 原 MessageHandler\nmodel 经 InputController 合批\n其余走对应 Native 策略，成功后原 drain ACK;
+          :EventBus / poll → 原 MessageHandler\nmodel 每条消息判断一次\n其余走对应 Native 策略，成功后原 drain ACK;
           :按策略追加 / 取消重建 / 安全恢复\n继续任务直到答案产出或失败;
         endif
         :保留答案和 trial 产物\n原 verify_local.py 按 rubric 评分;

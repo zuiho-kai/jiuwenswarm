@@ -1,8 +1,6 @@
 """Execute pinned InterruptBench's runner with a Native model-call adapter.
 
 The upstream code owns browser reset, replay, prompts, action parsing and scoring.
-Native admits actions before env.step and commits their authoritative trajectory
-afterward. Browser objects themselves are never reconstructed from receipts.
 """
 from __future__ import annotations
 
@@ -39,28 +37,6 @@ def instrument_runner(source: str, filename: str):
             matched += 1
     if matched != 1:
         raise ValueError(f"expected one official injection branch, found {matched}")
-    class Effects(ast.NodeTransformer):
-        calls = 0
-        commits = 0
-
-        def visit_Assign(self, node):
-            if isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == "env.step":
-                node.value = ast.parse("__duplex__.browser_step(env, action, _json_safe_loose)").body[0].value
-                self.calls += 1
-            return self.generic_visit(node)
-
-        def visit_Expr(self, node):
-            if ast.unparse(node) == "trajectory.append(state_info)":
-                self.commits += 1
-                return [node, ast.parse(
-                    "__duplex__.browser_commit(trajectory, _json_safe_loose)"
-                ).body[0]]
-            return self.generic_visit(node)
-
-    effects = Effects()
-    tree = effects.visit(tree)
-    if (effects.calls, effects.commits) != (2, 3):
-        raise ValueError("upstream browser effect/trajectory boundaries changed")
     return compile(ast.fix_missing_locations(tree), filename, "exec")
 
 
@@ -153,90 +129,11 @@ class NativeBrowserBridge:
         self._peer = None
         self._active_prompt = None
         self._environment = uuid.uuid4().hex
-        self._browser_checkpoint = None
-        self._browser_action = None
-        self._browser_pending = False
-        self._task_scope = None
         self._active_goal = ""
         self._pending_goal = None
-        self._ledger_path = self.events.path.with_suffix(".tools.sqlite3")
 
     async def reset_native(self, task=None, environment=None):
         await self.close_native()
-        self._browser_action = None
-        self._browser_checkpoint = None
-        self._task_scope = None
-        if task is not None:
-            from jiuwenswarm.benchmarks.duplex_browser_checkpoint import BrowserCheckpoint
-            self._task_scope = "interruptbench:" + uuid.uuid5(uuid.NAMESPACE_URL,
-                f"{self.events.path.resolve()}:{self.policy}:{task}").hex
-            self._browser_checkpoint = BrowserCheckpoint(self._ledger_path, self._task_scope, environment)
-            self._browser_checkpoint.ready()
-
-    async def browser_operation(self, operation, **payload):
-        checkpoint = self._browser_checkpoint
-        if checkpoint is None:
-            raise RuntimeError("Browser action requires a task checkpoint")
-        if operation == "browser_begin":
-            if self._peer is not None:
-                from openjiuwen.agent_teams.harness.state import HarnessState
-                if self._peer.harness.state is not HarnessState.IDLE:
-                    raise RuntimeError("Browser effects require a completed Native action round")
-            version = str(getattr(getattr(self._peer, "harness", None), "_duplex_version", "official-replay"))
-            self._browser_action = checkpoint.begin(payload["action"], version)
-            return {"ordinal": self._browser_action}
-        if operation == "browser_commit":
-            if self._browser_action is None:
-                raise RuntimeError("No browser action is pending")
-            row = checkpoint.commit(self._browser_action, payload["trajectory"])
-            self._browser_action = None
-            self._adopt_browser_checkpoint(row)
-            if self._peer is not None:
-                from jiuwenswarm.agents.harness.team.duplex_native import DuplexNativeHarness
-                if isinstance(self._peer.harness, DuplexNativeHarness):
-                    from jiuwenswarm.agents.harness.team.duplex_inbox import persist_native
-                    await persist_native(self._peer.harness, running=False)
-            return {"committed": row["ordinal"]}
-        raise ValueError("Unknown browser operation")
-
-    def _adopt_browser_checkpoint(self, row):
-        if self._peer is not None and row is not None:
-            # Kept outside rollbackable model context. The original browser
-            # prompt still supplies the authoritative observation/action history.
-            self._peer.harness._duplex_browser_checkpoint = row
-            self._peer.browser_checkpoint = row
-
-    def browser_step(self, env, action, serialize):
-        if self.policy == "official":
-            return env.step(action)
-        payload = {"operation": "browser_begin", "action": serialize(action)}
-        if isinstance(self.worker, ProcessWorker):
-            self.worker.request(payload)
-        else:
-            self.worker.call(self.browser_operation(**payload))
-        self._browser_pending = True
-        # Exceptions leave a durable pending receipt. No automatic retry.
-        return env.step(action)
-
-    def browser_commit(self, trajectory, serialize):
-        if self.policy == "official" or not self._browser_pending:
-            return
-        evidence = []
-        for item in trajectory:
-            if isinstance(item, dict) and "observation" in item and isinstance(item.get("info"), dict):
-                # Upstream freezes page_url at each step. A live Page object's
-                # repr changes after navigation and is not recovery evidence.
-                info = {**item["info"]}
-                if "page" in info:
-                    info["page"] = {"url": info.get("page_url")}
-                item = {**item, "info": info}
-            evidence.append(serialize(item))
-        payload = {"operation": "browser_commit", "trajectory": evidence}
-        if isinstance(self.worker, ProcessWorker):
-            self.worker.request(payload)
-        else:
-            self.worker.call(self.browser_operation(**payload))
-        self._browser_pending = False
 
     async def close_native(self):
         if self._peer is not None:
@@ -270,7 +167,6 @@ class NativeBrowserBridge:
         def reset(agent, config_file):
             bridge.pending.pop(id(agent), None)
             bridge._environment = uuid.uuid4().hex
-            bridge._browser_pending = False
             if isinstance(bridge.worker, ProcessWorker):
                 bridge.worker.reset(str(Path(config_file).resolve()), bridge._environment)
             elif isinstance(bridge.worker, LoopThread):
@@ -352,7 +248,6 @@ class NativeBrowserBridge:
         self._active_goal = pending["before"] if changing else (current or {}).get("intent", "")
         self._pending_goal = pending if changing else None
         self._active_prompt = copy.deepcopy(current["after_prompt"] if pending and pending["delivered"] else prompt)
-        checkpoint = self._browser_checkpoint.ready() if self._browser_checkpoint else None
         def goal():
             update = self._pending_goal
             harness = self._peer.harness
@@ -361,11 +256,9 @@ class NativeBrowserBridge:
         if self._peer is None:
             self._peer = UserInputPeer(name="interruptbench", models=models, policy=self.policy,
                 system_prompt="", tools=[], events=self.events, prompt=lambda: self._active_prompt,
-                durable_scope=self._task_scope, ledger_path=self._ledger_path, goal=goal)
-            self._adopt_browser_checkpoint(checkpoint)
+                goal=goal)
             self._peer.harness._duplex_goal_provider = goal
             await self._peer.start()
-        self._adopt_browser_checkpoint(checkpoint)
         peer = self._peer
         peer.harness._duplex_goal_provider = goal
         peer.model.entered.clear()

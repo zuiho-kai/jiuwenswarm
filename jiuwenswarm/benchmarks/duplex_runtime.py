@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -23,14 +24,78 @@ from jiuwenswarm.common.duplex_router import InboundMessage
 from jiuwenswarm.benchmarks.duplex_metrics import Events as Events
 
 
+def request_fingerprint(args, kwargs, settings):
+    """Hash SDK inputs and their API-shaped meaning without logging credentials.
+
+    The raw hash includes SDK bookkeeping. The semantic hash uses the SDK's
+    message/tool conversion (which drops BaseMessage metadata), then normalizes
+    tool-call identities. Neither hash claims to capture the final HTTP body.
+    """
+    from openjiuwen.core.foundation.llm.model_clients.base_model_client import BaseModelClient
+
+    def serializable(value):
+        if hasattr(value, "model_dump"):
+            return serializable(value.model_dump(mode="json", exclude_none=True))
+        if isinstance(value, dict):
+            return {key: serializable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [serializable(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise TypeError(f"Unsupported request value: {type(value).__name__}")
+
+    payload = serializable({"args": args, "kwargs": {k: v for k, v in kwargs.items()
+        if k in ("messages", "tools", "temperature", "top_p", "max_tokens", "model",
+                 "stop", "seed", "tool_choice", "response_format", "extra_body")}, "settings": settings})
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                        separators=(",", ":")).encode()).hexdigest()
+    exact = digest(payload)
+    semantic_kwargs = dict(kwargs)
+    semantic_args = list(args)
+    if semantic_args:
+        semantic_kwargs["messages"] = semantic_args.pop(0)
+    if "messages" in semantic_kwargs:
+        semantic_kwargs["messages"] = BaseModelClient._convert_messages_to_dict(semantic_kwargs["messages"])
+    if "tools" in semantic_kwargs:
+        semantic_kwargs["tools"] = BaseModelClient._convert_tools_to_dict(semantic_kwargs["tools"])
+    semantic_payload = serializable({"args": semantic_args, "kwargs": {
+        k: v for k, v in semantic_kwargs.items() if k in payload["kwargs"] or k == "messages"},
+        "settings": settings})
+    identities = {}
+    def collect(value):
+        if isinstance(value, dict):
+            for call in value.get("tool_calls", []) or []:
+                if isinstance(call, dict) and call.get("id"):
+                    identities.setdefault(call["id"], f"call-{len(identities)}")
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+    def normalize(value):
+        if isinstance(value, dict):
+            return {key: identities.get(item, item) if key in ("id", "tool_call_id") and isinstance(item, str)
+                    else normalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+    collect(semantic_payload)
+    return {"request_sha256": exact, "semantic_request_sha256": digest(normalize(semantic_payload))}
+
+
 class MeasuredModel(Model):
     """Count calls including cancellations; missing provider usage stays null."""
-    def __init__(self, config, events, *, lane, prompt=None):
+    def __init__(self, config, events, *, lane, prompt=None, member=None, max_calls=None):
         super().__init__(model_client_config=config.model_client_config,
                          model_config=config.model_request_config)
         self.events = events
         self.lane = lane
         self.prompt = prompt
+        self.member, self.max_calls, self.calls = member, max_calls, 0
+        config_values = config.model_request_config.model_dump(mode="json", exclude_none=True)
+        self.request_settings = {k: v for k, v in config_values.items() if k in (
+            "model_name", "model", "temperature", "top_p", "max_tokens", "stop", "seed", "extra_body")}
         self.entered = asyncio.Event()
 
     def _arguments(self, kwargs):
@@ -40,19 +105,34 @@ class MeasuredModel(Model):
         return kwargs
 
     async def stream(self, *args, **kwargs):
+        if self.max_calls is not None and self.calls >= self.max_calls:
+            raise RuntimeError("Benchmark model call budget exhausted")
+        self.calls += 1
         call_id = uuid.uuid4().hex
         started = time.monotonic()
         usage, status, chars = None, "complete", 0
-        self.events.add("model_start", lane=self.lane, call_id=call_id)
+        output_text = []
+        arguments = self._arguments(kwargs)
+        try:
+            fingerprint = request_fingerprint(args, arguments, self.request_settings)
+        except (TypeError, ValueError):
+            fingerprint = {"request_fingerprint_unavailable": True}
+        first_chunk_seconds = first_output_seconds = None
+        self.events.add("model_start", lane=self.lane, member=self.member, call_id=call_id, **fingerprint)
         self.entered.set()
         try:
-            async for chunk in super().stream(*args, **self._arguments(kwargs)):
+            async for chunk in super().stream(*args, **arguments):
+                if first_chunk_seconds is None:
+                    first_chunk_seconds = time.monotonic() - started
                 value = getattr(chunk, "usage_metadata", None)
                 if value:
                     usage = value.model_dump() if hasattr(value, "model_dump") else value
                 content = getattr(chunk, "content", "")
+                if first_output_seconds is None and (content or getattr(chunk, "tool_calls", None)):
+                    first_output_seconds = time.monotonic() - started
                 if isinstance(content, str):
                     chars += len(content)
+                    output_text.append(content)
                 yield chunk
         except asyncio.CancelledError:
             status = "cancelled"
@@ -61,8 +141,10 @@ class MeasuredModel(Model):
             status = "error"
             raise
         finally:
-            self.events.add("model_end", lane=self.lane, call_id=call_id, status=status,
-                            seconds=time.monotonic() - started, usage=usage, output_chars=chars)
+            self.events.add("model_end", lane=self.lane, member=self.member, call_id=call_id, status=status,
+                            seconds=time.monotonic() - started, usage=usage, output_chars=chars,
+                            response_text="".join(output_text), first_chunk_seconds=first_chunk_seconds,
+                            first_output_seconds=first_output_seconds)
 
 
 def load_models(path: Path):
@@ -73,17 +155,16 @@ def load_models(path: Path):
 class NativePeer:
     """A persistent native worker; Runner's lifetime belongs to the entry point."""
     def __init__(self, *, name, models, policy, system_prompt, tools, events, prompt=None,
-                 max_iterations=1000, durable_scope=None, ledger_path=None, goal=None):
+                 max_iterations=1000, goal=None, max_model_calls=None):
         if policy not in ("serial", "steer", "abort_restart", "model", "always_interrupt"):
             raise ValueError("unsupported benchmark policy")
         self.name, self.policy, self.events = name, policy, events
         self.models = models
-        self.durable_scope, self.ledger_path = durable_scope, ledger_path
         self.goal = goal
-        self.browser_checkpoint = None
         self.blueprint = SimpleNamespace(member_name=name)
         self.tiny_agent_model_resolver = lambda name: models["fast"] if name == "fast" else None
-        self.model = MeasuredModel(models["slow"], events, lane="slow", prompt=prompt)
+        self.model = MeasuredModel(models["slow"], events, lane="slow", prompt=prompt,
+                                   member=name, max_calls=max_model_calls)
         self._system_prompt, self._tools = system_prompt, tools
         self._max_iterations = max_iterations
         self._collector = None
@@ -107,19 +188,10 @@ class NativePeer:
 
         cls = DuplexNativeHarness if self.policy in ("model", "always_interrupt") else NativeHarness
         harness = cls(Spec())
-        if self.durable_scope is not None:
-            harness.durable_scope = self.durable_scope
-        if self.ledger_path is not None and isinstance(harness, DuplexNativeHarness):
-            from jiuwenswarm.agents.harness.team.duplex_ledger import ToolLedger
-            from jiuwenswarm.agents.harness.team.duplex_inbox import DurableInbox
-            harness._duplex_ledger = ToolLedger(self.ledger_path)
-            harness._duplex_inbox = DurableInbox(Path(self.ledger_path).with_suffix(".inbox.sqlite3"))
         if self.model.prompt is not None:
             harness._duplex_context_provider = self.model.prompt
         if self.goal is not None:
             harness._duplex_goal_provider = self.goal
-        if self.browser_checkpoint is not None:
-            harness._duplex_browser_checkpoint = self.browser_checkpoint
         return harness
 
     async def start(self):
@@ -132,7 +204,7 @@ class NativePeer:
             pass
 
     async def _on_round(self, kind, round_id, result=None):
-        self.events.add("round", member=self.name, kind=kind, round_id=round_id)
+        self.events.add("round", member=self.name, kind=kind, round_id=round_id, result=result)
         if kind == "finished":
             self._last_result = result
         elif kind == "failed":
@@ -147,8 +219,14 @@ class NativePeer:
     async def _original(host, content, *, use_steer):
         return await host.harness.send(content, immediate=use_steer)
 
+    def record_duplex_input(self, snapshot, messages):
+        self.events.add("route_input", member=self.name, goal=snapshot.goal,
+                        next_action=snapshot.next_action, last_action=snapshot.last_action, phase=snapshot.phase,
+                        message_ids=[message.message_id for message in messages])
+
     def record_duplex_observation(self, observation):
         self.events.add("route_decision", member=self.name, attempts=observation.attempts,
+                        message_ids=observation.message_ids,
                         latency_ms=observation.latency_ms, status=observation.status,
                         action=observation.proposed_action, usage=None)
 
@@ -184,11 +262,7 @@ class NativePeer:
                 await asyncio.sleep(0.01)
                 if self._failure is not None:
                     raise RuntimeError(f"native benchmark worker failed: {self._failure}")
-                controller = getattr(self.harness, "_duplex_controller", None)
-                if controller is not None and controller.task is not None and controller.task.done():
-                    controller.task.result()  # Accepted input application failures are visible to the run.
-                if (self.harness.state is HarnessState.IDLE and self._last_result is not None
-                        and not (controller is not None and controller.pending)):
+                if self.harness.state is HarnessState.IDLE and self._last_result is not None:
                     return self._last_result
 
     async def close(self):
@@ -223,8 +297,5 @@ class UserInputPeer(NativePeer):
                         handler="AgentLifecycleHandler.on_user_input")
         await handler.on_user_input(InnerEventMessage(event_type=InnerEventType.USER_INPUT,
             payload={"content": content, "message_id": message_id}))
-        controller = getattr(self.harness, "_duplex_controller", None)
-        if controller is not None and controller.task is not None:
-            await asyncio.shield(controller.task)
         self._received.add(message_id)
         self.events.add("message_accepted", member=self.name, message_id=message_id)

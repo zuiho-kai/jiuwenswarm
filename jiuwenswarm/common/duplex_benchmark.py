@@ -91,7 +91,7 @@ def main():
         async with create_tiny_agent(
             system_prompt=SYSTEM_PROMPT, model_name=model_name,
             model_resolver=lambda name: config if name == model_name else None,
-            default_schema=decision_schema(snapshot), name="duplex-replay",
+            default_schema=decision_schema(), name="duplex-replay",
             language="en", max_iterations=1,
         ) as agent:
             return await agent.run(prompt_for(snapshot, messages))

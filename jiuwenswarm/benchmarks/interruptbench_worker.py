@@ -23,8 +23,6 @@ async def serve(args, output):
                 if request.get("operation") == "reset":
                     await bridge.reset_native(request.get("task"), request.get("environment"))
                     response = {"reset": True}
-                elif request.get("operation") in ("browser_begin", "browser_commit"):
-                    response = await bridge.browser_operation(**request)
                 else:
                     config = SimpleNamespace(model=request["model"], gen_config=request["gen_config"])
                     answer = await bridge._predict(config, request["prompt"], request["current"])
