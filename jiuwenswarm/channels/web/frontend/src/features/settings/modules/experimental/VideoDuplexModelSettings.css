@@ -39,6 +39,16 @@
   font-size: 12px;
 }
 
+.video-duplex-model-settings__hint {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.video-duplex-model-settings__reply-language {
+  margin-top: 12px;
+}
+
 .video-duplex-model-settings__field input,
 .video-duplex-model-settings__field select {
   width: 100%;

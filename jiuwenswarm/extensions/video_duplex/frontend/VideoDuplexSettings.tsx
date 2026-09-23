@@ -8,6 +8,7 @@ import './VideoDuplexSettings.css';
 
 type Provider = 'joyai' | 'qwen_omni';
 type VoiceProtocol = 'native_ws' | 'openai_http';
+type ReplyLanguage = 'match' | 'zh-CN' | 'en';
 
 interface SettingsValues {
   video_live_provider: Provider;
@@ -18,6 +19,7 @@ interface SettingsValues {
   qwen_omni_api_key: string;
   qwen_omni_model: string;
   qwen_omni_voice: string;
+  reply_language: ReplyLanguage;
   voice_protocol: VoiceProtocol;
   voice_asr_endpoint: string;
   voice_tts_endpoint: string;
@@ -43,6 +45,7 @@ const EMPTY_SETTINGS: SettingsValues = {
   qwen_omni_api_key: '',
   qwen_omni_model: 'qwen3.5-omni-flash-realtime',
   qwen_omni_voice: 'Cherry',
+  reply_language: 'match',
   voice_protocol: 'native_ws',
   voice_asr_endpoint: 'ws://127.0.0.1:8994/ws/asr',
   voice_tts_endpoint: 'ws://127.0.0.1:8992/ws/tts',
@@ -197,6 +200,20 @@ export function VideoDuplexSettings({
       {expanded && (
         <form className="video-duplex-settings__form" onSubmit={event => void save(event)}>
           <h3>{t('settingsPanel.videoDuplex.videoSectionTitle')}</h3>
+          <label className="video-duplex-settings__field">
+            <span>{t('settingsPanel.videoDuplex.replyLanguageLabel')}</span>
+            <select
+              value={values.reply_language}
+              onChange={event => updateValue('reply_language', event.target.value as ReplyLanguage)}
+              data-testid="settings-video-duplex-reply-language"
+              aria-label={t('settingsPanel.videoDuplex.replyLanguageLabel')}
+            >
+              <option value="match">{t('settingsPanel.videoDuplex.replyLanguageMatch')}</option>
+              <option value="zh-CN">{t('settingsPanel.videoDuplex.replyLanguageZhCN')}</option>
+              <option value="en">{t('settingsPanel.videoDuplex.replyLanguageEn')}</option>
+            </select>
+            <small>{t('settingsPanel.videoDuplex.replyLanguageDescription')}</small>
+          </label>
           <label className="video-duplex-settings__field">
             <span>{t('settingsPanel.videoDuplex.providerLabel')}</span>
             <select value={values.video_live_provider} onChange={event => updateValue('video_live_provider', event.target.value as Provider)}>

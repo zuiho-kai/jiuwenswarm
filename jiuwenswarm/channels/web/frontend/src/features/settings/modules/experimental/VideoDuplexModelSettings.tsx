@@ -9,6 +9,7 @@ import './VideoDuplexModelSettings.css';
 
 type Provider = 'joyai' | 'qwen_omni';
 type VoiceProtocol = 'native_ws' | 'openai_http';
+type ReplyLanguage = 'match' | 'zh-CN' | 'en';
 
 type SettingsValues = {
   video_live_provider: Provider;
@@ -19,6 +20,7 @@ type SettingsValues = {
   qwen_omni_api_key: string;
   qwen_omni_model: string;
   qwen_omni_voice: string;
+  reply_language: ReplyLanguage;
   voice_protocol: VoiceProtocol;
   voice_asr_endpoint: string;
   voice_tts_endpoint: string;
@@ -37,6 +39,7 @@ const DEFAULTS: SettingsValues = {
   qwen_omni_api_key: '',
   qwen_omni_model: 'qwen3.5-omni-flash-realtime',
   qwen_omni_voice: 'Cherry',
+  reply_language: 'match',
   voice_protocol: 'native_ws',
   voice_asr_endpoint: 'ws://127.0.0.1:8994/ws/asr',
   voice_tts_endpoint: 'ws://127.0.0.1:8992/ws/tts',
@@ -166,6 +169,7 @@ export function VideoDuplexModelSettings() {
     try {
       const emptyValues = Object.fromEntries(Object.keys(DEFAULTS).map((key) => [key, ''])) as Record<string, string>;
       emptyValues.video_live_provider = 'joyai';
+      emptyValues.reply_language = DEFAULTS.reply_language;
       const payload = await webRequest<Payload>(
         'video.duplex.settings.update',
         { values: emptyValues, clear_secrets: true },
@@ -179,6 +183,48 @@ export function VideoDuplexModelSettings() {
       setDeleting(false);
     }
   };
+
+  const saveReplyLanguage = async (replyLanguage: ReplyLanguage) => {
+    if (replyLanguage === values.reply_language || saving || deleting) return;
+    setSaving(true);
+    setError('');
+    try {
+      const payload = await webRequest<Payload>(
+        'video.duplex.settings.update',
+        { values: { reply_language: replyLanguage } },
+        { timeoutMs: 10_000 },
+      );
+      applyPayload(payload);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : t('settingsPanel.videoDuplex.saveError'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const replyLanguageSelect = (
+    value: ReplyLanguage,
+    onChange: (value: ReplyLanguage) => void,
+    options: { disabled?: boolean; testId?: string } = {},
+  ) => (
+    <label className="video-duplex-model-settings__field">
+      <span>{t('settingsPanel.videoDuplex.replyLanguageLabel')}</span>
+      <select
+        value={value}
+        disabled={options.disabled}
+        onChange={(event) => onChange(event.target.value as ReplyLanguage)}
+        data-testid={options.testId || 'settings-video-duplex-reply-language'}
+        aria-label={t('settingsPanel.videoDuplex.replyLanguageLabel')}
+      >
+        <option value="match">{t('settingsPanel.videoDuplex.replyLanguageMatch')}</option>
+        <option value="zh-CN">{t('settingsPanel.videoDuplex.replyLanguageZhCN')}</option>
+        <option value="en">{t('settingsPanel.videoDuplex.replyLanguageEn')}</option>
+      </select>
+      <small className="video-duplex-model-settings__hint">
+        {t('settingsPanel.videoDuplex.replyLanguageDescription')}
+      </small>
+    </label>
+  );
 
   if (loading) {
     return <div className="video-duplex-model-settings__status">{t('settingsPanel.videoDuplex.loading')}</div>;
@@ -228,6 +274,12 @@ export function VideoDuplexModelSettings() {
         </div>
       )}
 
+      <div className="video-duplex-model-settings__reply-language">
+        {replyLanguageSelect(values.reply_language, (value) => void saveReplyLanguage(value), {
+          disabled: saving || deleting,
+        })}
+      </div>
+
       {draft ? (
         <FormDialog
           open
@@ -243,6 +295,9 @@ export function VideoDuplexModelSettings() {
           }}
         >
           <div className="video-duplex-model-settings__dialog-fields">
+            {replyLanguageSelect(draft.reply_language, (value) => updateDraft('reply_language', value), {
+              testId: 'settings-video-duplex-reply-language-draft',
+            })}
             <label className="video-duplex-model-settings__field">
               <span>{t('settingsPanel.videoDuplex.providerLabel')}</span>
               <select
