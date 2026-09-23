@@ -3,30 +3,40 @@ import {
   createQwenOmniResponseEvent,
   createQwenOmniToolFollowupEvent,
   parseQwenOmniFunctionCall,
-  QWEN_OMNI_TOOL_INSTRUCTIONS,
 } from './qwenOmniTools.js';
+import {
+  buildQwenOmniToolInstructions,
+  normalizeReplyLanguage,
+  type ReplyLanguage,
+} from './taskPrompts.js';
 import type { RealtimeBrief } from './types.js';
 import type { QwenOmniToolResultContext } from './qwenOmniTools.js';
 
 export type { QwenOmniFunctionCall } from './qwenOmniTools.js';
 export { parseQwenOmniFunctionCall };
+export type { ReplyLanguage } from './taskPrompts.js';
 
 const QWEN_MAX_BASE64_IMAGE_BYTES = 256 * 1024;
-const QWEN_SESSION_INSTRUCTIONS = [
+
+const QWEN_SESSION_IDENTITY = [
   'Streaming Omni Conversation.',
   '你是九问实时视觉助手。',
   '始终结合当前会话中的近期聊天、近期画面和最新画面回答；最新画面优先，不得把已经消失的物体当成仍在画面中。',
   '只把当前可见画面、当前可辨语音、用户明确提供的信息和九问工具结果作为事实依据。画面模糊、文字不完整、对象无法确认时，明确说明无法确认或请用户调整画面，不得猜测品牌、文字、人物、数量或状态。',
   '当你无法仅凭当前音视频和会话直接完成用户要求时，必须调用九问工具交给 Core Agent 处理，不得直接以无法联网、无法访问文件、无法计算、无法操作或能力不足为由拒绝。',
   '收到九问工具结果后，只回答结果正文能够直接支持的内容。结果表示材料不足、存在冲突或无法确认时，必须保留该不确定性，不得自行补齐结论。',
-  QWEN_OMNI_TOOL_INSTRUCTIONS,
-].join('\n');
+];
+
+export function buildQwenSessionInstructions(replyLanguage: ReplyLanguage = 'match'): string {
+  return [...QWEN_SESSION_IDENTITY, buildQwenOmniToolInstructions(replyLanguage)].join('\n');
+}
 
 export interface QwenOmniSessionOptions {
   voice?: string;
   tools?: Array<Record<string, unknown>>;
   inputRate: number;
   outputRate: number;
+  replyLanguage?: ReplyLanguage | string;
 }
 
 export interface QwenOmniMediaBatch {
@@ -41,12 +51,13 @@ export interface QwenOmniMediaSnapshot {
 }
 
 export function createQwenOmniSessionUpdate(options: QwenOmniSessionOptions): Record<string, unknown> {
+  const replyLanguage = normalizeReplyLanguage(options.replyLanguage);
   return {
     type: 'session.update',
     session: {
       modalities: ['audio', 'text'],
       voice: options.voice || 'Ethan',
-      instructions: QWEN_SESSION_INSTRUCTIONS,
+      instructions: buildQwenSessionInstructions(replyLanguage),
       audio: {
         input: { format: { type: 'pcm', sample_rate: options.inputRate } },
         output: { format: { type: 'pcm', sample_rate: options.outputRate } },
@@ -80,10 +91,11 @@ export function createQwenOmniToolResultEvents(
   callId: string,
   brief: RealtimeBrief,
   context?: QwenOmniToolResultContext,
+  replyLanguage?: ReplyLanguage | string,
 ): Array<Record<string, unknown>> {
   return [
     createQwenOmniBriefOutputEvent(callId, brief, context),
-    createQwenOmniToolFollowupEvent(brief, context),
+    createQwenOmniToolFollowupEvent(brief, context, replyLanguage),
     createQwenOmniResponseEvent(),
   ];
 }

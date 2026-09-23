@@ -14,6 +14,7 @@ import uuid
 
 from jiuwenswarm.extensions.video_duplex.backend import (
     joyai_provider,
+    settings,
     video_search,
     video_voice,
 )
@@ -243,6 +244,7 @@ def register_video_live_handler(
                 "url": QWEN_OMNI_PROXY_PATH,
                 "model": config.model,
                 "voice": config.voice,
+                "reply_language": settings.reply_language(),
                 "tools": qwen_omni_tools(),
             },
         )

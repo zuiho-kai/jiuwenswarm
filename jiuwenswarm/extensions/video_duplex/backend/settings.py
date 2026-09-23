@@ -160,6 +160,14 @@ def update_settings(values: Mapping[str, Any], *, clear_secrets: bool = False) -
     _persist_env_updates(updates)
 
 
+def reply_language() -> str:
+    """Return the configured Full-duplex reply language, defaulting to match."""
+    raw = (os.getenv(SETTING_ENV_KEYS["reply_language"]) or "").strip()
+    if raw in ALLOWED_REPLY_LANGUAGES:
+        return raw
+    return str(DEFAULTS["reply_language"])
+
+
 def set_enabled(enabled: bool) -> None:
     value = "true" if enabled else "false"
     os.environ["VIDEO_DUPLEX_ENABLED"] = value

@@ -621,6 +621,7 @@ async def test_video_config_selects_qwen_gateway_without_reference_audio(
     monkeypatch.setenv("QWEN_OMNI_API_KEY", "test-secret")
     monkeypatch.setenv("QWEN_OMNI_MODEL_NAME", "qwen3.5-omni-flash-realtime")
     monkeypatch.setenv("QWEN_OMNI_VOICE", "Ethan")
+    monkeypatch.delenv("VIDEO_DUPLEX_REPLY_LANGUAGE", raising=False)
     await channel.handlers["video.realtime.config"](
         object(), "config-request", {}, "web-session"
     )
@@ -630,8 +631,27 @@ async def test_video_config_selects_qwen_gateway_without_reference_audio(
         "url": "/ws/video/qwen-omni",
         "model": "qwen3.5-omni-flash-realtime",
         "voice": "Ethan",
+        "reply_language": "match",
         "tools": video_live.qwen_omni_tools(),
     }
+
+
+@pytest.mark.asyncio
+async def test_video_config_includes_configured_reply_language(monkeypatch) -> None:
+    channel = _video_channel()
+    monkeypatch.setenv("VIDEO_LIVE_MODE", "realtime")
+    monkeypatch.setenv(
+        "QWEN_OMNI_REALTIME_URL",
+        "wss://workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+    )
+    monkeypatch.setenv("QWEN_OMNI_API_KEY", "test-secret")
+    monkeypatch.setenv("QWEN_OMNI_MODEL_NAME", "qwen3.5-omni-flash-realtime")
+    monkeypatch.setenv("VIDEO_DUPLEX_REPLY_LANGUAGE", "en")
+    await channel.handlers["video.realtime.config"](
+        object(), "config-request", {}, "web-session"
+    )
+
+    assert channel.responses[-1][1]["payload"]["reply_language"] == "en"
 
 
 @pytest.mark.asyncio

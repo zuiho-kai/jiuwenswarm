@@ -103,6 +103,7 @@ export interface VideoSessionConfig {
   url?: string;
   model: string;
   voice?: string;
+  reply_language?: 'match' | 'zh-CN' | 'en' | string;
   tools?: Array<Record<string, unknown>>;
 }
 
