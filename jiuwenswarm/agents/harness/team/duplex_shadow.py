@@ -101,6 +101,8 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
         return await original(host, str(content), use_steer=use_steer)
     message = content.message
     if message.message_id in native._duplex_received:
+        if config.get("backend") == "jev":
+            logger.info("Jev route duplicate message_id=%s", message.message_id)
         return
 
     async def steer():
@@ -112,9 +114,15 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     policy = config.get("policy", "model")
     snapshot = snapshot_from_native(native)
     if not use_steer or policy in ("serial", "steer") or snapshot is None:
+        if config.get("backend") == "jev":
+            logger.info("Jev route bypass message_id=%s policy=%s use_steer=%s snapshot=%s",
+                        message.message_id, policy, use_steer, snapshot is not None)
         return await steer()
     model_name = str(config.get("model_name") or "")
     backend = config.get("backend", "sdk")
+    if backend == "jev":
+        logger.info("Jev route start message_id=%s round_id=%s checkpoint_id=%s phase=%s",
+                    message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
 
     async def classify(state, messages):
         record_input = getattr(host, "record_duplex_input", None)
@@ -154,16 +162,33 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
             current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout)
     except Exception:
         logger.warning("duplex classification unavailable; using SDK steer", exc_info=True)
+        if backend == "jev":
+            logger.info("Jev route fallback message_id=%s reason=classification_exception effective=APPEND",
+                        message.message_id)
         return await steer()
     recorder = getattr(host, "record_duplex_observation", None)
     if recorder is not None:
         recorder(observation)
+    if backend == "jev":
+        logger.info("Jev route observation message_id=%s status=%s proposed=%s latency_ms=%.1f attempts=%d",
+                    message.message_id, observation.status, observation.proposed_action,
+                    observation.latency_ms, observation.attempts)
     if observation.status != "ok" or observation.proposed_action == "APPEND":
-        return await steer()
+        result = await steer()
+        if backend == "jev":
+            logger.info("Jev route effective message_id=%s action=APPEND reason=%s",
+                        message.message_id, observation.status if observation.status != "ok" else "model_append")
+        return result
     effective = await native.interrupt(str(content), version=observation.context_version,
                                        message_id=message.message_id)
     if effective == "STALE":
-        return await steer()
+        result = await steer()
+        if backend == "jev":
+            logger.info("Jev route effective message_id=%s action=APPEND reason=stale_at_commit",
+                        message.message_id)
+        return result
+    if backend == "jev":
+        logger.info("Jev route effective message_id=%s action=%s", message.message_id, effective)
     return effective
 
 

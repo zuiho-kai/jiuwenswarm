@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -81,10 +82,18 @@ async def test_request_uses_native_choice_and_only_public_snapshot(endpoint):
     ("INTERRUPT", 0.7, 0.6, "INTERRUPT"),
     ("INTERRUPT", 0.5, 0.9, "APPEND"),
 ])
-async def test_interrupt_probability_gate(endpoint, action, probability, threshold, expected):
+async def test_interrupt_probability_gate(endpoint, monkeypatch, action, probability, threshold, expected):
     endpoint.payload = answer(action, probability)
+    log = Mock()
+    monkeypatch.setattr(jev.logger, "info", log)
     assert await jev.classify_jev(SNAPSHOT, MESSAGES, settings={"interrupt_threshold": threshold}) == {
         "action": expected}
+    fmt, *args = log.call_args.args
+    rendered = fmt % tuple(args)
+    assert f"choice={action} effective={expected}" in rendered
+    assert "p_interrupt=" in rendered
+    assert "test-only-secret" not in rendered
+    assert MESSAGES[0].content not in rendered
 
 
 @pytest.mark.asyncio
@@ -123,11 +132,17 @@ async def test_invalid_threshold_prevents_request(endpoint, threshold):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [302, 401, 422, 429, 500, 529])
-async def test_http_failure_is_not_retried(endpoint, status):
+async def test_http_failure_is_not_retried(endpoint, monkeypatch, status):
     endpoint.status = status
+    log = Mock()
+    monkeypatch.setattr(jev.logger, "warning", log)
     result = await observe(SNAPSHOT, MESSAGES, classify=jev.classify_jev, current_snapshot=lambda: SNAPSHOT)
     assert result.status == "error"
     assert result.attempts == len(endpoint.requests) == 1
+    fmt, *args = log.call_args.args
+    rendered = fmt % tuple(args)
+    assert f"status_code={status}" in rendered
+    assert "test-only-secret" not in rendered
 
 
 @pytest.mark.asyncio

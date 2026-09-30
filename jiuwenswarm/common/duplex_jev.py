@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ DEFAULT_MODEL = "jev-1.13.0"
 DEFAULT_API_BASE = "https://api.typesafe.ai/v1"
 DEFAULT_TIMEOUT_SECONDS = 2.0
 DEFAULT_INTERRUPT_THRESHOLD = 0.9
+logger = logging.getLogger(__name__)
 
 
 def _probability(value: Any) -> float:
@@ -47,6 +49,8 @@ def _decision(payload: Any, threshold: float) -> dict[str, str]:
     if chosen < max(append, interrupt):
         raise ValueError("Jev choice disagrees with its probabilities")
     action = "INTERRUPT" if answer["choice"] == "INTERRUPT" and interrupt >= threshold else "APPEND"
+    logger.info("Jev decision choice=%s effective=%s p_interrupt=%.4f p_append=%.4f threshold=%.4f",
+                answer["choice"], action, interrupt, append, threshold)
     return {"action": action}
 
 
@@ -101,5 +105,12 @@ async def classify_jev(
             response = await client.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=request)
             response.raise_for_status()
             return _decision(response.json(), threshold)
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Jev request failed status_code=%s", exc.response.status_code)
+        raise
     except httpx.TimeoutException as exc:
+        logger.warning("Jev request timed out")
         raise TimeoutError("Jev request timed out") from exc
+    except Exception as exc:
+        logger.warning("Jev request or response failed error_type=%s", type(exc).__name__)
+        raise
