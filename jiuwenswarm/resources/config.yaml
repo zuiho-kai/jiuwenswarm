@@ -11,6 +11,14 @@ preferred_language: zh
 # ToolCard 自己显式声明的 exposure 优先级更高。
 progressive_tool_enabled: true
 
+# Native A2A / U2A 输入路由；修改 mode 后重启团队。
+duplex_router:
+  mode: "off"  # off / shadow / active
+  policy: model  # model / always_interrupt / steer / serial（后两项用于对照）
+  backend: sdk  # sdk / jev / mindshub
+  model_name: ""
+  timeout_seconds: 2.0
+
 # Web 首次模型配置引导；用户确认完成后会自动关闭，可通过侧栏问号再次打开
 setup_guide:
   enabled: true
