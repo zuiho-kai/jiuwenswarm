@@ -114,6 +114,7 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     if not use_steer or policy in ("serial", "steer") or snapshot is None:
         return await steer()
     model_name = str(config.get("model_name") or "")
+    classifier = str(config.get("classifier") or "sdk")
 
     async def classify(state, messages):
         record_input = getattr(host, "record_duplex_input", None)
@@ -121,11 +122,22 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
             record_input(state, messages)
         if policy == "always_interrupt":
             return {"action": "INTERRUPT"}
+        if classifier == "clef":
+            from jiuwenswarm.common.duplex_clef import classify_clef
+
+            return await classify_clef(state, messages, settings=config.get("clef"),
+                                       timeout_seconds=config.get("timeout_seconds"))
+        if classifier != "sdk":
+            raise ValueError(f"unsupported duplex classifier: {classifier}")
         return await classify_input(host, model_name, state, messages)
 
     try:
         timeout = config.get("timeout_seconds")
-        if timeout is None and policy != "always_interrupt":
+        if timeout is None and policy != "always_interrupt" and classifier == "clef":
+            from jiuwenswarm.common.duplex_clef import clef_timeout
+
+            timeout = clef_timeout(config.get("clef"))
+        elif timeout is None and policy != "always_interrupt" and classifier == "sdk":
             timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
         timeout = float(timeout) if timeout is not None else None
         observation = await observe(snapshot, (message,), classify=classify,

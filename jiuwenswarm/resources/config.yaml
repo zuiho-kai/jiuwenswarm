@@ -9,8 +9,13 @@ preferred_language: zh
 duplex_router:
   mode: "off"  # off / shadow / active
   policy: model  # model / always_interrupt / steer / serial（后两项用于对照）
+  classifier: sdk  # sdk：团队模型池里的 model_name；clef：Cloudflare Clef 决策模型
   model_name: ""
   timeout_seconds: 2.0
+  clef:
+    model: clef  # clef / clef-flash
+    interrupt_threshold: 0.9  # 低于该概率的 INTERRUPT 按 APPEND 处理
+    # 账号和令牌只从环境变量读取：CLOUDFLARE_ACCOUNT_ID、CLOUDFLARE_AUTH_TOKEN
 
 # Agent 模式是否启用渐进式工具暴露（tool_search + deferred 工具）
 # true：只向模型暴露 direct 工具和 tool_search，其他工具按需搜索；
