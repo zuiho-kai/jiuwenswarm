@@ -130,7 +130,7 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
             from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
 
             timeout = DEFAULT_TIMEOUT_SECONDS
-        elif classifier == "clef":
+        elif backend == "clef" or classifier == "clef":
             from jiuwenswarm.common.duplex_clef import clef_timeout
 
             timeout = clef_timeout(config.get("clef"))
@@ -149,13 +149,13 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
 
             return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
                                       settings=config.get("jev"), timeout_seconds=timeout)
-        if backend != "sdk":
-            raise ValueError("unsupported duplex router backend")
-        if classifier == "clef":
+        if backend == "clef" or (backend == "sdk" and classifier == "clef"):
             from jiuwenswarm.common.duplex_clef import classify_clef
 
             return await classify_clef(state, messages, settings=config.get("clef"),
                                        timeout_seconds=timeout)
+        if backend != "sdk":
+            raise ValueError("unsupported duplex router backend")
         if classifier != "sdk":
             raise ValueError(f"unsupported duplex classifier: {classifier}")
         return await classify_input(host, model_name, state, messages)

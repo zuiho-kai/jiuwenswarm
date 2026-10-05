@@ -322,6 +322,8 @@
       "skills": "技能",
       "webSearch": "网页搜索",
       "mediaTools": "工具",
+      "a2aDuplexRouter": "A2A 双工监工",
+      "a2aDuplexRouterDescription": "配置 Agent 间的双工路由与监工决策。密钥只通过环境变量读取，不会保存到配置文件。",
       "vision": "图片处理",
       "visionDescription": "启用后可处理图片内容；关闭后保留已有模型配置。",
       "visionConfigTitle": "配置图片处理模型",
@@ -341,6 +343,19 @@
       "deleteModelTitle": "删除模型配置",
       "deleteModelConfirm": "将删除{{name}}已保存的模型配置；如果该能力当前已启用，将同步关闭。",
       "team": "智能体团队"
+    },
+    "options": {
+      "duplexRouterModeOff": "关闭",
+      "duplexRouterModeShadow": "影子模式（仅观察）",
+      "duplexRouterModeActive": "启用主动监工",
+      "duplexRouterBackendSdk": "内置 SDK",
+      "duplexRouterBackendJev": "Jev",
+      "duplexRouterBackendMindshub": "Mindshub",
+      "duplexRouterBackendClef": "Cloudflare Clef",
+      "duplexRouterPolicyModel": "由模型决定",
+      "duplexRouterPolicyAlwaysInterrupt": "始终允许打断",
+      "duplexRouterPolicySteer": "仅引导当前 Agent",
+      "duplexRouterPolicySerial": "串行处理"
     },
     "browser": {
       "runtime": "浏览器运行配置",
@@ -451,6 +466,58 @@
       "task_asr_enabled": {
         "title": "语音转写",
         "description": "开启后，任务对话可以使用麦克风进行语音转写。"
+      },
+      "duplex_router_mode": {
+        "title": "A2A 监工模式",
+        "description": "关闭、只记录决策，或允许监工主动干预 Agent 对话。"
+      },
+      "duplex_router_policy": {
+        "title": "监工策略",
+        "description": "决定监工输出如何影响当前 Agent 流程。"
+      },
+      "duplex_router_backend": {
+        "title": "监工后端",
+        "description": "选择内置 SDK、Jev、Mindshub 或 Cloudflare Clef。"
+      },
+      "duplex_router_model_name": {
+        "title": "监工模型名称",
+        "description": "发送给监工后端的模型标识，例如 jev-1.13.0。",
+        "placeholder": "例如：jev-1.13.0"
+      },
+      "duplex_router_timeout_seconds": {
+        "title": "决策超时（秒）",
+        "description": "单次监工决策允许的最长等待时间。",
+        "placeholder": "例如：8"
+      },
+      "duplex_router_interrupt_threshold": {
+        "title": "打断阈值",
+        "description": "监工判定需要打断时使用的置信度阈值，范围为 0.5 到 1。",
+        "placeholder": "例如：0.8"
+      },
+      "duplex_router_api_base": {
+        "title": "监工 API 地址",
+        "description": "Jev/Mindshub/Clef 后端的 API 基地址。",
+        "placeholder": "例如：https://api.mindshub.ai/v1"
+      },
+      "duplex_router_endpoint_path": {
+        "title": "决策接口路径",
+        "description": "相对于 API 地址的决策接口路径。",
+        "placeholder": "例如：decisions"
+      },
+      "duplex_router_api_key_env": {
+        "title": "API Key 环境变量名",
+        "description": "服务启动环境中保存 API Key 的变量名，不填写密钥本身。",
+        "placeholder": "例如：MINDSHUB_API_KEY"
+      },
+      "duplex_router_account_id_env": {
+        "title": "Cloudflare 账号环境变量名",
+        "description": "Cloudflare Clef 使用的账号 ID 环境变量名。",
+        "placeholder": "例如：CLOUDFLARE_ACCOUNT_ID"
+      },
+      "duplex_router_model": {
+        "title": "Clef 模型名称",
+        "description": "Cloudflare Clef 使用的模型名称。",
+        "placeholder": "例如：@cf/meta/llama-3.1-8b-instruct"
       },
       "skill_evolution": { "title": "本地技能自动演进与沉淀", "description": "控制本地技能的自动演进和沉淀" },
       "symphony_evolution_enabled": {

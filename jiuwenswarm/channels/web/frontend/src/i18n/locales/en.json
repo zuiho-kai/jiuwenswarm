@@ -322,6 +322,8 @@
       "skills": "Skills",
       "webSearch": "Web search",
       "mediaTools": "Tools",
+      "a2aDuplexRouter": "A2A duplex supervisor",
+      "a2aDuplexRouterDescription": "Configure duplex routing and supervision decisions between Agents. Keys are read from environment variables and are never stored in the config file.",
       "vision": "Image processing",
       "visionDescription": "Enable image processing; disabling it keeps the saved model configuration.",
       "visionConfigTitle": "Configure image processing model",
@@ -341,6 +343,19 @@
       "deleteModelTitle": "Delete model configuration",
       "deleteModelConfirm": "This deletes the saved model configuration for {{name}} and turns the capability off if it is currently enabled.",
       "team": "Agent team"
+    },
+    "options": {
+      "duplexRouterModeOff": "Off",
+      "duplexRouterModeShadow": "Shadow mode (observe only)",
+      "duplexRouterModeActive": "Active supervision",
+      "duplexRouterBackendSdk": "Built-in SDK",
+      "duplexRouterBackendJev": "Jev",
+      "duplexRouterBackendMindshub": "Mindshub",
+      "duplexRouterBackendClef": "Cloudflare Clef",
+      "duplexRouterPolicyModel": "Model decides",
+      "duplexRouterPolicyAlwaysInterrupt": "Always allow interruption",
+      "duplexRouterPolicySteer": "Steer the current Agent only",
+      "duplexRouterPolicySerial": "Process serially"
     },
     "browser": {
       "runtime": "Browser runtime",
@@ -451,6 +466,58 @@
       "task_asr_enabled": {
         "title": "Speech transcription",
         "description": "Enable microphone speech transcription in task conversations."
+      },
+      "duplex_router_mode": {
+        "title": "A2A supervision mode",
+        "description": "Disable supervision, record decisions only, or allow the supervisor to intervene in Agent conversations."
+      },
+      "duplex_router_policy": {
+        "title": "Supervision policy",
+        "description": "Controls how supervisor decisions affect the current Agent workflow."
+      },
+      "duplex_router_backend": {
+        "title": "Supervisor backend",
+        "description": "Choose the built-in SDK, Jev, Mindshub, or Cloudflare Clef."
+      },
+      "duplex_router_model_name": {
+        "title": "Supervisor model name",
+        "description": "Model identifier sent to the supervisor backend, for example jev-1.13.0.",
+        "placeholder": "e.g. jev-1.13.0"
+      },
+      "duplex_router_timeout_seconds": {
+        "title": "Decision timeout (seconds)",
+        "description": "Maximum time allowed for one supervision decision.",
+        "placeholder": "e.g. 8"
+      },
+      "duplex_router_interrupt_threshold": {
+        "title": "Interruption threshold",
+        "description": "Confidence threshold for an interruption decision, from 0.5 to 1.",
+        "placeholder": "e.g. 0.8"
+      },
+      "duplex_router_api_base": {
+        "title": "Supervisor API URL",
+        "description": "API base URL for the Jev, Mindshub, or Clef backend.",
+        "placeholder": "e.g. https://api.mindshub.ai/v1"
+      },
+      "duplex_router_endpoint_path": {
+        "title": "Decision endpoint path",
+        "description": "Decision endpoint path relative to the API URL.",
+        "placeholder": "e.g. decisions"
+      },
+      "duplex_router_api_key_env": {
+        "title": "API key environment variable",
+        "description": "Name of the environment variable containing the API key; do not enter the key itself.",
+        "placeholder": "e.g. MINDSHUB_API_KEY"
+      },
+      "duplex_router_account_id_env": {
+        "title": "Cloudflare account environment variable",
+        "description": "Environment variable name for the Cloudflare account ID used by Clef.",
+        "placeholder": "e.g. CLOUDFLARE_ACCOUNT_ID"
+      },
+      "duplex_router_model": {
+        "title": "Clef model name",
+        "description": "Model name used by Cloudflare Clef.",
+        "placeholder": "e.g. @cf/meta/llama-3.1-8b-instruct"
       },
       "skill_evolution": {
         "title": "Automatic evolution and retention of local skills",

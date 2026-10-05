@@ -23,6 +23,7 @@ import importlib.metadata
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -47,6 +48,7 @@ from jiuwenswarm.common.config import (
     update_a2ui_in_config,
     update_context_engine_enabled_in_config,
     update_default_model_provider_in_config,
+    update_duplex_router_in_config,
     update_enable_free_models_in_config,
     update_external_cli_agents_in_config,
     update_kv_cache_affinity_enabled_in_config,
@@ -205,6 +207,8 @@ class ConfigChangeSet:
                 scopes.add("web_ui")
             elif key_text.startswith("a2ui_") or key_text == "setup_guide_enabled":
                 scopes.add("web_ui")
+            elif key_text.startswith("duplex_router_"):
+                scopes.add("team")
             else:
                 scopes.add("agent_runtime")
         if self.force and not scopes:
@@ -338,6 +342,17 @@ CONFIG_KEYS = tuple(CONFIG_SET_ENV_MAP.keys())
 
 # 来自 config.yaml 的配置项（前端 param 名 -> config.yaml 路径）
 CONFIG_YAML_KEYS = frozenset({
+    "duplex_router_mode",
+    "duplex_router_policy",
+    "duplex_router_backend",
+    "duplex_router_model_name",
+    "duplex_router_timeout_seconds",
+    "duplex_router_interrupt_threshold",
+    "duplex_router_api_base",
+    "duplex_router_endpoint_path",
+    "duplex_router_api_key_env",
+    "duplex_router_account_id_env",
+    "duplex_router_model",
     "context_engine_enabled",
     "kv_cache_affinity_enabled",
     "permissions_enabled",
@@ -1117,6 +1132,64 @@ def preserve_deleted_team_entities(params: dict[str, Any]) -> None:
         )
 
 
+def update_duplex_router_setting(param_key: str, value: Any) -> None:
+    """Validate and persist one flat Settings-panel duplex field."""
+    raw_value = str(value if value is not None else "").strip()
+    field_map = {
+        "duplex_router_mode": ("mode", {"off", "shadow", "active"}),
+        "duplex_router_policy": ("policy", {"model", "always_interrupt", "steer", "serial"}),
+        "duplex_router_backend": ("backend", {"sdk", "jev", "mindshub", "clef"}),
+    }
+    if param_key in field_map:
+        field, allowed = field_map[param_key]
+        if raw_value not in allowed:
+            raise ConfigPanelBadRequest(f"invalid duplex router {field}")
+        if field == "backend" and raw_value == "clef":
+            update_duplex_router_in_config({"backend": "clef", "classifier": "clef"})
+        elif field == "backend":
+            update_duplex_router_in_config({"backend": raw_value, "classifier": "sdk"})
+        else:
+            update_duplex_router_in_config({field: raw_value})
+        return
+    if param_key == "duplex_router_timeout_seconds":
+        try:
+            number = float(raw_value)
+        except ValueError as exc:
+            raise ConfigPanelBadRequest("duplex timeout must be positive") from exc
+        if not math.isfinite(number) or number <= 0:
+            raise ConfigPanelBadRequest("duplex timeout must be positive")
+        update_duplex_router_in_config({"timeout_seconds": number})
+        return
+    if param_key == "duplex_router_interrupt_threshold":
+        try:
+            number = float(raw_value)
+        except ValueError as exc:
+            raise ConfigPanelBadRequest("interrupt threshold must be between 0.5 and 1") from exc
+        if not math.isfinite(number) or number <= 0.5 or number > 1:
+            raise ConfigPanelBadRequest("interrupt threshold must be between 0.5 and 1")
+        update_duplex_router_in_config({"interrupt_threshold": number,
+                                        "jev": {"interrupt_threshold": number},
+                                        "mindshub": {"interrupt_threshold": number},
+                                        "clef": {"interrupt_threshold": number}})
+        return
+    if param_key == "duplex_router_model_name":
+        update_duplex_router_in_config({"model_name": raw_value})
+        return
+    if param_key in {"duplex_router_api_base", "duplex_router_endpoint_path", "duplex_router_api_key_env"}:
+        key = {"duplex_router_api_base": "api_base", "duplex_router_endpoint_path": "endpoint_path",
+               "duplex_router_api_key_env": "api_key_env"}[param_key]
+        if param_key == "duplex_router_endpoint_path":
+            update_duplex_router_in_config({"jev": {key: raw_value}})
+        else:
+            update_duplex_router_in_config({"jev": {key: raw_value},
+                                            "mindshub": {key: raw_value},
+                                            "clef": {key: raw_value}})
+        return
+    if param_key in {"duplex_router_account_id_env", "duplex_router_model"}:
+        key = {"duplex_router_account_id_env": "account_id_env", "duplex_router_model": "model"}[param_key]
+        update_duplex_router_in_config({"clef": {key: raw_value}})
+
+
 def apply_config_payload(
     params: dict[str, Any],
     *,
@@ -1286,6 +1359,8 @@ def apply_config_payload(
             elif param_key == "proactive_recommendation_max_rounds_per_tick":
                 n = validate_proactive_int(val, name="每次检查对话轮数(max_rounds_per_tick)")
                 update_proactive_recommendation_in_config({"max_rounds_per_tick": n})
+            elif param_key.startswith("duplex_router_"):
+                update_duplex_router_setting(param_key, val)
             yaml_updated.append(param_key)
         except ConfigPanelBadRequest:
             # proactive 数值校验等：直接返回前端，不被外层吞成 warning
@@ -1488,6 +1563,37 @@ async def config_get_handler(
         if not payload.get("free_search_bing_enabled"):
             payload["free_search_bing_enabled"] = "false"
         payload.update(flatten_modes_team_for_config_panel(raw))
+        duplex = raw.get("duplex_router") or {}
+        jev = duplex.get("jev") or {}
+        mindshub = duplex.get("mindshub") or {}
+        clef = duplex.get("clef") or {}
+        backend = str(duplex.get("backend", "sdk"))
+        if backend == "sdk" and str(duplex.get("classifier") or "sdk") == "clef":
+            backend = "clef"
+        payload.update({
+            "duplex_router_mode": str(duplex.get("mode", "off")),
+            "duplex_router_policy": str(duplex.get("policy", "model")),
+            "duplex_router_backend": backend,
+            "duplex_router_model_name": str(duplex.get("model_name", "")),
+            "duplex_router_timeout_seconds": str(duplex.get("timeout_seconds", "2.0")),
+            "duplex_router_interrupt_threshold": str(
+                (jev.get("interrupt_threshold") if backend == "jev" else
+                 mindshub.get("interrupt_threshold") if backend == "mindshub" else
+                 clef.get("interrupt_threshold") if backend == "clef" else
+                 duplex.get("interrupt_threshold", "0.9"))),
+            "duplex_router_api_base": str(
+                (jev.get("api_base") if backend == "jev" else
+                 mindshub.get("api_base") if backend == "mindshub" else
+                 clef.get("api_base") if backend == "clef" else "")),
+            "duplex_router_endpoint_path": str(jev.get("endpoint_path", "systemone")),
+            "duplex_router_api_key_env": str(
+                (jev.get("api_key_env") if backend == "jev" else
+                 mindshub.get("api_key_env") if backend == "mindshub" else
+                 clef.get("api_key_env") if backend == "clef" else
+                 jev.get("api_key_env", "TYPESAFE_API_KEY"))),
+            "duplex_router_account_id_env": str(clef.get("account_id_env", "CLOUDFLARE_ACCOUNT_ID")),
+            "duplex_router_model": str(clef.get("model", "clef")),
+        })
         # Proactive recommendation — use resolved config (env vars expanded)
         resolved = get_config()
         proactive_cfg = resolved.get("proactive_recommendation") or {}
@@ -1515,6 +1621,17 @@ async def config_get_handler(
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("task_full_duplex_enabled", "false")
         payload.setdefault("task_asr_enabled", "false")
+        payload.setdefault("duplex_router_mode", "off")
+        payload.setdefault("duplex_router_policy", "model")
+        payload.setdefault("duplex_router_backend", "sdk")
+        payload.setdefault("duplex_router_model_name", "")
+        payload.setdefault("duplex_router_timeout_seconds", "2.0")
+        payload.setdefault("duplex_router_interrupt_threshold", "0.9")
+        payload.setdefault("duplex_router_api_base", "")
+        payload.setdefault("duplex_router_endpoint_path", "systemone")
+        payload.setdefault("duplex_router_api_key_env", "TYPESAFE_API_KEY")
+        payload.setdefault("duplex_router_account_id_env", "CLOUDFLARE_ACCOUNT_ID")
+        payload.setdefault("duplex_router_model", "clef")
         for key, (_, value_type, default) in {
             **SYMPHONY_CONFIG_SPECS,
             **SKILL_RETRIEVAL_CONFIG_SPECS,
