@@ -6,9 +6,42 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable
+
+
+DUPLEX_ROUTER_API_KEY_ENV = "DUPLEX_ROUTER_API_KEY"
+
+
+def env_secret(name: str) -> str:
+    """Read a router credential from the process environment.
+
+    Settings stores the value through the same .env path as other API keys.
+    When a crypto provider is active, that path saves ciphertext and this
+    restores the original value. A missing provider keeps the stored text.
+    """
+    value = os.environ.get(name, "")
+    if not isinstance(value, str):
+        value = ""
+    value = value.strip()
+    if not value:
+        return ""
+    lowered = name.lower()
+    if "api_key" not in lowered and "token" not in lowered:
+        return value
+    try:
+        from jiuwenswarm.common.security.base_crypto import get_crypto_provider
+
+        crypto = get_crypto_provider()
+        if crypto is not None:
+            decrypted = crypto.decrypt(value)
+            if isinstance(decrypted, str) and decrypted.strip():
+                return decrypted.strip()
+    except Exception:
+        return value
+    return value
 
 
 @dataclass(frozen=True)

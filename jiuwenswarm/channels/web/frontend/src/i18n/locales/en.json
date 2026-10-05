@@ -504,10 +504,10 @@
         "description": "Decision endpoint path relative to the API URL.",
         "placeholder": "e.g. decisions"
       },
-      "duplex_router_api_key_env": {
-        "title": "API key environment variable",
-        "description": "Name of the environment variable containing the API key; do not enter the key itself.",
-        "placeholder": "e.g. MINDSHUB_API_KEY"
+      "duplex_router_api_key": {
+        "title": "API key",
+        "description": "Saved with the other API keys. Restart the team after changing it.",
+        "placeholder": ""
       },
       "duplex_router_account_id_env": {
         "title": "Cloudflare account environment variable",

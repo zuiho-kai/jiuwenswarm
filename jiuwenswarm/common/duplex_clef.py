@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage, prompt_for
+from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage, env_secret, prompt_for
 
 DEFAULT_MODEL = "clef"
 DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4"
@@ -101,7 +101,7 @@ def _request(snapshot: ControlSnapshot, messages: tuple[InboundMessage, ...], se
         raise ValueError("invalid Clef model")
     key_env = str(settings.get("api_key_env") or "CLOUDFLARE_AUTH_TOKEN")
     account_env = str(settings.get("account_id_env") or "CLOUDFLARE_ACCOUNT_ID")
-    api_key = os.environ.get(key_env, "").strip()
+    api_key = env_secret(key_env)
     account_id = os.environ.get(account_env, "").strip()
     if not api_key:
         raise ValueError("Clef API token environment variable is empty or missing")

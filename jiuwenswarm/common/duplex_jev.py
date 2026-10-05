@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -15,6 +14,7 @@ from jiuwenswarm.common.duplex_router import (
     ROUTING_INSTRUCTIONS,
     ControlSnapshot,
     InboundMessage,
+    env_secret,
     state_for,
 )
 
@@ -76,7 +76,7 @@ async def classify_jev(
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("Jev timeout_seconds must be finite and positive")
     key_env = settings.get("api_key_env", "TYPESAFE_API_KEY")
-    api_key = os.environ.get(key_env, "").strip()
+    api_key = env_secret(str(key_env))
     if not api_key:
         raise ValueError("Jev API key environment variable is empty or missing")
     api_base = settings.get("api_base", DEFAULT_API_BASE).rstrip("/")

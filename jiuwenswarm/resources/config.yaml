@@ -16,11 +16,12 @@ duplex_router:
   clef:
     model: clef  # clef / clef-flash
     interrupt_threshold: 0.9  # 低于该概率的 INTERRUPT 按 APPEND 处理
-    # 账号和令牌只从环境变量读取：CLOUDFLARE_ACCOUNT_ID、CLOUDFLARE_AUTH_TOKEN
+    # 账号仍从 CLOUDFLARE_ACCOUNT_ID 读取。API Key 由设置页写入 .env 的 DUPLEX_ROUTER_API_KEY。
+    api_key_env: DUPLEX_ROUTER_API_KEY
   jev:
     api_base: https://api.typesafe.ai/v1
     endpoint_path: systemone  # systemone / decisions
-    api_key_env: TYPESAFE_API_KEY
+    api_key_env: DUPLEX_ROUTER_API_KEY
     interrupt_threshold: 0.9  # 低于该概率的 INTERRUPT 按 APPEND 处理
 
 # Agent 模式是否启用渐进式工具暴露（tool_search + deferred 工具）

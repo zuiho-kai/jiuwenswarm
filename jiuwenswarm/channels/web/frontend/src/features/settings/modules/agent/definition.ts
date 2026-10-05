@@ -80,7 +80,7 @@ export const agentModule: SettingsModuleDefinition = {
         { id: 'duplex-router-threshold', component: 'input', key: 'duplex_router_interrupt_threshold' },
         { id: 'duplex-router-api-base', component: 'input', key: 'duplex_router_api_base' },
         { id: 'duplex-router-endpoint', component: 'input', key: 'duplex_router_endpoint_path' },
-        { id: 'duplex-router-api-key-env', component: 'input', key: 'duplex_router_api_key_env' },
+        { id: 'duplex-router-api-key', component: 'input', key: 'duplex_router_api_key', inputType: 'password' },
         { id: 'duplex-router-account-env', component: 'input', key: 'duplex_router_account_id_env' },
         { id: 'duplex-router-clef-model', component: 'input', key: 'duplex_router_model' },
       ],

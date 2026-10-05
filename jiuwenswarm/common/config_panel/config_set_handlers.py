@@ -321,6 +321,8 @@ CONFIG_SET_ENV_MAP = {
     "asr_api_base": "ASR_API_BASE",
     "asr_api_key": "ASR_API_KEY",
     "asr_model": "ASR_MODEL_NAME",
+    # Duplex supervisor key. The yaml only stores this variable name.
+    "duplex_router_api_key": "DUPLEX_ROUTER_API_KEY",
     # agents
     "skills": "SKILLS",
     "max_iterations": "MAX_ITERATIONS",
@@ -350,7 +352,6 @@ CONFIG_YAML_KEYS = frozenset({
     "duplex_router_interrupt_threshold",
     "duplex_router_api_base",
     "duplex_router_endpoint_path",
-    "duplex_router_api_key_env",
     "duplex_router_account_id_env",
     "duplex_router_model",
     "context_engine_enabled",
@@ -1175,9 +1176,8 @@ def update_duplex_router_setting(param_key: str, value: Any) -> None:
     if param_key == "duplex_router_model_name":
         update_duplex_router_in_config({"model_name": raw_value})
         return
-    if param_key in {"duplex_router_api_base", "duplex_router_endpoint_path", "duplex_router_api_key_env"}:
-        key = {"duplex_router_api_base": "api_base", "duplex_router_endpoint_path": "endpoint_path",
-               "duplex_router_api_key_env": "api_key_env"}[param_key]
+    if param_key in {"duplex_router_api_base", "duplex_router_endpoint_path"}:
+        key = {"duplex_router_api_base": "api_base", "duplex_router_endpoint_path": "endpoint_path"}[param_key]
         if param_key == "duplex_router_endpoint_path":
             update_duplex_router_in_config({"jev": {key: raw_value}})
         else:
@@ -1252,6 +1252,16 @@ def apply_config_payload(
             env_updates[env_key] = ""
         else:
             env_updates[env_key] = str(val).strip()
+
+    if "duplex_router_api_key" in params:
+        from jiuwenswarm.common.duplex_router import DUPLEX_ROUTER_API_KEY_ENV
+
+        update_duplex_router_in_config({
+            "jev": {"api_key_env": DUPLEX_ROUTER_API_KEY_ENV},
+            "mindshub": {"api_key_env": DUPLEX_ROUTER_API_KEY_ENV},
+            "clef": {"api_key_env": DUPLEX_ROUTER_API_KEY_ENV},
+        })
+        yaml_updated.append("duplex_router_api_key_env")
 
     raw = get_config_raw()
     preferred_lang = raw.get("preferred_language", "zh")
@@ -1586,11 +1596,6 @@ async def config_get_handler(
                  mindshub.get("api_base") if backend == "mindshub" else
                  clef.get("api_base") if backend == "clef" else "")),
             "duplex_router_endpoint_path": str(jev.get("endpoint_path", "systemone")),
-            "duplex_router_api_key_env": str(
-                (jev.get("api_key_env") if backend == "jev" else
-                 mindshub.get("api_key_env") if backend == "mindshub" else
-                 clef.get("api_key_env") if backend == "clef" else
-                 jev.get("api_key_env", "TYPESAFE_API_KEY"))),
             "duplex_router_account_id_env": str(clef.get("account_id_env", "CLOUDFLARE_ACCOUNT_ID")),
             "duplex_router_model": str(clef.get("model", "clef")),
         })
@@ -1629,7 +1634,7 @@ async def config_get_handler(
         payload.setdefault("duplex_router_interrupt_threshold", "0.9")
         payload.setdefault("duplex_router_api_base", "")
         payload.setdefault("duplex_router_endpoint_path", "systemone")
-        payload.setdefault("duplex_router_api_key_env", "TYPESAFE_API_KEY")
+        payload.setdefault("duplex_router_api_key", "")
         payload.setdefault("duplex_router_account_id_env", "CLOUDFLARE_ACCOUNT_ID")
         payload.setdefault("duplex_router_model", "clef")
         for key, (_, value_type, default) in {
