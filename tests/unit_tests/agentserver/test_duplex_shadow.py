@@ -283,3 +283,47 @@ async def test_jev_route_logs_observation_and_effective_action(
         original.assert_not_awaited()
     else:
         original.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision_result,expected", [
+    ({"action": "INTERRUPT"}, "INTERRUPT"),
+    ({"action": "APPEND"}, "APPEND"),
+    (RuntimeError("Clef unavailable"), "APPEND"),
+])
+async def test_clef_backend_routes_and_falls_back(
+        monkeypatch, decision_result, expected):
+    from jiuwenswarm.agents.harness.team import duplex_native
+    from jiuwenswarm.common import duplex_clef
+
+    class FakeNative:
+        _duplex_received = set()
+
+        def __init__(self):
+            self.interrupt = AsyncMock(return_value="INTERRUPT")
+
+    native = FakeNative()
+    classify = AsyncMock(side_effect=decision_result if isinstance(decision_result, Exception) else None,
+                         return_value=decision_result if isinstance(decision_result, dict) else None)
+    monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
+    monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
+    monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot())
+    monkeypatch.setattr(duplex_clef, "classify_clef", classify)
+    original = AsyncMock(return_value="sent")
+    config = {"mode": "active", "policy": "model", "backend": "clef",
+              "timeout_seconds": 1.5, "clef": {"model": "clef-flash"}}
+
+    result = await shadow.deliver_routed(
+        NS(harness=native), shadow.RoutedInput("Customer forbids Kafka", MESSAGES[0]),
+        use_steer=True, original=original, settings=config)
+
+    classify.assert_awaited_once()
+    assert classify.await_args.kwargs == {"settings": config["clef"], "timeout_seconds": 1.5}
+    if expected == "INTERRUPT":
+        assert result == "INTERRUPT"
+        native.interrupt.assert_awaited_once()
+        original.assert_not_awaited()
+    else:
+        assert result == "sent"
+        native.interrupt.assert_not_awaited()
+        original.assert_awaited_once()

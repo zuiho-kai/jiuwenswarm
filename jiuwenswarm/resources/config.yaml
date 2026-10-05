@@ -15,9 +15,13 @@ progressive_tool_enabled: true
 duplex_router:
   mode: "off"  # off / shadow / active
   policy: model  # model / always_interrupt / steer / serial（后两项用于对照）
-  backend: sdk  # sdk / jev / mindshub
+  backend: sdk  # sdk / jev / mindshub / clef
   model_name: ""
   timeout_seconds: 2.0
+  clef:
+    model: clef  # clef / clef-flash
+    interrupt_threshold: 0.9  # 低于该概率的 INTERRUPT 按 APPEND 处理
+    # 账号和令牌只从环境变量读取：CLOUDFLARE_ACCOUNT_ID、CLOUDFLARE_AUTH_TOKEN
 
 # Web 首次模型配置引导；用户确认完成后会自动关闭，可通过侧栏问号再次打开
 setup_guide:

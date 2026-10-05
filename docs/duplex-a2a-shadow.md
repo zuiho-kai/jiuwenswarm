@@ -57,6 +57,29 @@ duplex_router:
 2026-09-30 使用本机私有密钥实测六条路由样例：6/6 正确、0 次失败、0 次误中断，
 p50 约 1.79 秒、p95 约 2.09 秒。此结果仅验证小样本路由，不代表完整任务质量。
 
+## Cloudflare Clef 后端
+
+Cloudflare Clef 使用相同的 APPEND / INTERRUPT 路由契约，作为可选后端接入；
+不会自动替换现有 Jev 配置。在运行 agentserver 的环境中设置
+`CLOUDFLARE_ACCOUNT_ID` 和 `CLOUDFLARE_AUTH_TOKEN`，然后配置：
+
+```yaml
+duplex_router:
+  mode: active
+  policy: model
+  backend: clef
+  timeout_seconds: 2.0
+  clef:
+    model: clef  # 或 clef-flash
+    interrupt_threshold: 0.9
+```
+
+适配器向 Cloudflare Workers AI 的 `@cf/cloudflare/clef`（或 `clef-flash`）
+发送一次类型化 Choice 请求。账号与令牌只从环境变量读取，不写入仓库；
+HTTP 错误、超时、非法结果或过期快照仍按现有路由回退到 SDK steer。
+合并时只验证了模拟响应和路由链路，真实 Cloudflare 账户调用仍需单独验证。
+[Cloudflare Clef 文档](https://developers.cloudflare.com/workers-ai/models/clef/)。
+
 适配器仅发送已有 `goal / next_action / last_action / phase` 和消息的发送者、ID、原文，
 不发送完整上下文或隐藏推理。状态和消息会离开本机到达所配置的 API。
 同一套路由规则放入 `Choice.instructions`，选项固定为 `APPEND` 和 `INTERRUPT`。

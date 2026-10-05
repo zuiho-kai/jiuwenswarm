@@ -140,6 +140,11 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
 
             return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
                                       settings=config.get("jev"), timeout_seconds=timeout)
+        if backend == "clef":
+            from jiuwenswarm.common.duplex_clef import classify_clef
+
+            return await classify_clef(state, messages, settings=config.get("clef"),
+                                       timeout_seconds=timeout)
         if backend != "sdk":
             raise ValueError("unsupported duplex router backend")
         return await classify_input(host, model_name, state, messages)
@@ -155,6 +160,10 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
                 from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
 
                 timeout = DEFAULT_TIMEOUT_SECONDS
+            elif backend == "clef":
+                from jiuwenswarm.common.duplex_clef import clef_timeout
+
+                timeout = clef_timeout(config.get("clef"))
             elif backend == "sdk":
                 timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
         timeout = float(timeout) if timeout is not None else None
