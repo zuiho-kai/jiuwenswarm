@@ -17,6 +17,7 @@ from jiuwenswarm.common.duplex_router import (
     InboundMessage,
     state_for,
 )
+from jiuwenswarm.common.duplex_decision import action_from_answer, probability
 
 DEFAULT_MODEL = "jev-1.13.0"
 DEFAULT_API_BASE = "https://api.typesafe.ai/v1"
@@ -25,30 +26,13 @@ DEFAULT_INTERRUPT_THRESHOLD = 0.9
 logger = logging.getLogger(__name__)
 
 
-def _probability(value: Any) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or not 0 <= value <= 1):
-        raise ValueError("Jev probabilities and confidence must be finite numbers in [0, 1]")
-    return float(value)
-
-
 def _decision(payload: Any, threshold: float) -> dict[str, str]:
     """Reject malformed or contradictory answers before admitting an interrupt."""
     answer = payload["answers"]["action"]
-    if answer["type"] != "choice" or answer["choice"] not in ("APPEND", "INTERRUPT"):
-        raise ValueError("invalid Jev action choice")
+    action = action_from_answer(answer, threshold, provider="Jev")["action"]
     probabilities = answer["probabilities"]
-    if not isinstance(probabilities, dict) or set(probabilities) != {"APPEND", "INTERRUPT"}:
-        raise ValueError("invalid Jev action probabilities")
-    append = _probability(probabilities["APPEND"])
-    interrupt = _probability(probabilities["INTERRUPT"])
-    _probability(answer["confidence"])
-    if not math.isclose(append + interrupt, 1.0, rel_tol=0, abs_tol=1e-5):
-        raise ValueError("Jev action probabilities must sum to one")
-    chosen = probabilities[answer["choice"]]
-    if chosen < max(append, interrupt):
-        raise ValueError("Jev choice disagrees with its probabilities")
-    action = "INTERRUPT" if answer["choice"] == "INTERRUPT" and interrupt >= threshold else "APPEND"
+    append = probability(probabilities["APPEND"], provider="Jev")
+    interrupt = probability(probabilities["INTERRUPT"], provider="Jev")
     logger.info("Jev decision choice=%s effective=%s p_interrupt=%.4f p_append=%.4f threshold=%.4f",
                 answer["choice"], action, interrupt, append, threshold)
     return {"action": action}
@@ -70,7 +54,7 @@ async def classify_jev(
     """
     if settings is None:
         settings = {}
-    threshold = _probability(settings.get("interrupt_threshold", DEFAULT_INTERRUPT_THRESHOLD))
+    threshold = probability(settings.get("interrupt_threshold", DEFAULT_INTERRUPT_THRESHOLD), provider="Jev")
     if threshold <= 0.5:
         raise ValueError("Jev interrupt_threshold must be greater than 0.5 and at most 1")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
