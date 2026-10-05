@@ -42,6 +42,8 @@ class Endpoint:
     def __init__(self):
         self.calls = []
         self.fast_action = "INTERRUPT"
+        self.jev_probability = 0.95
+        self.jev_status = 200
         self.fast_error = False
         self.fast_gate = asyncio.Event()
         self.fast_gate.set()
@@ -115,6 +117,19 @@ class Endpoint:
         await response.write_eof()
         return response
 
+    async def handle_jev(self, request):
+        body = await request.json()
+        self.calls.append(body)
+        self.fast_entered.set()
+        await self.fast_gate.wait()
+        assert request.headers["Authorization"] == "Bearer local-jev-test"
+        assert body["questions"]["action"]["type"] == "choice"
+        probability = self.jev_probability if self.fast_action == "INTERRUPT" else 0.05
+        return web.json_response({"model": body["model"], "answers": {"action": {
+            "type": "choice", "choice": self.fast_action, "confidence": 0.8,
+            "probabilities": {"INTERRUPT": probability, "APPEND": 1 - probability},
+        }}}, status=self.jev_status)
+
     @staticmethod
     def tool_message(name, arguments):
         return {"role": "assistant", "content": None, "tool_calls": [{
@@ -181,6 +196,8 @@ async def world(tmp_path, monkeypatch, request):
     endpoint = Endpoint()
     app = web.Application()
     app.router.add_post("/v1/chat/completions", endpoint.handle)
+    app.router.add_post("/v1/systemone", endpoint.handle_jev)
+    app.router.add_post("/v1/decisions", endpoint.handle_jev)
     server = web.AppRunner(app, shutdown_timeout=0.1)
     await server.setup()
     site = web.TCPSite(server, "127.0.0.1", 0)
@@ -215,6 +232,18 @@ async def world(tmp_path, monkeypatch, request):
     messager = InProcessMessager()
     manager = TeamMessageManager(team_name="duplex", db=db, messager=messager, member_name="A1")
     host = Host(harness, fast)
+    if settings["duplex_router"].get("backend") == "jev":
+        jev_settings = {"api_base": f"http://127.0.0.1:{port}/v1",
+                        "api_key_env": "TEST_DUPLEX_JEV_KEY"}
+        if settings["duplex_router"].get("jev_provider") == "mindshub":
+            jev_settings["endpoint_path"] = "decisions"
+        settings["duplex_router"].update(model_name="jev-1.13.0", jev=jev_settings)
+        monkeypatch.setenv("TEST_DUPLEX_JEV_KEY", "local-jev-test")
+
+        def no_sdk_model(name):
+            raise AssertionError("Jev must not resolve a chat model")
+
+        host.tiny_agent_model_resolver = no_sdk_model
     blueprint = NS(role=TeamRole.LEADER, member_name="A2", language="en", team_spec=None)
     handler = MessageHandler(host, blueprint, NS(message_manager=manager, team_backend=None), NS())
     chunks = []
@@ -307,6 +336,8 @@ async def test_monitor_correction_invalidates_kafka_plan_before_redis_replan(wor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("world", [{}, {"backend": "jev", "timeout_seconds": None},
+                                   {"backend": "jev", "jev_provider": "mindshub"}], indirect=True)
 async def test_model_interrupt_keeps_original_task_tool_result_and_db_ack(world):
     w = world
     await w.harness.send("Implement the order event system with Kafka.")
@@ -327,7 +358,8 @@ async def test_model_interrupt_keeps_original_task_tool_result_and_db_ack(world)
     assert "Obsolete Kafka answer" not in recovered
     assert "Request cancelled by user" not in recovered
     assert any(getattr(c, "type", None) == "round_aborted" for c in w.chunks)
-    assert any(c["model"] == "fast" for c in w.endpoint.calls)
+    router_model = w.settings["duplex_router"]["model_name"]
+    assert sum(c["model"] == router_model for c in w.endpoint.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -382,6 +414,7 @@ async def test_interrupt_discards_partial_stream_without_executing_its_tool(worl
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("world", [{}, {"backend": "jev"}], indirect=True)
 async def test_interrupt_during_tool_waits_for_commit_and_does_not_repeat(world):
     w = world
     w.tool.gate.clear()
@@ -407,6 +440,7 @@ async def test_interrupt_during_tool_waits_for_commit_and_does_not_repeat(world)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("world", [{}, {"backend": "jev"}], indirect=True)
 async def test_append_during_tool_is_adopted_without_restart(world):
     w = world
     w.endpoint.fast_action = "APPEND"
@@ -422,6 +456,55 @@ async def test_append_during_tool_is_adopted_without_restart(world):
     w.tool.gate.set()
     await wait_until(lambda: w.harness.state is HarnessState.IDLE)
     assert w.native._st.round_id_counter == before
+    assert mid in json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("world", [{"backend": "jev"}], indirect=True)
+@pytest.mark.parametrize("scenario,status", [
+    ("uncertain", "ok"), ("overloaded", "error"), ("timeout", "timeout"),
+    ("stale", "stale"), ("missing_key", "error"), ("unknown_backend", "error"),
+])
+async def test_jev_fallback_preserves_message_and_tool_commit(world, monkeypatch, scenario, status):
+    w = world
+    observations = []
+    w.host.record_duplex_observation = observations.append
+    if scenario == "uncertain":
+        w.endpoint.jev_probability = 0.8
+    elif scenario == "overloaded":
+        w.endpoint.jev_status = 529
+    elif scenario == "missing_key":
+        monkeypatch.delenv("TEST_DUPLEX_JEV_KEY")
+    elif scenario == "unknown_backend":
+        w.settings["duplex_router"]["backend"] = "typo"
+    if scenario in ("timeout", "stale"):
+        w.endpoint.fast_gate.clear()
+    if scenario == "timeout":
+        w.settings["duplex_router"]["timeout_seconds"] = 0.25
+    w.endpoint.block_model = False
+    w.tool.gate.clear()
+    await w.harness.send("Research database options.")
+    await asyncio.wait_for(w.tool.entered.wait(), 6)
+    before = w.native.active_round.round_id
+    mid = await send_message(w)
+    drain = asyncio.create_task(poll_and_apply(w))
+    if scenario == "stale":
+        await asyncio.wait_for(w.endpoint.fast_entered.wait(), 3)
+        await w.harness.send("Also preserve audit logs.", immediate=True)
+        w.endpoint.fast_gate.set()
+    await asyncio.wait_for(drain, 3)
+    assert observations[0].status == status
+    assert observations[0].proposed_action != "INTERRUPT"
+    assert w.native.active_round.round_id == before
+    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
+    calls = [c for c in w.endpoint.calls if c["model"] == "jev-1.13.0"]
+    assert len(calls) == (0 if scenario in ("missing_key", "unknown_backend") else 1)
+    w.tool.gate.set()
+    w.endpoint.fast_gate.set()
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+    assert w.native._st.round_id_counter == before
+    assert w.tool.path.read_text() == "committed\n"
+    assert w.tool.cancelled == 0
     assert mid in json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1])
 
 

@@ -70,6 +70,12 @@ def main():
     parser.add_argument("cases", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--model-config", type=Path, help="JSON TeamModelConfig; keep credentials out of Git")
+    parser.add_argument("--backend", choices=("sdk", "jev"), default="sdk")
+    parser.add_argument("--jev-model", default="jev-1.13.0")
+    parser.add_argument("--jev-api-base", default="https://api.typesafe.ai/v1")
+    parser.add_argument("--jev-endpoint-path", choices=("systemone", "decisions"), default="systemone")
+    parser.add_argument("--jev-api-key-env", default="TYPESAFE_API_KEY")
+    parser.add_argument("--jev-interrupt-threshold", type=float, default=0.9)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
@@ -78,27 +84,48 @@ def main():
     if args.validate_only:
         print(json.dumps({"validated_cases": len(cases), "model_calls": 0}))
         return
-    if args.model_config is None or args.output is None:
-        parser.error("--model-config and --output are required for model replay")
+    if args.output is None:
+        parser.error("--output is required for model replay")
+    if args.backend == "jev":
+        if args.model_config is not None:
+            parser.error("--model-config is only supported by the sdk backend")
+        from jiuwenswarm.common.duplex_jev import classify_jev
+        from jiuwenswarm.common.utils import get_env_file
+        from jiuwenswarm.dotenv_early import load_dotenv_runtime
 
-    from openjiuwen.agent_teams import create_tiny_agent
-    from openjiuwen.agent_teams.schema.deep_agent_spec import TeamModelConfig
+        load_dotenv_runtime(get_env_file(), override=False)
+        model_name = args.jev_model
 
-    config = TeamModelConfig.model_validate(json.loads(args.model_config.read_text(encoding="utf-8")))
-    model_name = config.model_request_config.model_name
+        async def classify(snapshot, messages):
+            return await classify_jev(snapshot, messages, model_name=model_name,
+                settings={"api_base": args.jev_api_base, "endpoint_path": args.jev_endpoint_path,
+                          "api_key_env": args.jev_api_key_env,
+                          "interrupt_threshold": args.jev_interrupt_threshold},
+                timeout_seconds=args.timeout_seconds)
+    else:
+        if args.model_config is None:
+            parser.error("--model-config is required for sdk model replay")
+        from openjiuwen.agent_teams import create_tiny_agent
+        from openjiuwen.agent_teams.schema.deep_agent_spec import TeamModelConfig
 
-    async def classify(snapshot, messages):
-        async with create_tiny_agent(
-            system_prompt=SYSTEM_PROMPT, model_name=model_name,
-            model_resolver=lambda name: config if name == model_name else None,
-            default_schema=decision_schema(), name="duplex-replay",
-            language="en", max_iterations=1,
-        ) as agent:
-            return await agent.run(prompt_for(snapshot, messages))
+        config = TeamModelConfig.model_validate(json.loads(args.model_config.read_text(encoding="utf-8")))
+        model_name = config.model_request_config.model_name
+
+        async def classify(snapshot, messages):
+            async with create_tiny_agent(
+                system_prompt=SYSTEM_PROMPT, model_name=model_name,
+                model_resolver=lambda name: config if name == model_name else None,
+                default_schema=decision_schema(), name="duplex-replay",
+                language="en", max_iterations=1,
+            ) as agent:
+                return await agent.run(prompt_for(snapshot, messages))
 
     report = asyncio.run(replay(cases, classify, repeats=args.repeats,
                                timeout_seconds=args.timeout_seconds))
     report["model_name"] = model_name
+    report["backend"] = args.backend
+    if args.backend == "jev":
+        report["interrupt_threshold"] = args.jev_interrupt_threshold
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "observations"}))
 

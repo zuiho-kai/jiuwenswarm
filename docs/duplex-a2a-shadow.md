@@ -11,6 +11,36 @@ duplex_router:
 
 快模型总期限默认沿用该模型的 SDK timeout，可显式设置 `timeout_seconds`。
 
+## Jev 监工后端
+
+在运行 agentserver 的环境中设置 `TYPESAFE_API_KEY`。密钥只放在环境变量或私有 `config/.env`，不要提交。将工作区 `config/config.yaml` 改为：
+
+```yaml
+duplex_router:
+  mode: active
+  policy: model
+  backend: jev
+  model_name: jev-1.13.0
+  timeout_seconds: 2.0
+  jev:
+    api_base: https://api.typesafe.ai/v1
+    endpoint_path: systemone
+    api_key_env: TYPESAFE_API_KEY
+    interrupt_threshold: 0.9
+```
+
+`backend: jev` 走 TypeSafe 的 Choice 接口，不把 Jev 放进团队聊天模型池。省略 `backend` 或保持 `sdk` 时，仍使用 `classifier` 指定的团队模型或 Clef。`model_name` 留空时使用 `jev-1.13.0`。`endpoint_path` 只接受 `systemone` 或 `decisions`。
+
+适配器只发送 `goal`、`next_action`、`last_action`、`phase` 和消息的发送者、ID、原文。只有 `choice=INTERRUPT` 且 `probabilities.INTERRUPT` 不低于阈值才建议中断，否则按 APPEND。阈值必须大于 0.5 且不超过 1。HTTP 错误、非法响应和总超时都退回原来的 steer。
+
+```bash
+python -m jiuwenswarm.common.duplex_benchmark \
+  tests/fixtures/duplex/routing_cases.jsonl \
+  --backend jev --jev-model jev-1.13.0 \
+  --jev-interrupt-threshold 0.9 --timeout-seconds 2 \
+  --repeats 1 --output /tmp/duplex-jev-replay.json
+```
+
 | 结果 | 执行 |
 | --- | --- |
 | APPEND | 原 steer，下一次原有模型调用前注入 |

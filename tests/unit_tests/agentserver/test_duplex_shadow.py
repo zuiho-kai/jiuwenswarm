@@ -4,12 +4,12 @@ import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from jiuwenswarm.common.duplex_router import (
-    ControlSnapshot, InboundMessage, observe, prompt_for,
+    ControlSnapshot, InboundMessage, Observation, observe, prompt_for,
 )
 from jiuwenswarm.agents.harness.team import duplex_shadow as shadow
 
@@ -240,3 +240,46 @@ def test_prompt_preserves_full_messages_and_tail_constraints():
     assert len(payload["messages"]) == 32
     assert all(m["content"] == messages[i].content for i, m in enumerate(payload["messages"]))
     assert all(m["content"].endswith("DO NOT SEND") for m in payload["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proposed,status,interrupt_result,expected", [
+    ("INTERRUPT", "ok", "INTERRUPT", "action=INTERRUPT"),
+    ("APPEND", "ok", None, "action=APPEND reason=model_append"),
+    ("UNDECIDED", "timeout", None, "action=APPEND reason=timeout"),
+    ("INTERRUPT", "ok", "STALE", "action=APPEND reason=stale_at_commit"),
+])
+async def test_jev_route_logs_observation_and_effective_action(
+        monkeypatch, proposed, status, interrupt_result, expected):
+    from jiuwenswarm.agents.harness.team import duplex_native
+
+    class FakeNative:
+        _duplex_received = set()
+
+        def __init__(self):
+            self.interrupt = AsyncMock(return_value=interrupt_result)
+
+    native = FakeNative()
+    monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
+    monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
+    monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot())
+    monkeypatch.setattr(shadow, "observe", AsyncMock(return_value=Observation(
+        ("m204",), "v1", "r1", "c1", proposed, "UNCHANGED", status, 12.5, 1)))
+    log = Mock()
+    monkeypatch.setattr(shadow.logger, "info", log)
+    original = AsyncMock(return_value="sent")
+    content = shadow.RoutedInput("Customer forbids Kafka", MESSAGES[0])
+
+    await shadow.deliver_routed(NS(harness=native), content, use_steer=True,
+                                original=original, settings={"mode": "active", "policy": "model",
+                                                             "backend": "jev", "timeout_seconds": 2})
+
+    rendered = [call.args[0] % call.args[1:] for call in log.call_args_list]
+    assert any("Jev route observation message_id=m204" in line for line in rendered)
+    assert any(expected in line for line in rendered)
+    assert all("Customer forbids Kafka" not in line for line in rendered)
+    if expected == "action=INTERRUPT":
+        native.interrupt.assert_awaited_once()
+        original.assert_not_awaited()
+    else:
+        original.assert_awaited_once()

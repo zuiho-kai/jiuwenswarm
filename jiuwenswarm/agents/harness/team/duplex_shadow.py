@@ -100,7 +100,10 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     if config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness):
         return await original(host, str(content), use_steer=use_steer)
     message = content.message
+    backend = str(config.get("backend") or "sdk")
     if message.message_id in native._duplex_received:
+        if backend == "jev":
+            logger.info("Jev route duplicate message_id=%s", message.message_id)
         return
 
     async def steer():
@@ -112,9 +115,28 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     policy = config.get("policy", "model")
     snapshot = snapshot_from_native(native)
     if not use_steer or policy in ("serial", "steer") or snapshot is None:
+        if backend == "jev":
+            logger.info("Jev route bypass message_id=%s policy=%s use_steer=%s snapshot=%s",
+                        message.message_id, policy, use_steer, snapshot is not None)
         return await steer()
     model_name = str(config.get("model_name") or "")
     classifier = str(config.get("classifier") or "sdk")
+    if backend == "jev":
+        logger.info("Jev route start message_id=%s round_id=%s checkpoint_id=%s phase=%s",
+                    message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
+    timeout = config.get("timeout_seconds")
+    if timeout is None and policy != "always_interrupt":
+        if backend == "jev":
+            from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
+
+            timeout = DEFAULT_TIMEOUT_SECONDS
+        elif classifier == "clef":
+            from jiuwenswarm.common.duplex_clef import clef_timeout
+
+            timeout = clef_timeout(config.get("clef"))
+        elif backend == "sdk":
+            timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
+    timeout = float(timeout) if timeout is not None else None
 
     async def classify(state, messages):
         record_input = getattr(host, "record_duplex_input", None)
@@ -122,38 +144,54 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
             record_input(state, messages)
         if policy == "always_interrupt":
             return {"action": "INTERRUPT"}
+        if backend == "jev":
+            from jiuwenswarm.common.duplex_jev import DEFAULT_MODEL, classify_jev
+
+            return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
+                                      settings=config.get("jev"), timeout_seconds=timeout)
+        if backend != "sdk":
+            raise ValueError("unsupported duplex router backend")
         if classifier == "clef":
             from jiuwenswarm.common.duplex_clef import classify_clef
 
             return await classify_clef(state, messages, settings=config.get("clef"),
-                                       timeout_seconds=config.get("timeout_seconds"))
+                                       timeout_seconds=timeout)
         if classifier != "sdk":
             raise ValueError(f"unsupported duplex classifier: {classifier}")
         return await classify_input(host, model_name, state, messages)
 
     try:
-        timeout = config.get("timeout_seconds")
-        if timeout is None and policy != "always_interrupt" and classifier == "clef":
-            from jiuwenswarm.common.duplex_clef import clef_timeout
-
-            timeout = clef_timeout(config.get("clef"))
-        elif timeout is None and policy != "always_interrupt" and classifier == "sdk":
-            timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
-        timeout = float(timeout) if timeout is not None else None
         observation = await observe(snapshot, (message,), classify=classify,
             current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout)
     except Exception:
         logger.warning("duplex classification unavailable; using SDK steer", exc_info=True)
+        if backend == "jev":
+            logger.info("Jev route fallback message_id=%s reason=classification_exception effective=APPEND",
+                        message.message_id)
         return await steer()
     recorder = getattr(host, "record_duplex_observation", None)
     if recorder is not None:
         recorder(observation)
+    if backend == "jev":
+        logger.info("Jev route observation message_id=%s status=%s proposed=%s latency_ms=%.1f attempts=%d",
+                    message.message_id, observation.status, observation.proposed_action,
+                    observation.latency_ms, observation.attempts)
     if observation.status != "ok" or observation.proposed_action == "APPEND":
-        return await steer()
+        result = await steer()
+        if backend == "jev":
+            logger.info("Jev route effective message_id=%s action=APPEND reason=%s",
+                        message.message_id, observation.status if observation.status != "ok" else "model_append")
+        return result
     effective = await native.interrupt(str(content), version=observation.context_version,
                                        message_id=message.message_id)
     if effective == "STALE":
-        return await steer()
+        result = await steer()
+        if backend == "jev":
+            logger.info("Jev route effective message_id=%s action=APPEND reason=stale_at_commit",
+                        message.message_id)
+        return result
+    if backend == "jev":
+        logger.info("Jev route effective message_id=%s action=%s", message.message_id, effective)
     return effective
 
 
