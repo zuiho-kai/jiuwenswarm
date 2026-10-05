@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from jiuwenswarm.benchmarks.duplex_metrics import official_scores, summarize_events, paired_success
@@ -99,6 +100,31 @@ class Experiment:
                     self._report(reports)
                     previous = result
 
+    def a2asecbench(self):
+        from jiuwenswarm.benchmarks.a2asecbench import FAMILIES, orchestration_command, prepare
+        from jiuwenswarm.common.duplex_public_benchmark import REVISIONS
+
+        config = self.config
+        root = Path(config["repo"]).resolve()
+        revision = prepare(root)
+        python = Path(config.get("python") or sys.executable).resolve()
+        families = config.get("families") or ["as"]
+        if not isinstance(families, list) or not families or any(name not in FAMILIES for name in families):
+            raise ValueError(f"families must be chosen from {sorted(FAMILIES)}")
+        trials = int(config.get("trials", 1))
+        reports = []
+        for family in families:
+            records = self.output / family / "run.jsonl"
+            records.parent.mkdir(parents=True)
+            self.command(orchestration_command(root, python, family, records, trials),
+                         cwd=root, label=family)
+            summary_path = records.with_name("summary.json")
+            summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else None
+            reports.append({"family": family, "records": str(records), "summary": summary})
+        (self.output / "report.json").write_text(json.dumps(
+            {"benchmark": "a2asecbench", "revision": revision, "pinned": REVISIONS["a2asecbench"],
+             "runs": reports}, indent=2), encoding="utf-8")
+
     def agentradio(self):
         c = self.config
         root = Path(c["repo"]).resolve()
@@ -155,8 +181,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = read_json(args.config)
-    if config.get("benchmark") not in ("agentradio", "interruptbench"):
-        parser.error("benchmark must be agentradio or interruptbench")
+    if config.get("benchmark") not in ("agentradio", "interruptbench", "a2asecbench"):
+        parser.error("benchmark must be agentradio, interruptbench, or a2asecbench")
     experiment = Experiment(config, args.output)
     getattr(experiment, config["benchmark"])()
 
