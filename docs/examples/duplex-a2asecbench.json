@@ -1,0 +1,7 @@
+{
+  "benchmark": "a2asecbench",
+  "repo": "C:/Users/hiennoob/A2ASecBench",
+  "python": "C:/Users/hiennoob/jiuwenswarm/.venv/Scripts/python.exe",
+  "families": ["as"],
+  "trials": 1
+}

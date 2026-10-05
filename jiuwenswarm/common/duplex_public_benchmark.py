@@ -21,6 +21,7 @@ from typing import Any
 REVISIONS = {
     "agentradio": "5e4e137991ce5662d95cf890e534b5b223d24d6a",
     "interruptbench": "17da111e4858b93c0cab1d88f85e1735fbd1d423",
+    "a2asecbench": "e02109ebdcce3fe926884fbacbc935eef44e4aa3",
 }
 INTERRUPT_SUITES = ("1update", "2update", "2modification", "1retraction", "2retraction", "3mixed")
 
@@ -170,14 +171,30 @@ def load_official_interrupt(root: Path, *, suite: str, task_id: str,
     })
 
 
+def a2asecbench_manifest(root: Path) -> dict[str, Any]:
+    """Fingerprint the pinned runner and its official configs. Cases stay in the checkout."""
+    from jiuwenswarm.benchmarks.a2asecbench import FAMILIES
+
+    revision = verify_checkout(root, "a2asecbench")
+    paths = [root / "orchestration.py", *(root / spec["config"] for spec in FAMILIES.values())]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(f"a2asecbench: missing {missing}")
+    return {"benchmark": "a2asecbench", "revision": revision, "families": sorted(FAMILIES),
+            "files": {str(path.relative_to(root)).replace("\\", "/"): fingerprint(path) for path in paths}}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agentradio", type=Path, required=True)
     parser.add_argument("--interruptbench", type=Path, required=True)
+    parser.add_argument("--a2asecbench", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    report = {"status": "inputs_prepared_not_evaluated", "benchmarks": [
-        agentradio_manifest(args.agentradio), interruptbench_manifest(args.interruptbench)]}
+    benchmarks = [agentradio_manifest(args.agentradio), interruptbench_manifest(args.interruptbench)]
+    if args.a2asecbench is not None:
+        benchmarks.append(a2asecbench_manifest(args.a2asecbench))
+    report = {"status": "inputs_prepared_not_evaluated", "benchmarks": benchmarks}
     # Refuse to overwrite an earlier experiment manifest.
     with args.output.open("x", encoding="utf-8") as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)

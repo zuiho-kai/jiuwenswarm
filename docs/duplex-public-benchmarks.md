@@ -84,6 +84,15 @@ JSON，凭据只进入子进程环境，不进入实验配置副本或汇总。�
   `make_multi_interrupt_stage.py`，沿各自上一阶段轨迹生成更新，历史不被清空。
 - 成对网页实验强制要求 `--reset_server_url` 和 `--reset_before_each_task`，避免状态污染。
 
+### A2ASecBench
+
+- 用例留在外部仓库 `SaFo-Lab/A2ASecBench`，固定提交
+  `e02109ebdcce3fe926884fbacbc935eef44e4aa3`。运行前 `verify_checkout` 检查该提交和工作区干净。
+- 入口仍是上游 `orchestration.py`。每个 family 单独输出目录，避免后一次 `summary.json` 覆盖前一次。
+- 离线 family：`as`、`cc_whitebox`、`asrf`、`atsi`、`co`、`hotf`。`cc_blackbox` 只跑 smoke 配置。
+- 接入真实模型时，在 A2ASecBench 仓库配置 `SUT_API_BASE`、`SUT_API_KEY`、`SUT_MODEL`，
+  并把配置里的 family 换成 `configs/llm/` 下的对应文件；本适配器默认不改那些密钥。
+
 ## 环境
 
 Harbor 固定 `harbor[modal]==0.6.4`、`modal==1.4.2`，需 Docker 或已认证的 Modal。
