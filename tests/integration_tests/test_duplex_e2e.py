@@ -517,7 +517,10 @@ async def test_jev_fallback_preserves_message_and_tool_commit(world, monkeypatch
         w.endpoint.fast_gate.set()
     await asyncio.wait_for(drain, 3)
     assert observations[0].status == status
-    assert observations[0].proposed_action != "INTERRUPT"
+    if scenario == "stale":
+        assert observations[0].proposed_action == "INTERRUPT"
+    else:
+        assert observations[0].proposed_action != "INTERRUPT"
     assert w.native.active_round.round_id == before
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
     calls = [c for c in w.endpoint.calls if c["model"] == "jev-1.13.0"]

@@ -11,6 +11,8 @@ duplex_router:
 
 快模型总期限默认沿用该模型的 SDK timeout，可显式设置 `timeout_seconds`。
 
+`mode: shadow` 仍立即按原路径投递，不暂停慢模型。监工判断在后台继续，直到返回或到达 `timeout_seconds`。快照仍是当时那一版时状态为 `ok`；快照已经变化时状态为 `stale`，`proposed_action` 仍保留 `APPEND` 或 `INTERRUPT`。过期结果只记日志。这条观察不受下面的临时过期开关影响。
+
 ## 临时测试：禁用快照过期拦截（2026-10-05）
 
 `common/duplex_router.py` 中 `SNAPSHOT_FRESHNESS_CHECK_ENABLED = False` 暂时关闭

@@ -7,6 +7,7 @@ Only this adapter knows its MessageHandler and NativeHarness accessors.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -89,6 +90,126 @@ async def classify_input(host, model_name, snapshot, messages):
         return await agent.run(prompt_for(snapshot, messages))
 
 
+_SHADOW_TASKS: set[asyncio.Task] = set()
+
+
+def _decision_timeout(host, config, policy, backend, model_name):
+    timeout = config.get("timeout_seconds")
+    if timeout is None and policy != "always_interrupt":
+        if backend == "mindshub":
+            from jiuwenswarm.common.duplex_mindshub import DEFAULT_TIMEOUT_SECONDS
+
+            timeout = DEFAULT_TIMEOUT_SECONDS
+        elif backend == "jev":
+            from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
+
+            timeout = DEFAULT_TIMEOUT_SECONDS
+        elif backend == "clef":
+            from jiuwenswarm.common.duplex_clef import clef_timeout
+
+            timeout = clef_timeout(config.get("clef"))
+        elif backend == "sdk":
+            timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
+    return float(timeout) if timeout is not None else None
+
+
+def _classifier(host, config, policy, backend, model_name, timeout):
+    async def classify(state, messages):
+        record_input = getattr(host, "record_duplex_input", None)
+        if record_input is not None:
+            record_input(state, messages)
+        if policy == "always_interrupt":
+            return {"action": "INTERRUPT"}
+        if backend == "mindshub":
+            from jiuwenswarm.common.duplex_mindshub import DEFAULT_MODEL, classify_mindshub
+
+            return await classify_mindshub(state, messages, model_name=model_name or DEFAULT_MODEL,
+                                           settings=config.get("mindshub"), timeout_seconds=timeout)
+        if backend == "jev":
+            from jiuwenswarm.common.duplex_jev import DEFAULT_MODEL, classify_jev
+
+            return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
+                                      settings=config.get("jev"), timeout_seconds=timeout)
+        if backend == "clef":
+            from jiuwenswarm.common.duplex_clef import classify_clef
+
+            return await classify_clef(state, messages, settings=config.get("clef"),
+                                       timeout_seconds=timeout)
+        if backend != "sdk":
+            raise ValueError("unsupported duplex router backend")
+        return await classify_input(host, model_name, state, messages)
+
+    return classify
+
+
+async def drain_shadow_observations() -> None:
+    """Wait for in-flight shadow classifications. Delivery does not wait on them."""
+    while _SHADOW_TASKS:
+        await asyncio.gather(*tuple(_SHADOW_TASKS), return_exceptions=True)
+
+
+def _schedule_shadow(host, snapshot, message, classify, timeout, backend, native):
+    async def watch():
+        try:
+            observation = await observe(
+                snapshot, (message,), classify=classify,
+                current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout,
+                check_freshness=True)
+        except Exception as exc:
+            logger.warning("duplex shadow observation failed backend=%s message_id=%s error_type=%s",
+                           backend, message.message_id, type(exc).__name__)
+            return
+        recorder = getattr(host, "record_duplex_observation", None)
+        if recorder is not None:
+            recorder(observation)
+        logger.info("duplex shadow observation backend=%s message_id=%s status=%s proposed=%s "
+                    "latency_ms=%.1f attempts=%d",
+                    backend, message.message_id, observation.status, observation.proposed_action,
+                    observation.latency_ms, observation.attempts)
+
+    task = asyncio.create_task(watch(), name=f"duplex-shadow[{message.message_id}]")
+    _SHADOW_TASKS.add(task)
+    task.add_done_callback(_SHADOW_TASKS.discard)
+
+
+async def _deliver_shadow(host, content, *, use_steer, original, config, native, message, backend):
+    """Log the supervisor decision without delaying delivery or cancelling the worker."""
+    if native is None or not use_steer:
+        return await original(host, str(content), use_steer=use_steer)
+    policy = config.get("policy", "model")
+    if policy in ("serial", "steer"):
+        logger.info("duplex shadow bypass backend=%s message_id=%s reason=policy_bypass policy=%s",
+                    backend, message.message_id, policy)
+        return await original(host, str(content), use_steer=use_steer)
+    seen = getattr(host, "_shadow_seen", None)
+    if seen is None:
+        seen = set()
+        host._shadow_seen = seen
+    if message.message_id in seen:
+        logger.info("duplex shadow bypass backend=%s message_id=%s reason=duplicate",
+                    backend, message.message_id)
+        return
+    snapshot = snapshot_from_native(native)
+    if snapshot is None:
+        logger.info("duplex shadow bypass backend=%s message_id=%s reason=no_snapshot",
+                    backend, message.message_id)
+        return await original(host, str(content), use_steer=use_steer)
+    seen.add(message.message_id)
+    model_name = str(config.get("model_name") or "")
+    try:
+        timeout = _decision_timeout(host, config, policy, backend, model_name)
+        classify = _classifier(host, config, policy, backend, model_name, timeout)
+    except Exception as exc:
+        seen.discard(message.message_id)
+        logger.warning("duplex shadow bypass backend=%s message_id=%s reason=classification_exception "
+                       "error_type=%s", backend, message.message_id, type(exc).__name__)
+        return await original(host, str(content), use_steer=use_steer)
+    logger.info("duplex shadow start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
+                backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
+    _schedule_shadow(host, snapshot, message, classify, timeout, backend, native)
+    return await original(host, str(content), use_steer=use_steer)
+
+
 async def deliver_routed(host, content, *, use_steer, original, settings=None):
     from jiuwenswarm.common.config import get_config
     from .duplex_native import DuplexNativeHarness
@@ -104,6 +225,9 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
                 backend, config.get("mode", "off"),
                 getattr(getattr(host, "blueprint", None), "member_name", "unknown"),
                 message.message_id, message.sender, use_steer, type(native).__name__)
+    if config.get("mode") == "shadow":
+        return await _deliver_shadow(host, content, use_steer=use_steer, original=original,
+                                     config=config, native=native, message=message, backend=str(backend))
     if config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness):
         logger.info("duplex route bypass backend=%s message_id=%s reason=%s",
                     backend, message.message_id,
@@ -130,49 +254,9 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     logger.info("duplex route start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
                 backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
 
-    async def classify(state, messages):
-        record_input = getattr(host, "record_duplex_input", None)
-        if record_input is not None:
-            record_input(state, messages)
-        if policy == "always_interrupt":
-            return {"action": "INTERRUPT"}
-        if backend == "mindshub":
-            from jiuwenswarm.common.duplex_mindshub import DEFAULT_MODEL, classify_mindshub
-
-            return await classify_mindshub(state, messages, model_name=model_name or DEFAULT_MODEL,
-                                           settings=config.get("mindshub"), timeout_seconds=timeout)
-        if backend == "jev":
-            from jiuwenswarm.common.duplex_jev import DEFAULT_MODEL, classify_jev
-
-            return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
-                                      settings=config.get("jev"), timeout_seconds=timeout)
-        if backend == "clef":
-            from jiuwenswarm.common.duplex_clef import classify_clef
-
-            return await classify_clef(state, messages, settings=config.get("clef"),
-                                       timeout_seconds=timeout)
-        if backend != "sdk":
-            raise ValueError("unsupported duplex router backend")
-        return await classify_input(host, model_name, state, messages)
-
     try:
-        timeout = config.get("timeout_seconds")
-        if timeout is None and policy != "always_interrupt":
-            if backend == "mindshub":
-                from jiuwenswarm.common.duplex_mindshub import DEFAULT_TIMEOUT_SECONDS
-
-                timeout = DEFAULT_TIMEOUT_SECONDS
-            elif backend == "jev":
-                from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
-
-                timeout = DEFAULT_TIMEOUT_SECONDS
-            elif backend == "clef":
-                from jiuwenswarm.common.duplex_clef import clef_timeout
-
-                timeout = clef_timeout(config.get("clef"))
-            elif backend == "sdk":
-                timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
-        timeout = float(timeout) if timeout is not None else None
+        timeout = _decision_timeout(host, config, policy, backend, model_name)
+        classify = _classifier(host, config, policy, backend, model_name, timeout)
         observation = await observe(snapshot, (message,), classify=classify,
             current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout)
     except Exception as exc:

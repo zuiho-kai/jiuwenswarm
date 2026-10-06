@@ -87,6 +87,7 @@ async def observe(
     classify: Classify,
     current_snapshot: Callable[[], ControlSnapshot | None],
     timeout_seconds: float | None = None,
+    check_freshness: bool | None = None,
 ) -> Observation:
     """Classify once; snapshot freshness rejection is temporarily disabled."""
     if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
@@ -98,13 +99,15 @@ async def observe(
             attempts = 1
             result = await classify(snapshot, messages)
             candidate = validate_decision(result)
-            if not SNAPSHOT_FRESHNESS_CHECK_ENABLED:
+            freshness = (SNAPSHOT_FRESHNESS_CHECK_ENABLED if check_freshness is None else check_freshness)
+            if not freshness:
                 action = candidate
                 logger.info("duplex freshness check bypassed stage=observation message_ids=%s action=%s",
                             json.dumps([m.message_id for m in messages]), candidate)
             elif current_snapshot() == snapshot:
                 action = candidate
             else:
+                action = candidate
                 status = "stale"
     except TimeoutError:
         status = "timeout"
