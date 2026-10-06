@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable
@@ -75,6 +76,30 @@ def validate_decision(result: Any) -> str:
 
 Classify = Callable[[ControlSnapshot, tuple[InboundMessage, ...]], Awaitable[Any]]
 logger = logging.getLogger(__name__)
+
+
+def env_secret(name: str) -> str:
+    """Read a router credential, decrypting it when a crypto provider is active."""
+    value = os.environ.get(name, "")
+    if not isinstance(value, str):
+        value = ""
+    value = value.strip()
+    if not value:
+        return ""
+    lowered = name.lower()
+    if "api_key" not in lowered and "token" not in lowered:
+        return value
+    try:
+        from jiuwenswarm.common.security.base_crypto import get_crypto_provider
+
+        crypto = get_crypto_provider()
+        if crypto is not None:
+            decrypted = crypto.decrypt(value)
+            if isinstance(decrypted, str) and decrypted.strip():
+                return decrypted.strip()
+    except Exception:
+        return value
+    return value
 # Temporary test override: restore True to enable both snapshot freshness checks.
 # Response validation, thresholds and native lifecycle safety remain enabled.
 SNAPSHOT_FRESHNESS_CHECK_ENABLED = False

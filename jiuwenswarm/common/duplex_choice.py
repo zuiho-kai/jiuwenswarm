@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import math
-import os
 import time
 import uuid
 from collections.abc import Callable
@@ -16,7 +15,7 @@ from typing import Any
 import httpx
 
 from jiuwenswarm.common.duplex_decision import action_from_answer, probability
-from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage
+from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage, env_secret
 
 DEFAULT_TIMEOUT_SECONDS = 2.0
 DEFAULT_INTERRUPT_THRESHOLD = 0.9
@@ -37,7 +36,7 @@ def request_timeout(value: Any, *, provider: str) -> float:
 
 
 def credential(env_name: str, *, provider: str) -> str:
-    value = os.environ.get(env_name, "").strip()
+    value = env_secret(env_name)
     if not value:
         raise ValueError(f"{provider} API key/token environment variable is empty or missing")
     return value

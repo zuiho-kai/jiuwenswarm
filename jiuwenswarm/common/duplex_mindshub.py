@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
 from jiuwenswarm.common.duplex_router import (
-    ControlSnapshot, InboundMessage, SYSTEM_PROMPT, prompt_for, validate_decision,
+    SYSTEM_PROMPT, ControlSnapshot, InboundMessage, env_secret, prompt_for, validate_decision,
 )
 
 DEFAULT_MODEL = "mindshub_air"
@@ -32,7 +31,7 @@ async def classify_mindshub(
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("MindsHub timeout_seconds must be finite and positive")
     key_env = settings.get("api_key_env", "MINDSHUB_API_KEY")
-    api_key = os.environ.get(key_env, "").strip()
+    api_key = env_secret(str(key_env))
     if not api_key:
         raise ValueError("MindsHub API key environment variable is empty or missing")
     api_base = settings.get("api_base", DEFAULT_API_BASE).rstrip("/")

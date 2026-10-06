@@ -500,10 +500,10 @@
         "description": "相对于 API 地址的决策接口路径。",
         "placeholder": "例如：decisions"
       },
-      "duplex_router_api_key_env": {
-        "title": "API Key 环境变量名",
-        "description": "服务启动环境中保存 API Key 的变量名，不填写密钥本身。",
-        "placeholder": "例如：MINDSHUB_API_KEY"
+      "duplex_router_api_key": {
+        "title": "监工 API Key",
+        "description": "Jev、MindsHub 或 Clef 的 API Key，按其他 API Key 的方式保存。",
+        "placeholder": ""
       },
       "duplex_router_account_id_env": {
         "title": "Cloudflare 账号环境变量名",

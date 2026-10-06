@@ -71,7 +71,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   yamlField('duplex_router_interrupt_threshold', 'agent', 'text', 'duplex_router.interrupt_threshold'),
   yamlField('duplex_router_api_base', 'agent', 'text', 'duplex_router.api_base'),
   yamlField('duplex_router_endpoint_path', 'agent', 'text', 'duplex_router.endpoint_path'),
-  yamlField('duplex_router_api_key_env', 'agent', 'text', 'duplex_router.api_key_env'),
+  envField('duplex_router_api_key', 'agent', 'text', 'DUPLEX_ROUTER_API_KEY'),
   yamlField('duplex_router_account_id_env', 'agent', 'text', 'duplex_router.account_id_env'),
   yamlField('duplex_router_model', 'agent', 'text', 'duplex_router.clef.model'),
   envField('embed_api_base', 'models', 'text', 'EMBED_API_BASE'),

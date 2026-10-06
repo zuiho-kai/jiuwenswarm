@@ -21,7 +21,12 @@ duplex_router:
   clef:
     model: clef  # clef / clef-flash
     interrupt_threshold: 0.9  # 低于该概率的 INTERRUPT 按 APPEND 处理
-    # 账号和令牌只从环境变量读取：CLOUDFLARE_ACCOUNT_ID、CLOUDFLARE_AUTH_TOKEN
+    # 账号仍从 CLOUDFLARE_ACCOUNT_ID 读取。API Key 由设置页写入 .env 的 DUPLEX_ROUTER_API_KEY。
+    api_key_env: DUPLEX_ROUTER_API_KEY
+  jev:
+    api_key_env: DUPLEX_ROUTER_API_KEY
+  mindshub:
+    api_key_env: DUPLEX_ROUTER_API_KEY
 
 # Web 首次模型配置引导；用户确认完成后会自动关闭，可通过侧栏问号再次打开
 setup_guide:

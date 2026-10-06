@@ -84,10 +84,11 @@ async def test_missing_key_and_stale_snapshot(endpoint, monkeypatch):
         await mindshub.classify_mindshub(SNAPSHOT, MESSAGES)
     assert not endpoint["requests"]
     monkeypatch.setenv("MINDSHUB_API_KEY", "test-only-secret")
+    monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED", True)
     result = await observe(SNAPSHOT, MESSAGES, classify=mindshub.classify_mindshub,
                            current_snapshot=lambda: replace(SNAPSHOT, context_version="v2"))
     assert result.status == "stale"
-    assert result.proposed_action == "UNDECIDED"
+    assert result.proposed_action == "INTERRUPT"
 
 
 def test_replay_cli_uses_mindshub_without_sdk_model_config(endpoint, monkeypatch, tmp_path):
