@@ -19,6 +19,7 @@ from pathlib import Path
 
 from openjiuwen.core.runner import Runner
 
+from jiuwenswarm.agents.harness.team.duplex_shadow import drain_shadow_observations
 from jiuwenswarm.benchmarks.duplex_runtime import Events, UserInputPeer, load_models
 
 
@@ -83,7 +84,42 @@ def grade(task_id, answer):
             "task_spec": spec, "scope": "custom final-intent constraint checks, NOT official task success"}
 
 
+def _mean(values):
+    values = [value for value in values if value is not None]
+    return statistics.mean(values) if values else None
+
+
+def _median(values):
+    values = [value for value in values if value is not None]
+    return statistics.median(values) if values else None
+
+
+def decision_rows(records):
+    """One row per supervisor answer, timed from that call until the task finishes."""
+    run_start = next((row["elapsed_seconds"] for row in records if row["event"] == "run_start"), None)
+    run_end = next((row["elapsed_seconds"] for row in records if row["event"] == "run_end"), None)
+    span = None if run_start is None or run_end is None else run_end - run_start
+    rows = []
+    for row in records:
+        if row["event"] != "route_decision":
+            continue
+        decision_seconds = (row.get("latency_ms") or 0) / 1000
+        called_at = None if run_start is None else row["elapsed_seconds"] - run_start - decision_seconds
+        task_from_call = None if span is None or called_at is None else span - called_at
+        rows.append({"message_ids": row.get("message_ids"), "attempts": row.get("attempts"),
+                     "latency_ms": row.get("latency_ms"), "status": row.get("status"),
+                     "action": row.get("action"), "decision_seconds": decision_seconds,
+                     "called_at_seconds": called_at, "task_seconds_from_call": task_from_call,
+                     "stale": row.get("status") == "stale"})
+    return rows
+
+
 class RecordedUserPeer(UserInputPeer):
+    async def start(self):
+        await super().start()
+        if self.policy == "model":
+            self.duplex_settings = {**self.duplex_settings, "mode": "shadow"}
+
     async def deliver_input(self, content, *, use_steer=True):
         active = self.harness.active_round
         phase = active.iter_phase.value if active is not None else self.harness.state.value
@@ -183,6 +219,8 @@ async def one(models, case, policy, repeat, output):
         answer = peer._last_result
     ended = time.monotonic()
     events.add("run_end", status=status, error_type=error)
+    if policy == "model":
+        await drain_shadow_observations()
     try:
         await asyncio.wait_for(peer.close(), timeout=20)
     except Exception as exc:
@@ -191,7 +229,7 @@ async def one(models, case, policy, repeat, output):
     save(directory / "requests.json", requests)
     effective = [row for row in events.records if row["event"] == "delivery_effective"]
     model_ends = [row for row in events.records if row["event"] == "model_end"]
-    routes = [row for row in events.records if row["event"] == "route_decision"]
+    routes = decision_rows(events.records)
     for arrival in arrivals:
         candidates = [row for row in requests if row["started_seconds"] >= arrival["seconds"] and row["updates_in_prompt"][arrival["index"]]]
         arrival["adoption_seconds"] = min((row["started_seconds"] - arrival["seconds"] for row in candidates), default=None)
@@ -204,12 +242,17 @@ async def one(models, case, policy, repeat, output):
               "actual_interrupts": sum(row["action"] == "INTERRUPT" for row in effective),
               "idle_deliveries": sum(row["action"] == "IDLE_START" for row in effective),
               "slow_calls": len(model_ends), "cancelled_slow_calls": sum(row["status"] == "cancelled" for row in model_ends),
+              "router_mode": "shadow" if policy == "model" else "off",
+              "decisions": len(routes),
+              "stale_decisions": sum(row["stale"] for row in routes),
+              "mean_decision_seconds": statistics.mean(row["decision_seconds"] for row in routes) if routes else None,
+              "mean_task_seconds_from_call": statistics.mean(row["task_seconds_from_call"] for row in routes if row["task_seconds_from_call"] is not None) if routes else None,
               "fast_attempts": sum(row["attempts"] for row in routes), "routes": routes,
               "observed_slow_tokens": sum((row.get("usage") or {}).get("total_tokens", 0) or 0 for row in model_ends),
               "slow_calls_without_usage": sum(row.get("usage") is None for row in model_ends),
               "total_billed_tokens": None, "quality": grade(case["task_id"], answer)}
     save(directory / "result.json", result)
-    print(json.dumps({key: result[key] for key in ("case_id", "policy", "repeat", "status", "elapsed_seconds", "actual_interrupts", "quality")}), flush=True)
+    print(json.dumps({key: result[key] for key in ("case_id", "policy", "repeat", "status", "elapsed_seconds", "router_mode", "decisions", "stale_decisions", "mean_decision_seconds", "actual_interrupts", "quality")}), flush=True)
     return result
 
 
@@ -233,6 +276,11 @@ def report(output, rows):
             "cancelled_slow_calls": sum(row["cancelled_slow_calls"] for row in group),
             "slow_calls": sum(row["slow_calls"] for row in group),
             "fast_attempts": sum(row["fast_attempts"] for row in group),
+            "decisions": sum(row["decisions"] for row in group),
+            "stale_decisions": sum(row["stale_decisions"] for row in group),
+            "mean_decision_seconds": _mean(route["decision_seconds"] for row in group for route in row["routes"]),
+            "median_decision_seconds": _median(route["decision_seconds"] for row in group for route in row["routes"]),
+            "mean_task_seconds_from_call": _mean(route["task_seconds_from_call"] for row in group for route in row["routes"] if route["task_seconds_from_call"] is not None),
             "route_actions": dict(collections.Counter(route["action"] for row in group for route in row["routes"])),
             "route_statuses": dict(collections.Counter(route["status"] for row in group for route in row["routes"]))}
     pairs = []
@@ -258,7 +306,8 @@ async def run(args):
     cases = read_cases(Path(args.repo))
     models = load_models(Path(args.models))
     save(output / "manifest.json", {"cases": cases, "system_prompt": SYSTEM_PROMPT, "repeats": args.repeats,
-        "concurrent_pairs": args.concurrency, "injection": "first_real_stream_text_after_previous_update_seen",
+        "concurrent_pairs": args.concurrency, "router_mode": "shadow for model; steer has no supervisor",
+        "injection": "first_real_stream_text_after_previous_update_seen",
         "source_revision": "17da111e4858b93c0cab1d88f85e1735fbd1d423", "scope": "input replay, not official website score",
         "models": {key: value.model_request_config.model_dump() for key, value in models.items()},
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
