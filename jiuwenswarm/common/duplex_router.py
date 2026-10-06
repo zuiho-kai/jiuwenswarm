@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import time
 from dataclasses import asdict, dataclass
@@ -73,6 +74,10 @@ def validate_decision(result: Any) -> str:
 
 
 Classify = Callable[[ControlSnapshot, tuple[InboundMessage, ...]], Awaitable[Any]]
+logger = logging.getLogger(__name__)
+# Temporary test override: restore True to enable both snapshot freshness checks.
+# Response validation, thresholds and native lifecycle safety remain enabled.
+SNAPSHOT_FRESHNESS_CHECK_ENABLED = False
 
 
 async def observe(
@@ -83,7 +88,7 @@ async def observe(
     current_snapshot: Callable[[], ControlSnapshot | None],
     timeout_seconds: float | None = None,
 ) -> Observation:
-    """Classify once. Failures or a changed snapshot fall back to SDK steer."""
+    """Classify once; snapshot freshness rejection is temporarily disabled."""
     if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
         raise ValueError("timeout_seconds must be finite and positive")
     started = time.monotonic()
@@ -93,14 +98,22 @@ async def observe(
             attempts = 1
             result = await classify(snapshot, messages)
             candidate = validate_decision(result)
-            if current_snapshot() == snapshot:
+            if not SNAPSHOT_FRESHNESS_CHECK_ENABLED:
+                action = candidate
+                logger.info("duplex freshness check bypassed stage=observation message_ids=%s action=%s",
+                            json.dumps([m.message_id for m in messages]), candidate)
+            elif current_snapshot() == snapshot:
                 action = candidate
             else:
                 status = "stale"
     except TimeoutError:
         status = "timeout"
-    except Exception:
+    except Exception as exc:
         status = "error"
+        logger.warning("duplex observation classification error provider_status=error error_type=%s",
+                       type(exc).__name__)
+    logger.info("duplex observation status=%s proposed_action=%s latency_ms=%.1f attempts=%d",
+                status, action, (time.monotonic() - started) * 1000, attempts)
     return Observation(
         message_ids=tuple(m.message_id for m in messages),
         context_version=snapshot.context_version, round_id=snapshot.round_id,

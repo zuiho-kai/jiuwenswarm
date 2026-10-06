@@ -11,7 +11,34 @@ duplex_router:
 
 快模型总期限默认沿用该模型的 SDK timeout，可显式设置 `timeout_seconds`。
 
+## 临时测试：禁用快照过期拦截（2026-10-05）
+
+`common/duplex_router.py` 中 `SNAPSHOT_FRESHNESS_CHECK_ENABLED = False` 暂时关闭
+模型返回后的快照一致性检查及打断执行前的版本一致性检查，适用于所有监工后端。
+旧检查代码保留；改回 `True` 并重启服务即可恢复。日志记录
+`duplex freshness check bypassed stage=observation/commit`。
+模型结果仍经过响应验证和概率阈值处理，超时、错误仍回退原 steer。
+执行器仍保留运行状态、快照存在、待执行打断、消息去重及安全暂停检查。
+此测试模式可能把旧状态下的判断应用于已经变化的计划，不宜作为生产默认策略。
+下文关于过期回退的说明仅在恢复该开关后适用。
+
 ## Jev 监工后端
+
+### 桌面 / CMD 日志（2026-10-06）
+
+监工日志统一保存在用户工作区 `agent/.logs/duplex.log`，本机路径为
+`C:/Users/yzdnh/.jiuwenswarm/agent/.logs/duplex.log`。无需重定向 CMD 的 stdout/stderr；
+原组件日志与控制台输出不变。该文件使用现有 UTF-8、安全轮转及敏感数据过滤，
+单文件上限 20 MiB，保留最多 20 份归档。跟随 `logging.agent_server` 文件日志级别。
+记录 Jev/Clef 请求与概率、路由入口/回退、stale 开关绕过、安全暂停及打断提交；
+用户追问入口仅汇集 `duplex ...` 诊断，不汇集普通对话或工具正文。
+启动时记录 `duplex logging ready`，每行带 PID，便于区分服务重启及进程。
+
+Jev 与 Clef 共用 `common/duplex_choice.py` 的 Choice 问题构造、配置校验、HTTP
+传输、异常处理及脱敏决策日志；概率校验继续复用 `duplex_decision.py`。
+适配层只保留各自 URL、认证环境变量、模型名、state 编码、提示词和响应包裹差异。
+路由日志统一为 `duplex route ... backend=jev/clef`，不再重复输出 Jev 专属路由日志。
+两者均只请求一次、不跟随重定向；新建客户端由公共层关闭，注入客户端由调用者管理。
 
 在运行 agentserver 的环境中设置 `TYPESAFE_API_KEY`（或在其私有 `config/.env` 中设置，勿提交密钥），
 将工作区 `config/config.yaml` 的路由配置改为下面内容，然后重启团队：
@@ -80,6 +107,17 @@ HTTP 错误、超时、非法结果或过期快照仍按现有路由回退到 SD
 合并时只验证了模拟响应和路由链路，真实 Cloudflare 账户调用仍需单独验证。
 [Cloudflare Clef 文档](https://developers.cloudflare.com/workers-ai/models/clef/)。
 
+Clef 排查日志不保存密钥、请求/响应正文或状态内容。`Clef request start` 的
+`request_id` 将 HTTP 状态、耗时、原始 `choice`、`p_interrupt/p_append`、阈值和最终动作关联；
+`reason=below_threshold` 表示模型选择中断但被阈值挡住。广播消息 ID 会被多个接收者复用，
+需结合路由入口的 `recipient` 和快照版本区分各次判断。
+`duplex user followup dispatch` 记录 Web 追问入口；`duplex user input entry` 记录 SDK 事件入口。
+`duplex delivery bypass` / `duplex route bypass` 解释未判断的原因（未包装、非 active、
+不支持的 harness、无快照、policy 或 use_steer）。模型建议不等于完成打断：
+只有 `duplex interrupt committed ... replan_input_sent=true` 和最终
+`duplex route effective ... action=INTERRUPT` 才确认安全暂停与重规划输入提交；
+`replan_input_sent` 不代表重规划任务已经完成。`stale` 或 `superseded` 表示判断未执行。
+
 适配器仅发送已有 `goal / next_action / last_action / phase` 和消息的发送者、ID、原文，
 不发送完整上下文或隐藏推理。状态和消息会离开本机到达所配置的 API。
 同一套路由规则放入 `Choice.instructions`，选项固定为 `APPEND` 和 `INTERRUPT`。
@@ -91,7 +129,7 @@ HTTP 错误、超时、非法结果或过期快照仍按现有路由回退到 SD
 每条消息只请求一次，无自动重试。缺失密钥、HTTP 错误（含 429/529）、非法响应均走原 steer；
 总超时覆盖整个判断，HTTP 超时也记录为 `timeout`。返回后仍进行快照版本校验；
 过期判断不执行，中断继续使用 Native supervisor 的安全暂停、保留已提交工具结果和重新规划机制。
-路由观测仍记录 action/status/latency，不保存原始概率或密钥。
+路由观测记录 action/status/latency；Clef 调试日志另记录经过校验的选项概率，不保存密钥。
 
 可先用现有 6 条样例验证真实 API（只测路由，不执行 Agent 动作）：
 

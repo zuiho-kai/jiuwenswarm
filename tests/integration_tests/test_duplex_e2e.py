@@ -486,6 +486,9 @@ async def test_append_during_tool_is_adopted_without_restart(world):
     ("stale", "stale"), ("missing_key", "error"), ("unknown_backend", "error"),
 ])
 async def test_jev_fallback_preserves_message_and_tool_commit(world, monkeypatch, scenario, status):
+    # Exercise the preserved freshness fallback with the guard restored.
+    if scenario == "stale":
+        monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED", True)
     w = world
     observations = []
     w.host.record_duplex_observation = observations.append
@@ -518,7 +521,12 @@ async def test_jev_fallback_preserves_message_and_tool_commit(world, monkeypatch
     assert w.native.active_round.round_id == before
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
     calls = [c for c in w.endpoint.calls if c["model"] == "jev-1.13.0"]
-    assert len(calls) == (0 if scenario in ("missing_key", "unknown_backend") else 1)
+    if scenario == "timeout":
+        # The total deadline includes client setup: cancellation can occur
+        # before the server accepts the request. Neither case may retry.
+        assert len(calls) <= 1
+    else:
+        assert len(calls) == (0 if scenario in ("missing_key", "unknown_backend") else 1)
     w.tool.gate.set()
     w.endpoint.fast_gate.set()
     await wait_until(lambda: w.harness.state is HarnessState.IDLE)
@@ -677,7 +685,10 @@ async def test_explicit_cancel_supersedes_pending_interrupt_without_restart(worl
 
 
 @pytest.mark.asyncio
-async def test_stale_supervisor_command_cannot_interrupt_newer_context(world):
+@pytest.mark.parametrize("freshness_enabled", [True, False])
+async def test_supervisor_version_guard_can_be_restored(world, monkeypatch, freshness_enabled):
+    monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED",
+                        freshness_enabled)
     w = world
     await w.harness.send("Implement the order system.")
     await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
@@ -685,8 +696,14 @@ async def test_stale_supervisor_command_cannot_interrupt_newer_context(world):
     await w.harness.send("Also include migration steps.", immediate=True)
     result = await w.native.interrupt("old decision", version=old.context_version,
                                       message_id="old")
-    assert result == "STALE"
-    assert w.native.active_round.round_id == int(old.round_id)
+    if freshness_enabled:
+        assert result == "STALE"
+        assert w.native.active_round.round_id == int(old.round_id)
+    else:
+        assert result == "INTERRUPT"
+        await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+        assert w.native._st.round_id_counter > int(old.round_id)
+        assert "old" in w.native._duplex_received
 
 
 @pytest.mark.asyncio

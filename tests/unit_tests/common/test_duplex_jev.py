@@ -172,7 +172,8 @@ async def test_total_deadline_and_cancellation_stop_request(endpoint):
 
 
 @pytest.mark.asyncio
-async def test_valid_jev_interrupt_is_discarded_if_snapshot_changed(endpoint):
+async def test_valid_jev_interrupt_is_discarded_if_snapshot_changed(endpoint, monkeypatch):
+    monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED", True)
     result = await observe(SNAPSHOT, MESSAGES, classify=jev.classify_jev,
                            current_snapshot=lambda: replace(SNAPSHOT, context_version="v2"))
     assert result.status == "stale"

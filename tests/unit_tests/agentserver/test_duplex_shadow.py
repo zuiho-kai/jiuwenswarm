@@ -38,7 +38,8 @@ async def test_interrupt_is_observed_only():
 
 
 @pytest.mark.asyncio
-async def test_stale_decision_falls_back_without_reclassification():
+async def test_stale_decision_falls_back_without_reclassification(monkeypatch):
+    monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED", True)
     old = snapshot()
     new = replace(old, context_version="v2", round_id="r2", checkpoint_id="c2")
     classify = AsyncMock(side_effect=[decision(old), decision(new, "APPEND")])
@@ -50,7 +51,8 @@ async def test_stale_decision_falls_back_without_reclassification():
 
 
 @pytest.mark.asyncio
-async def test_continually_changing_context_is_discarded():
+async def test_continually_changing_context_is_discarded(monkeypatch):
+    monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED", True)
     s = snapshot()
     newer = replace(s, context_version="v2")
     newest = replace(s, context_version="v3")
@@ -60,6 +62,21 @@ async def test_continually_changing_context_is_discarded():
                            current_snapshot=lambda: next(values))
     assert result.status == "stale"
     assert result.proposed_action == "UNDECIDED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["APPEND", "INTERRUPT"])
+async def test_disabled_freshness_check_admits_model_action(action, monkeypatch):
+    monkeypatch.setattr("jiuwenswarm.common.duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED", False)
+    old = snapshot()
+    latest = Mock(return_value=replace(old, context_version="v2", phase="tool"))
+    classify = AsyncMock(return_value=decision(old, action))
+    result = await observe(old, MESSAGES, classify=classify, current_snapshot=latest)
+    assert result.status == "ok"
+    assert result.proposed_action == action
+    assert result.attempts == 1
+    classify.assert_awaited_once()
+    latest.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -243,14 +260,15 @@ def test_prompt_preserves_full_messages_and_tail_constraints():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["jev", "clef"])
 @pytest.mark.parametrize("proposed,status,interrupt_result,expected", [
     ("INTERRUPT", "ok", "INTERRUPT", "action=INTERRUPT"),
     ("APPEND", "ok", None, "action=APPEND reason=model_append"),
     ("UNDECIDED", "timeout", None, "action=APPEND reason=timeout"),
     ("INTERRUPT", "ok", "STALE", "action=APPEND reason=stale_at_commit"),
 ])
-async def test_jev_route_logs_observation_and_effective_action(
-        monkeypatch, proposed, status, interrupt_result, expected):
+async def test_choice_route_logs_observation_and_effective_action(
+        monkeypatch, backend, proposed, status, interrupt_result, expected):
     from jiuwenswarm.agents.harness.team import duplex_native
 
     class FakeNative:
@@ -272,10 +290,10 @@ async def test_jev_route_logs_observation_and_effective_action(
 
     await shadow.deliver_routed(NS(harness=native), content, use_steer=True,
                                 original=original, settings={"mode": "active", "policy": "model",
-                                                             "backend": "jev", "timeout_seconds": 2})
+                                                             "backend": backend, "timeout_seconds": 2})
 
     rendered = [call.args[0] % call.args[1:] for call in log.call_args_list]
-    assert any("Jev route observation message_id=m204" in line for line in rendered)
+    assert any(f"duplex route observation backend={backend} message_id=m204" in line for line in rendered)
     assert any(expected in line for line in rendered)
     assert all("Customer forbids Kafka" not in line for line in rendered)
     if expected == "action=INTERRUPT":
@@ -327,3 +345,36 @@ async def test_clef_backend_routes_and_falls_back(
         assert result == "sent"
         native.interrupt.assert_not_awaited()
         original.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,use_steer,policy,has_snapshot,reason", [
+    ("off", True, "model", True, "mode_not_active"),
+    ("active", False, "model", True, "use_steer_false"),
+    ("active", True, "steer", True, "policy_bypass"),
+    ("active", True, "model", False, "no_snapshot"),
+])
+async def test_route_bypass_logs_reason_without_content(monkeypatch, mode, use_steer, policy, has_snapshot, reason):
+    from jiuwenswarm.agents.harness.team import duplex_native
+
+    class FakeNative:
+        def __init__(self):
+            self._duplex_received = set()
+
+    native = FakeNative()
+    monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
+    monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
+    monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot() if has_snapshot else None)
+    log = Mock()
+    monkeypatch.setattr(shadow.logger, "info", log)
+    original = AsyncMock(return_value="sent")
+    content = shadow.RoutedInput("private-message-never-log", MESSAGES[0])
+    result = await shadow.deliver_routed(NS(harness=native, blueprint=NS(member_name="A2")), content,
+                                        use_steer=use_steer, original=original,
+                                        settings={"mode": mode, "policy": policy, "backend": "clef"})
+    assert result == "sent"
+    original.assert_awaited_once()
+    logged = "\n".join(call.args[0] % call.args[1:] for call in log.call_args_list)
+    assert f"reason={reason}" in logged
+    assert "recipient=A2" in logged
+    assert "private-message-never-log" not in logged

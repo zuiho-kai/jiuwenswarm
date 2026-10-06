@@ -1,41 +1,44 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""One bounded TypeSafe Choice request for the duplex router, without retries."""
+"""Jev endpoint adapter for the shared typed-choice supervisor transport."""
 
 from __future__ import annotations
 
 import logging
-import math
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
-from jiuwenswarm.common.duplex_router import (
-    ROUTING_INSTRUCTIONS,
-    ControlSnapshot,
-    InboundMessage,
-    state_for,
+from jiuwenswarm.common.duplex_choice import (
+    DEFAULT_INTERRUPT_THRESHOLD, DEFAULT_TIMEOUT_SECONDS, choice_request,
+    classify_choice, credential, decision_from_body, endpoint_url, log_decision,
 )
-from jiuwenswarm.common.duplex_decision import action_from_answer, probability
+from jiuwenswarm.common.duplex_router import (
+    ROUTING_INSTRUCTIONS, ControlSnapshot, InboundMessage, state_for,
+)
 
 DEFAULT_MODEL = "jev-1.13.0"
 DEFAULT_API_BASE = "https://api.typesafe.ai/v1"
-DEFAULT_TIMEOUT_SECONDS = 2.0
-DEFAULT_INTERRUPT_THRESHOLD = 0.9
 logger = logging.getLogger(__name__)
 
 
 def _decision(payload: Any, threshold: float) -> dict[str, str]:
-    """Reject malformed or contradictory answers before admitting an interrupt."""
-    answer = payload["answers"]["action"]
-    action = action_from_answer(answer, threshold, provider="Jev")["action"]
-    probabilities = answer["probabilities"]
-    append = probability(probabilities["APPEND"], provider="Jev")
-    interrupt = probability(probabilities["INTERRUPT"], provider="Jev")
-    logger.info("Jev decision choice=%s effective=%s p_interrupt=%.4f p_append=%.4f threshold=%.4f",
-                answer["choice"], action, interrupt, append, threshold)
-    return {"action": action}
+    """Compatibility entry point for direct typed-answer validation."""
+    decision = decision_from_body(payload, threshold, provider="Jev")
+    log_decision(payload, decision, threshold, provider="Jev", logger=logger)
+    return decision
+
+
+def _request(snapshot: ControlSnapshot, messages: tuple[InboundMessage, ...],
+             settings: Mapping[str, Any], model_name: str) -> tuple[httpx.URL, dict[str, Any], str]:
+    api_key = credential(settings.get("api_key_env", "TYPESAFE_API_KEY"), provider="Jev")
+    api_base = settings.get("api_base", DEFAULT_API_BASE).rstrip("/")
+    endpoint_path = settings.get("endpoint_path", "systemone")
+    if endpoint_path not in ("systemone", "decisions"):
+        raise ValueError("invalid Jev endpoint_path")
+    url = endpoint_url(api_base + "/" + endpoint_path, provider="Jev")
+    request = choice_request(model_name, state_for(snapshot, messages), ROUTING_INSTRUCTIONS)
+    return url, request, api_key
 
 
 async def classify_jev(
@@ -45,56 +48,12 @@ async def classify_jev(
     model_name: str = DEFAULT_MODEL,
     settings: Mapping[str, Any] | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    client: httpx.AsyncClient | None = None,
 ) -> dict[str, str]:
-    """Map Jev's typed answer to the existing action-only router contract.
-
-    The caller's observe() enforces the total deadline and snapshot freshness.
-    HTTP failures and invalid responses propagate to its ordinary steer fallback.
-    Credentials are read only from the selected environment variable.
-    """
-    if settings is None:
-        settings = {}
-    threshold = probability(settings.get("interrupt_threshold", DEFAULT_INTERRUPT_THRESHOLD), provider="Jev")
-    if threshold <= 0.5:
-        raise ValueError("Jev interrupt_threshold must be greater than 0.5 and at most 1")
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise ValueError("Jev timeout_seconds must be finite and positive")
-    key_env = settings.get("api_key_env", "TYPESAFE_API_KEY")
-    api_key = os.environ.get(key_env, "").strip()
-    if not api_key:
-        raise ValueError("Jev API key environment variable is empty or missing")
-    api_base = settings.get("api_base", DEFAULT_API_BASE).rstrip("/")
-    endpoint_path = settings.get("endpoint_path", "systemone")
-    if endpoint_path not in ("systemone", "decisions"):
-        raise ValueError("invalid Jev endpoint_path")
-    url = httpx.URL(api_base + "/" + endpoint_path)
-    if (url.scheme not in ("http", "https") or not url.host
-            or url.userinfo or url.query or url.fragment):
-        raise ValueError("invalid Jev api_base")
-    request = {
-        "model": model_name,
-        "state": state_for(snapshot, messages),
-        "questions": {"action": {
-            "type": "choice",
-            "instructions": ROUTING_INSTRUCTIONS,
-            "criteria": {
-                "APPEND": "The message does not invalidate the current plan or next action, or evidence is insufficient.",
-                "INTERRUPT": "A valid changed goal, hard constraint, or evidence of a mistake invalidates the current plan or next action.",
-            },
-        }},
-    }
-    try:
-        # HTTPX has no automatic retries. Redirects must not forward credentials.
-        async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False) as client:
-            response = await client.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=request)
-            response.raise_for_status()
-            return _decision(response.json(), threshold)
-    except httpx.HTTPStatusError as exc:
-        logger.warning("Jev request failed status_code=%s", exc.response.status_code)
-        raise
-    except httpx.TimeoutException as exc:
-        logger.warning("Jev request timed out")
-        raise TimeoutError("Jev request timed out") from exc
-    except Exception as exc:
-        logger.warning("Jev request or response failed error_type=%s", type(exc).__name__)
-        raise
+    """Preserve Jev's object-state payload and configurable decisions endpoint."""
+    configured = settings if settings is not None else {}
+    return await classify_choice(
+        snapshot, messages, provider="Jev", logger=logger, timeout_seconds=timeout_seconds,
+        threshold=configured.get("interrupt_threshold", DEFAULT_INTERRUPT_THRESHOLD),
+        build_request=lambda: _request(snapshot, messages, configured, model_name), client=client,
+    )
