@@ -115,9 +115,13 @@ def decision_rows(records):
 
 
 class RecordedUserPeer(UserInputPeer):
+    def __init__(self, *, router_mode="active", **kwargs):
+        super().__init__(**kwargs)
+        self.router_mode = router_mode
+
     async def start(self):
         await super().start()
-        if self.policy == "model":
+        if self.policy == "model" and self.router_mode == "shadow":
             self.duplex_settings = {**self.duplex_settings, "mode": "shadow"}
 
     async def deliver_input(self, content, *, use_steer=True):
@@ -131,14 +135,15 @@ class RecordedUserPeer(UserInputPeer):
         return result
 
 
-async def one(models, case, policy, repeat, output):
+async def one(models, case, policy, repeat, output, router_mode):
     label = f"{case['case_id']}-r{repeat}-{policy}"
     directory = output / label
     directory.mkdir()
     events = Events(directory / "events.jsonl")
     accepted_updates = []
     peer = RecordedUserPeer(name=label, models=copy.deepcopy(models), policy=policy,
-        system_prompt=SYSTEM_PROMPT, tools=[], events=events, max_iterations=12, max_model_calls=12,
+        router_mode=router_mode, system_prompt=SYSTEM_PROMPT, tools=[], events=events,
+        max_iterations=12, max_model_calls=12,
         goal=lambda: case["initial"] + "".join("\nAccepted user update: " + x for x in accepted_updates))
     updates = case["updates"]
     gates = [asyncio.Event() for _ in updates]
@@ -219,7 +224,7 @@ async def one(models, case, policy, repeat, output):
         answer = peer._last_result
     ended = time.monotonic()
     events.add("run_end", status=status, error_type=error)
-    if policy == "model":
+    if policy == "model" and router_mode == "shadow":
         await drain_shadow_observations()
     try:
         await asyncio.wait_for(peer.close(), timeout=20)
@@ -242,7 +247,7 @@ async def one(models, case, policy, repeat, output):
               "actual_interrupts": sum(row["action"] == "INTERRUPT" for row in effective),
               "idle_deliveries": sum(row["action"] == "IDLE_START" for row in effective),
               "slow_calls": len(model_ends), "cancelled_slow_calls": sum(row["status"] == "cancelled" for row in model_ends),
-              "router_mode": "shadow" if policy == "model" else "off",
+              "router_mode": router_mode if policy == "model" else "off",
               "decisions": len(routes),
               "stale_decisions": sum(row["stale"] for row in routes),
               "mean_decision_seconds": statistics.mean(row["decision_seconds"] for row in routes) if routes else None,
@@ -306,7 +311,8 @@ async def run(args):
     cases = read_cases(Path(args.repo))
     models = load_models(Path(args.models))
     save(output / "manifest.json", {"cases": cases, "system_prompt": SYSTEM_PROMPT, "repeats": args.repeats,
-        "concurrent_pairs": args.concurrency, "router_mode": "shadow for model; steer has no supervisor",
+        "concurrent_pairs": args.concurrency,
+        "router_mode": f"{args.router_mode} for model; steer has no supervisor",
         "injection": "first_real_stream_text_after_previous_update_seen",
         "source_revision": "17da111e4858b93c0cab1d88f85e1735fbd1d423", "scope": "input replay, not official website score",
         "models": {key: value.model_request_config.model_dump() for key, value in models.items()},
@@ -318,7 +324,7 @@ async def run(args):
     async def pair(case, repeat, index):
         async with semaphore:
             for policy in (("steer", "model") if (index + repeat) % 2 == 0 else ("model", "steer")):
-                row = await one(models, case, policy, repeat, output)
+                row = await one(models, case, policy, repeat, output, args.router_mode)
                 rows.append(row)
                 report(output, rows)
                 save(output / "progress.json", {"finished": len(rows), "expected": len(cases) * args.repeats * 2,
@@ -338,4 +344,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--router-mode", choices=("active", "shadow"), default="active",
+                        help="Duplex mode for the model policy. Active applies the decision; shadow only records it.")
     asyncio.run(run(parser.parse_args()))
