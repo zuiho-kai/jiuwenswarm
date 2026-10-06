@@ -1,6 +1,7 @@
 import { settingsNavigationIcons } from '../../../../assets/settings';
 import type { SettingsModuleDefinition } from '../../registry/types';
 import { AgentMediaSettings, AgentSearchSettings, VideoGenSettings, VisualGenSettings } from './AgentSettings';
+import { A2ADuplexSettings } from './A2ADuplexSettings';
 
 export const agentModule: SettingsModuleDefinition = {
   id: 'agent',
@@ -42,48 +43,7 @@ export const agentModule: SettingsModuleDefinition = {
     {
       id: 'a2a-duplex-router',
       titleKey: 'settingsPanel.agent.a2aDuplexRouter',
-      items: [
-        {
-          id: 'duplex-router-mode',
-          component: 'select',
-          key: 'duplex_router_mode',
-          options: [
-            { value: 'off', labelKey: 'settingsPanel.options.duplexRouterModeOff' },
-            { value: 'shadow', labelKey: 'settingsPanel.options.duplexRouterModeShadow' },
-            { value: 'active', labelKey: 'settingsPanel.options.duplexRouterModeActive' },
-          ],
-        },
-        {
-          id: 'duplex-router-backend',
-          component: 'select',
-          key: 'duplex_router_backend',
-          options: [
-            { value: 'sdk', labelKey: 'settingsPanel.options.duplexRouterBackendSdk' },
-            { value: 'jev', labelKey: 'settingsPanel.options.duplexRouterBackendJev' },
-            { value: 'mindshub', labelKey: 'settingsPanel.options.duplexRouterBackendMindshub' },
-            { value: 'clef', labelKey: 'settingsPanel.options.duplexRouterBackendClef' },
-          ],
-        },
-        {
-          id: 'duplex-router-policy',
-          component: 'select',
-          key: 'duplex_router_policy',
-          options: [
-            { value: 'model', labelKey: 'settingsPanel.options.duplexRouterPolicyModel' },
-            { value: 'always_interrupt', labelKey: 'settingsPanel.options.duplexRouterPolicyAlwaysInterrupt' },
-            { value: 'steer', labelKey: 'settingsPanel.options.duplexRouterPolicySteer' },
-            { value: 'serial', labelKey: 'settingsPanel.options.duplexRouterPolicySerial' },
-          ],
-        },
-        { id: 'duplex-router-model-name', component: 'input', key: 'duplex_router_model_name' },
-        { id: 'duplex-router-timeout', component: 'input', key: 'duplex_router_timeout_seconds' },
-        { id: 'duplex-router-threshold', component: 'input', key: 'duplex_router_interrupt_threshold' },
-        { id: 'duplex-router-api-base', component: 'input', key: 'duplex_router_api_base' },
-        { id: 'duplex-router-endpoint', component: 'input', key: 'duplex_router_endpoint_path' },
-        { id: 'duplex-router-api-key', component: 'input', key: 'duplex_router_api_key' },
-        { id: 'duplex-router-account-env', component: 'input', key: 'duplex_router_account_id_env' },
-        { id: 'duplex-router-clef-model', component: 'input', key: 'duplex_router_model' },
-      ],
+      items: [{ id: 'a2a-duplex-router-settings', component: 'custom', render: A2ADuplexSettings }],
     },
   ],
 };
