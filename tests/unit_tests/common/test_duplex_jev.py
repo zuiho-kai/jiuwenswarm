@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from jiuwenswarm.common import duplex_jev as jev
+from jiuwenswarm.common import duplex_choice, duplex_jev as jev
 from jiuwenswarm.common.duplex_router import (
     ControlSnapshot,
     InboundMessage,
@@ -47,7 +47,7 @@ def endpoint(monkeypatch):
         return httpx.Response(server.status, json=server.payload)
 
     client = httpx.AsyncClient
-    monkeypatch.setattr(jev.httpx, "AsyncClient",
+    monkeypatch.setattr(duplex_choice.httpx, "AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(handle), **kwargs))
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-only-secret")
     return server

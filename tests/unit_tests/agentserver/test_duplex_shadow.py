@@ -277,7 +277,7 @@ async def test_jev_route_logs_observation_and_effective_action(
                                                              "backend": "jev", "timeout_seconds": 2})
 
     rendered = [call.args[0] % call.args[1:] for call in log.call_args_list]
-    assert any("Jev route observation message_id=m204" in line for line in rendered)
+    assert any("duplex route observation backend=jev message_id=m204" in line for line in rendered)
     assert any(expected in line for line in rendered)
     assert all("Customer forbids Kafka" not in line for line in rendered)
     if expected == "action=INTERRUPT":

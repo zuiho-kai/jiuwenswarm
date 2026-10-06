@@ -11,6 +11,14 @@ duplex_router:
 
 快模型总期限默认沿用该模型的 SDK timeout，可显式设置 `timeout_seconds`。
 
+## 监工日志
+
+监工日志写入用户工作区 `agent/.logs/duplex.log`。桌面和 CMD 启动不需要重定向 stdout。文件沿用现有 UTF-8 轮转和敏感数据过滤，单文件上限 20 MiB，最多保留 20 份归档，级别跟随 `logging.agent_server`。
+
+记录 Jev/Clef 请求与概率、路由入口和回退、shadow 观察、安全暂停和打断提交。用户追问只汇集以 `duplex ` 开头的诊断，不汇集普通对话或工具正文。启动时记录 `duplex logging ready`，每行带 PID。
+
+Jev 与 Clef 共用 `common/duplex_choice.py` 的 Choice 问题构造、配置校验、HTTP 传输和脱敏决策日志。概率校验在 `duplex_decision.py`。适配层只保留各自的 URL、认证环境变量、模型名、state 编码和响应包裹。API Key 仍通过 `env_secret` 读取，设置页写入的密文会先解密。快照过期检查保持开启：`shadow` 在快照变化后仍记下 `proposed_action`，状态为 `stale`，但不作用到后续轮次。
+
 ## Jev 监工后端
 
 在运行 agentserver 的环境中设置 `TYPESAFE_API_KEY`。密钥只放在环境变量或私有 `config/.env`，不要提交。将工作区 `config/config.yaml` 改为：

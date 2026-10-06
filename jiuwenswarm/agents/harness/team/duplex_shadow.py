@@ -101,6 +101,10 @@ def _decision_timeout(host, config, policy, backend, model_name):
             from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
 
             timeout = DEFAULT_TIMEOUT_SECONDS
+        elif backend == "mindshub":
+            from jiuwenswarm.common.duplex_mindshub import DEFAULT_TIMEOUT_SECONDS
+
+            timeout = DEFAULT_TIMEOUT_SECONDS
         elif backend == "clef" or classifier == "clef":
             from jiuwenswarm.common.duplex_clef import clef_timeout
 
@@ -124,6 +128,11 @@ def _classifier(host, config, policy, backend, model_name, timeout):
 
             return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
                                       settings=config.get("jev"), timeout_seconds=timeout)
+        if backend == "mindshub":
+            from jiuwenswarm.common.duplex_mindshub import DEFAULT_MODEL, classify_mindshub
+
+            return await classify_mindshub(state, messages, model_name=model_name or DEFAULT_MODEL,
+                                           settings=config.get("mindshub"), timeout_seconds=timeout)
         if backend == "clef" or (backend == "sdk" and classifier == "clef"):
             from jiuwenswarm.common.duplex_clef import classify_clef
 
@@ -215,14 +224,21 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     native = native_from_runtime(host.harness)
     message = content.message
     backend = str(config.get("backend") or "sdk")
+    logger.info("duplex route entry backend=%s mode=%s recipient=%s message_id=%s sender=%s "
+                "use_steer=%s harness_type=%s",
+                backend, config.get("mode", "off"),
+                getattr(getattr(host, "blueprint", None), "member_name", "unknown"),
+                message.message_id, message.sender, use_steer, type(native).__name__)
     if config.get("mode") == "shadow":
         return await _deliver_shadow(host, content, use_steer=use_steer, original=original,
                                      config=config, native=native, message=message, backend=backend)
     if config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness):
+        logger.info("duplex route bypass backend=%s message_id=%s reason=%s",
+                    backend, message.message_id,
+                    "mode_not_active" if config.get("mode") != "active" else "unsupported_harness")
         return await original(host, str(content), use_steer=use_steer)
     if message.message_id in native._duplex_received:
-        if backend == "jev":
-            logger.info("Jev route duplicate message_id=%s", message.message_id)
+        logger.info("duplex route bypass backend=%s message_id=%s reason=duplicate", backend, message.message_id)
         return
 
     async def steer():
@@ -234,49 +250,45 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     policy = config.get("policy", "model")
     snapshot = snapshot_from_native(native)
     if not use_steer or policy in ("serial", "steer") or snapshot is None:
-        if backend == "jev":
-            logger.info("Jev route bypass message_id=%s policy=%s use_steer=%s snapshot=%s",
-                        message.message_id, policy, use_steer, snapshot is not None)
+        reason = ("use_steer_false" if not use_steer else
+                  "policy_bypass" if policy in ("serial", "steer") else "no_snapshot")
+        logger.info("duplex route bypass backend=%s message_id=%s reason=%s policy=%s",
+                    backend, message.message_id, reason, policy)
         return await steer()
     model_name = str(config.get("model_name") or "")
-    if backend == "jev":
-        logger.info("Jev route start message_id=%s round_id=%s checkpoint_id=%s phase=%s",
-                    message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
+    logger.info("duplex route start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
+                backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
     timeout = _decision_timeout(host, config, policy, backend, model_name)
     classify = _classifier(host, config, policy, backend, model_name, timeout)
 
     try:
         observation = await observe(snapshot, (message,), classify=classify,
             current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout)
-    except Exception:
-        logger.warning("duplex classification unavailable; using SDK steer", exc_info=True)
-        if backend == "jev":
-            logger.info("Jev route fallback message_id=%s reason=classification_exception effective=APPEND",
-                        message.message_id)
+    except Exception as exc:
+        logger.warning("duplex route fallback backend=%s message_id=%s reason=classification_exception "
+                       "error_type=%s effective=APPEND", backend, message.message_id, type(exc).__name__)
         return await steer()
     recorder = getattr(host, "record_duplex_observation", None)
     if recorder is not None:
         recorder(observation)
-    if backend == "jev":
-        logger.info("Jev route observation message_id=%s status=%s proposed=%s latency_ms=%.1f attempts=%d",
-                    message.message_id, observation.status, observation.proposed_action,
-                    observation.latency_ms, observation.attempts)
+    logger.info("duplex route observation backend=%s message_id=%s status=%s proposed=%s latency_ms=%.1f attempts=%d",
+                backend, message.message_id, observation.status, observation.proposed_action,
+                observation.latency_ms, observation.attempts)
     if observation.status != "ok" or observation.proposed_action == "APPEND":
         result = await steer()
-        if backend == "jev":
-            logger.info("Jev route effective message_id=%s action=APPEND reason=%s",
-                        message.message_id, observation.status if observation.status != "ok" else "model_append")
+        logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=%s",
+                    backend, message.message_id,
+                    observation.status if observation.status != "ok" else "model_append")
         return result
     effective = await native.interrupt(str(content), version=observation.context_version,
                                        message_id=message.message_id)
     if effective == "STALE":
         result = await steer()
-        if backend == "jev":
-            logger.info("Jev route effective message_id=%s action=APPEND reason=stale_at_commit",
-                        message.message_id)
+        logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=stale_at_commit",
+                    backend, message.message_id)
         return result
-    if backend == "jev":
-        logger.info("Jev route effective message_id=%s action=%s", message.message_id, effective)
+    logger.info("duplex route effective backend=%s message_id=%s action=%s",
+                backend, message.message_id, effective)
     return effective
 
 
@@ -326,6 +338,9 @@ def install_shadow_observer() -> bool:
     async def deliver_with_route(self, content, *, use_steer=True):
         if isinstance(content, RoutedInput):
             return await deliver_routed(self, content, use_steer=use_steer, original=deliver)
+        logger.info("duplex delivery bypass recipient=%s reason=unwrapped_input use_steer=%s input_type=%s",
+                    getattr(getattr(self, "blueprint", None), "member_name", "unknown"),
+                    use_steer, type(content).__name__)
         return await deliver(self, content, use_steer=use_steer)
 
     TeamAgent.deliver_input = deliver_with_route
@@ -335,11 +350,15 @@ def install_shadow_observer() -> bool:
     @wraps(user_input)
     async def route_user_input(self, event):
         content = event.payload.get("content", "")
+        logger.info("duplex user input entry recipient=%s input_type=%s already_wrapped=%s",
+                    getattr(getattr(self, "_blueprint", None), "member_name", "unknown"),
+                    type(content).__name__, isinstance(content, RoutedInput))
         if isinstance(content, str) and not isinstance(content, RoutedInput):
             message = InboundMessage(str(event.payload.get("message_id") or f"u2a-{uuid.uuid4().hex}"),
                                      "user", content)
             event = event.model_copy(update={"payload": {**event.payload,
                                                           "content": RoutedInput(content, message)}})
+            logger.info("duplex user input wrapped message_id=%s sender=user", message.message_id)
         return await user_input(self, event)
 
     AgentLifecycleHandler.on_user_input = route_user_input

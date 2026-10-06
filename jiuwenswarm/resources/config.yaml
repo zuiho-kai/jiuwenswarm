@@ -10,9 +10,12 @@ duplex_router:
   mode: "off"  # off / shadow / active
   policy: model  # model / always_interrupt / steer / serial（后两项用于对照）
   classifier: sdk  # sdk：团队模型池里的 model_name；clef：Cloudflare Clef 决策模型
-  backend: sdk  # sdk / jev。jev 使用 TypeSafe Choice，不走团队模型池。
+  backend: sdk  # sdk / jev / mindshub / clef。jev 与 clef 共用 Choice 传输，不走团队模型池。
   model_name: ""
   timeout_seconds: 2.0
+  mindshub:
+    api_base: https://api.mindshub.ai/v1
+    api_key_env: DUPLEX_ROUTER_API_KEY
   clef:
     model: clef  # clef / clef-flash
     interrupt_threshold: 0.9  # 低于该概率的 INTERRUPT 按 APPEND 处理

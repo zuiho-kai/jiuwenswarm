@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import time
@@ -106,6 +107,7 @@ def validate_decision(result: Any) -> str:
 
 
 Classify = Callable[[ControlSnapshot, tuple[InboundMessage, ...]], Awaitable[Any]]
+logger = logging.getLogger(__name__)
 
 
 async def observe(
@@ -130,8 +132,12 @@ async def observe(
                 status = "stale"
     except TimeoutError:
         status = "timeout"
-    except Exception:
+    except Exception as exc:
         status = "error"
+        logger.warning("duplex observation classification error provider_status=error error_type=%s",
+                       type(exc).__name__)
+    logger.info("duplex observation status=%s proposed_action=%s latency_ms=%.1f attempts=%d",
+                status, action, (time.monotonic() - started) * 1000, attempts)
     return Observation(
         message_ids=tuple(m.message_id for m in messages),
         context_version=snapshot.context_version, round_id=snapshot.round_id,
