@@ -34,7 +34,9 @@ from openjiuwen.harness.factory import DeepAgentParts
 from openjiuwen.harness.schema.config import DeepAgentConfig
 from openjiuwen.harness.schema.deep_agent_spec import TeamModelConfig
 
-from jiuwenswarm.agents.harness.team.duplex_shadow import install_shadow_observer, snapshot_from_native
+from jiuwenswarm.agents.harness.team.duplex_shadow import (
+    drain_shadow_observations, install_shadow_observer, snapshot_from_native,
+)
 from jiuwenswarm.agents.harness.team.duplex_native import DuplexNativeHarness, DeliverySuperseded
 
 
@@ -1064,14 +1066,21 @@ async def test_four_strategies_at_same_tool_boundary(world, group, use_steer, re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("world", [{"mode": "shadow"}], indirect=True)
-async def test_inactive_mode_uses_original_native_without_fast_call(world):
+async def test_shadow_mode_observes_without_interrupting(world):
     w = world
     assert not isinstance(w.native, DuplexNativeHarness)
+    w.endpoint.fast_gate.clear()
     await w.harness.send("Implement the order system.")
     await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
     await send_message(w)
-    await poll_and_apply(w)
-    assert not any(c["model"] == "fast" for c in w.endpoint.calls)
+    await asyncio.wait_for(poll_and_apply(w), 3)
+    assert w.harness.state is HarnessState.RUNNING
+    assert w.native.active_round.round_id == 1
+    await asyncio.wait_for(w.endpoint.fast_entered.wait(), 3)
+    assert not w.endpoint.fast_gate.is_set()
+    w.endpoint.fast_gate.set()
+    await drain_shadow_observations()
+    assert any(c["model"] == "fast" for c in w.endpoint.calls)
     assert w.harness.state is HarnessState.RUNNING
     assert w.native.active_round.round_id == 1
     assert not any(t["function"]["name"] == "update_working_intent"

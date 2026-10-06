@@ -176,7 +176,8 @@ async def test_valid_jev_interrupt_is_discarded_if_snapshot_changed(endpoint):
     result = await observe(SNAPSHOT, MESSAGES, classify=jev.classify_jev,
                            current_snapshot=lambda: replace(SNAPSHOT, context_version="v2"))
     assert result.status == "stale"
-    assert result.proposed_action == "UNDECIDED"
+    assert result.proposed_action == "INTERRUPT"
+    assert result.effective_action == "UNCHANGED"
     assert len(endpoint.requests) == 1
 
 

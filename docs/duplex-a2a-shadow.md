@@ -47,9 +47,11 @@ python -m jiuwenswarm.common.duplex_benchmark \
 | INTERRUPT | 原 SDK 安全暂停；保留当前 ctx，作废旧计划并结合新消息重新规划 |
 | 失败 / 超时 / 非法结果 / 过期 | 原 steer |
 
-快模型只返回 `{"action":"APPEND"}` 或 `{"action":"INTERRUPT"}`，状态编号只在本地校验。每条消息只判断一次。慢模型的工具列表和提示不增加内容；不生成状态摘要。快模型读取已有任务、计划和执行位置。其他模式走原 SDK，不再运行影子观察工作线程。
+快模型只返回 `{"action":"APPEND"}` 或 `{"action":"INTERRUPT"}`，状态编号只在本地校验。每条消息只判断一次。慢模型的工具列表和提示不增加内容；不生成状态摘要。快模型读取已有任务、计划和执行位置。`off` 走原 SDK，不调用快模型。
 
-消息收发、排序、工具执行与已读确认均沿用原 Jiuwen。路由在原投递调用内等待判断结果；没有另建后台投递或持久接受机制。
+`shadow` 仍使用原 NativeHarness，立即按原路径投递，不暂停慢模型。监工判断在后台继续，直到返回或到达 `timeout_seconds`。返回后写入观察记录：快照仍是当时那一版时状态为 `ok`；快照已经变化时状态为 `stale`，`proposed_action` 仍保留 `APPEND` 或 `INTERRUPT`。过期结果只记日志，不作用到后面的轮次。
+
+消息收发、排序、工具执行与已读确认均沿用原 Jiuwen。`active` 在原投递调用内等待判断结果；`shadow` 不等待。没有另建持久接受机制。
 
 代码：`duplex_shadow.py` 保留原安装入口名，负责消息对接与独立快模型调用；`duplex_native.py` 只实现 supervisor 内的打断适配；`common/duplex_router.py` 判断一次并校验响应。
 

@@ -7,6 +7,7 @@ Only this adapter knows its MessageHandler and NativeHarness accessors.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -89,42 +90,12 @@ async def classify_input(host, model_name, snapshot, messages):
         return await agent.run(prompt_for(snapshot, messages))
 
 
-async def deliver_routed(host, content, *, use_steer, original, settings=None):
-    from jiuwenswarm.common.config import get_config
-    from .duplex_native import DuplexNativeHarness
+_SHADOW_TASKS: set[asyncio.Task] = set()
 
-    config = settings if settings is not None else getattr(host, "duplex_settings", None)
-    if config is None:
-        config = get_config().get("duplex_router", {}) or {}
-    native = native_from_runtime(host.harness)
-    if config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness):
-        return await original(host, str(content), use_steer=use_steer)
-    message = content.message
-    backend = str(config.get("backend") or "sdk")
-    if message.message_id in native._duplex_received:
-        if backend == "jev":
-            logger.info("Jev route duplicate message_id=%s", message.message_id)
-        return
 
-    async def steer():
-        result = await original(host, str(content),
-                                use_steer=use_steer and config.get("policy") != "serial")
-        native._duplex_received.add(message.message_id)
-        return result
-
-    policy = config.get("policy", "model")
-    snapshot = snapshot_from_native(native)
-    if not use_steer or policy in ("serial", "steer") or snapshot is None:
-        if backend == "jev":
-            logger.info("Jev route bypass message_id=%s policy=%s use_steer=%s snapshot=%s",
-                        message.message_id, policy, use_steer, snapshot is not None)
-        return await steer()
-    model_name = str(config.get("model_name") or "")
-    classifier = str(config.get("classifier") or "sdk")
-    if backend == "jev":
-        logger.info("Jev route start message_id=%s round_id=%s checkpoint_id=%s phase=%s",
-                    message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
+def _decision_timeout(host, config, policy, backend, model_name):
     timeout = config.get("timeout_seconds")
+    classifier = str(config.get("classifier") or "sdk")
     if timeout is None and policy != "always_interrupt":
         if backend == "jev":
             from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
@@ -136,7 +107,11 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
             timeout = clef_timeout(config.get("clef"))
         elif backend == "sdk":
             timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
-    timeout = float(timeout) if timeout is not None else None
+    return float(timeout) if timeout is not None else None
+
+
+def _classifier(host, config, policy, backend, model_name, timeout):
+    classifier = str(config.get("classifier") or "sdk")
 
     async def classify(state, messages):
         record_input = getattr(host, "record_duplex_input", None)
@@ -159,6 +134,116 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
         if classifier != "sdk":
             raise ValueError(f"unsupported duplex classifier: {classifier}")
         return await classify_input(host, model_name, state, messages)
+
+    return classify
+
+
+async def drain_shadow_observations() -> None:
+    """Wait for in-flight shadow classifications. Delivery does not wait on them."""
+    while _SHADOW_TASKS:
+        await asyncio.gather(*tuple(_SHADOW_TASKS), return_exceptions=True)
+
+
+def _schedule_shadow(host, snapshot, message, classify, timeout, backend, native):
+    async def watch():
+        try:
+            observation = await observe(
+                snapshot, (message,), classify=classify,
+                current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout)
+        except Exception as exc:
+            logger.warning("duplex shadow observation failed backend=%s message_id=%s error_type=%s",
+                           backend, message.message_id, type(exc).__name__)
+            return
+        recorder = getattr(host, "record_duplex_observation", None)
+        if recorder is not None:
+            recorder(observation)
+        logger.info("duplex shadow observation backend=%s message_id=%s status=%s proposed=%s "
+                    "latency_ms=%.1f attempts=%d",
+                    backend, message.message_id, observation.status, observation.proposed_action,
+                    observation.latency_ms, observation.attempts)
+
+    task = asyncio.create_task(watch(), name=f"duplex-shadow[{message.message_id}]")
+    _SHADOW_TASKS.add(task)
+    task.add_done_callback(_SHADOW_TASKS.discard)
+
+
+async def _deliver_shadow(host, content, *, use_steer, original, config, native, message, backend):
+    """Log the supervisor decision without delaying delivery or cancelling the worker."""
+    if native is None or not use_steer:
+        return await original(host, str(content), use_steer=use_steer)
+    policy = config.get("policy", "model")
+    if policy in ("serial", "steer"):
+        logger.info("duplex shadow bypass backend=%s message_id=%s reason=policy_bypass policy=%s",
+                    backend, message.message_id, policy)
+        return await original(host, str(content), use_steer=use_steer)
+    seen = getattr(host, "_shadow_seen", None)
+    if seen is None:
+        seen = set()
+        host._shadow_seen = seen
+    if message.message_id in seen:
+        logger.info("duplex shadow bypass backend=%s message_id=%s reason=duplicate",
+                    backend, message.message_id)
+        return
+    snapshot = snapshot_from_native(native)
+    if snapshot is None:
+        logger.info("duplex shadow bypass backend=%s message_id=%s reason=no_snapshot",
+                    backend, message.message_id)
+        return await original(host, str(content), use_steer=use_steer)
+    seen.add(message.message_id)
+    model_name = str(config.get("model_name") or "")
+    try:
+        timeout = _decision_timeout(host, config, policy, backend, model_name)
+        classify = _classifier(host, config, policy, backend, model_name, timeout)
+    except Exception as exc:
+        seen.discard(message.message_id)
+        logger.warning("duplex shadow bypass backend=%s message_id=%s reason=classification_exception "
+                       "error_type=%s", backend, message.message_id, type(exc).__name__)
+        return await original(host, str(content), use_steer=use_steer)
+    logger.info("duplex shadow start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
+                backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
+    _schedule_shadow(host, snapshot, message, classify, timeout, backend, native)
+    return await original(host, str(content), use_steer=use_steer)
+
+
+async def deliver_routed(host, content, *, use_steer, original, settings=None):
+    from jiuwenswarm.common.config import get_config
+    from .duplex_native import DuplexNativeHarness
+
+    config = settings if settings is not None else getattr(host, "duplex_settings", None)
+    if config is None:
+        config = get_config().get("duplex_router", {}) or {}
+    native = native_from_runtime(host.harness)
+    message = content.message
+    backend = str(config.get("backend") or "sdk")
+    if config.get("mode") == "shadow":
+        return await _deliver_shadow(host, content, use_steer=use_steer, original=original,
+                                     config=config, native=native, message=message, backend=backend)
+    if config.get("mode") != "active" or not isinstance(native, DuplexNativeHarness):
+        return await original(host, str(content), use_steer=use_steer)
+    if message.message_id in native._duplex_received:
+        if backend == "jev":
+            logger.info("Jev route duplicate message_id=%s", message.message_id)
+        return
+
+    async def steer():
+        result = await original(host, str(content),
+                                use_steer=use_steer and config.get("policy") != "serial")
+        native._duplex_received.add(message.message_id)
+        return result
+
+    policy = config.get("policy", "model")
+    snapshot = snapshot_from_native(native)
+    if not use_steer or policy in ("serial", "steer") or snapshot is None:
+        if backend == "jev":
+            logger.info("Jev route bypass message_id=%s policy=%s use_steer=%s snapshot=%s",
+                        message.message_id, policy, use_steer, snapshot is not None)
+        return await steer()
+    model_name = str(config.get("model_name") or "")
+    if backend == "jev":
+        logger.info("Jev route start message_id=%s round_id=%s checkpoint_id=%s phase=%s",
+                    message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
+    timeout = _decision_timeout(host, config, policy, backend, model_name)
+    classify = _classifier(host, config, policy, backend, model_name, timeout)
 
     try:
         observation = await observe(snapshot, (message,), classify=classify,

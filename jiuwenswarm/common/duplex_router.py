@@ -125,10 +125,8 @@ async def observe(
         async with asyncio.timeout(timeout_seconds):
             attempts = 1
             result = await classify(snapshot, messages)
-            candidate = validate_decision(result)
-            if current_snapshot() == snapshot:
-                action = candidate
-            else:
+            action = validate_decision(result)
+            if current_snapshot() != snapshot:
                 status = "stale"
     except TimeoutError:
         status = "timeout"

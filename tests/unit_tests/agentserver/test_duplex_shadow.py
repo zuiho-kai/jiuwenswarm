@@ -45,7 +45,8 @@ async def test_stale_decision_falls_back_without_reclassification():
     result = await observe(old, MESSAGES, classify=classify, current_snapshot=lambda: new)
     assert result.attempts == 1
     assert result.status == "stale"
-    assert result.proposed_action == "UNDECIDED"
+    assert result.proposed_action == "INTERRUPT"
+    assert result.effective_action == "UNCHANGED"
     classify.assert_awaited_once()
 
 
@@ -59,7 +60,8 @@ async def test_continually_changing_context_is_discarded():
     result = await observe(s, MESSAGES, classify=classify,
                            current_snapshot=lambda: next(values))
     assert result.status == "stale"
-    assert result.proposed_action == "UNDECIDED"
+    assert result.proposed_action == "INTERRUPT"
+    assert result.effective_action == "UNCHANGED"
 
 
 @pytest.mark.asyncio
@@ -283,3 +285,49 @@ async def test_jev_route_logs_observation_and_effective_action(
         original.assert_not_awaited()
     else:
         original.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shadow_records_decision_without_waiting_or_interrupting(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    recorded = []
+    holder = {"snap": snapshot()}
+
+    async def classify(_host, _model_name, _state, _messages):
+        started.set()
+        await release.wait()
+        return {"action": "INTERRUPT"}
+
+    native = NS()
+    monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
+    monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: holder["snap"])
+    monkeypatch.setattr(shadow, "classify_input", classify)
+    original = AsyncMock(return_value="sent")
+    host = NS(harness=native, record_duplex_observation=recorded.append)
+    content = shadow.RoutedInput("private-message-never-log", MESSAGES[0])
+    settings = {"mode": "shadow", "policy": "model", "backend": "sdk",
+                "model_name": "fast", "timeout_seconds": 5}
+    try:
+        delivery = asyncio.create_task(shadow.deliver_routed(
+            host, content, use_steer=True, original=original, settings=settings))
+        await asyncio.wait_for(started.wait(), 1)
+        assert await asyncio.wait_for(delivery, 1) == "sent"
+        original.assert_awaited_once()
+        assert recorded == []
+        holder["snap"] = replace(holder["snap"], context_version="v2", phase="tool")
+        release.set()
+        await shadow.drain_shadow_observations()
+    finally:
+        release.set()
+        await shadow.drain_shadow_observations()
+    observation, = recorded
+    assert observation.status == "stale"
+    assert observation.proposed_action == "INTERRUPT"
+    assert observation.effective_action == "UNCHANGED"
+    duplicate = await shadow.deliver_routed(
+        host, content, use_steer=True, original=original, settings=settings)
+    assert duplicate is None
+    original.assert_awaited_once()
+    await shadow.drain_shadow_observations()
+    assert len(recorded) == 1
