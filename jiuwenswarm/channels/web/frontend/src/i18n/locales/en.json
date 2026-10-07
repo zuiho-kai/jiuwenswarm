@@ -325,6 +325,7 @@
       "a2aDuplexRouter": "A2A duplex supervisor",
       "a2aDuplexRouterDescription": "Configure duplex routing and supervision decisions between Agents. Keys are read from environment variables and are never stored in the config file.",
       "a2aNotConfigured": "Not configured",
+      "a2aDisabled": "Disabled",
       "a2aDefaultsHint": "Timeout, threshold, policy, and provider-specific options use system defaults. Only the model, endpoint, and key are required.",
       "a2aDeleteTitle": "Clear A2A supervisor configuration",
       "a2aDeleteConfirm": "This disables the duplex supervisor and restores the default configuration.",

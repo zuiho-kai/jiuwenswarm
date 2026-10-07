@@ -1185,6 +1185,7 @@ CONFIG_KEYS = tuple(_CONFIG_SET_ENV_MAP.keys())
 
 # 来自 config.yaml 的配置项（前端 param 名 -> config.yaml 路径）
 _CONFIG_YAML_KEYS = frozenset({
+    "duplex_router_enabled",
     "duplex_router_mode",
     "duplex_router_policy",
     "duplex_router_backend",
@@ -3259,6 +3260,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             clef = duplex.get("clef") or {}
             backend = str(duplex.get("backend", "sdk"))
             payload.update({
+                "duplex_router_enabled": "true" if duplex.get("enabled", duplex.get("mode", "off") != "off") else "false",
                 "duplex_router_mode": str(duplex.get("mode", "off")),
                 "duplex_router_policy": str(duplex.get("policy", "model")),
                 "duplex_router_backend": str(duplex.get("backend", "sdk")),
@@ -3467,6 +3469,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         """Validate and persist one flat Settings-panel duplex field."""
         raw_value = str(value if value is not None else "").strip()
         field_map = {
+            "duplex_router_enabled": ("enabled", {"true", "false"}),
             "duplex_router_mode": ("mode", {"off", "shadow", "active"}),
             "duplex_router_policy": ("policy", {"model", "always_interrupt", "steer", "serial"}),
             "duplex_router_backend": ("backend", {"sdk", "jev", "mindshub", "clef"}),
@@ -3475,7 +3478,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             field, allowed = field_map[param_key]
             if raw_value not in allowed:
                 raise _ConfigBadRequest(f"invalid duplex router {field}")
-            update_duplex_router_in_config({field: raw_value})
+            update_duplex_router_in_config({field: raw_value == "true" if field == "enabled" else raw_value})
             return
         if param_key == "duplex_router_timeout_seconds":
             try:
