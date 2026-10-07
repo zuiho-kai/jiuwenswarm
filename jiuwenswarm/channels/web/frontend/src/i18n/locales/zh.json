@@ -325,6 +325,7 @@
       "a2aDuplexRouter": "A2A 双工监工",
       "a2aDuplexRouterDescription": "配置 Agent 间的双工路由与监工决策。密钥只通过环境变量读取，不会保存到配置文件。",
       "a2aNotConfigured": "尚未配置",
+      "a2aDisabled": "已关闭",
       "a2aDefaultsHint": "超时、阈值、策略和供应商专用参数使用系统默认值；只有模型、接口和密钥需要填写。",
       "a2aDeleteTitle": "清除 A2A 监工配置",
       "a2aDeleteConfirm": "清除后将关闭双工监工并恢复默认配置。",

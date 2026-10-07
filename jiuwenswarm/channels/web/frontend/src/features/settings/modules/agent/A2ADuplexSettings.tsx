@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { settingsActionIcons } from '../../../../assets/settings';
-import { Button, Select } from '../../../../components/ui';
+import { Button, Select, Switch } from '../../../../components/ui';
 import { FormDialog } from '../../../../components/form';
 import { SettingsConfirmDialog } from '../../components';
 import type { SettingsCustomItemProps } from '../../registry/types';
 import { useSettingsServices } from '../../services/SettingsServicesProvider';
 import { useSettingsSource } from '../../services/SettingsSourceProvider';
+import { parseConfigBoolean } from '../../services/settingsContract';
 import './A2ADuplexSettings.css';
 
 type Draft = { mode: string; backend: string; model: string; apiBase: string; apiKey: string };
@@ -31,6 +32,21 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
   const configured = Boolean(value('duplex_router_model_name') || value('duplex_router_model'));
   const model = value('duplex_router_model_name') || value('duplex_router_model') || t('settingsPanel.agent.a2aNotConfigured');
   const backend = value('duplex_router_backend') || 'sdk';
+  const enabled = parseConfigBoolean(source.values.duplex_router_enabled)
+    || (!Object.prototype.hasOwnProperty.call(source.values, 'duplex_router_enabled')
+      && value('duplex_router_mode') !== 'off');
+
+  const toggleEnabled = async (next: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await source.save({ duplex_router_enabled: next ? 'true' : 'false' }, 'a2a-duplex-router-enabled');
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : t('settingsPanel.feedback.saveFailed'));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (!source.values.duplex_router_api_key) return;
@@ -56,6 +72,7 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
     setError('');
     try {
       const updates: Record<string, string> = {
+        duplex_router_enabled: 'true',
         duplex_router_mode: draft.mode,
         duplex_router_backend: draft.backend,
         duplex_router_model_name: draft.model.trim(),
@@ -76,6 +93,7 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
     setError('');
     try {
       await source.save({
+        duplex_router_enabled: 'false',
         duplex_router_mode: 'off',
         duplex_router_model_name: '',
         duplex_router_api_base: '',
@@ -95,7 +113,7 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
       <div className="settings-agent-media__model-card a2a-duplex-settings__card">
         <div className="a2a-duplex-settings__summary">
           <strong className="settings-agent-media__model-name">{model}</strong>
-          <small>{configured ? `${backend} · ${value('duplex_router_mode') || 'active'}` : t('settingsPanel.agent.a2aNotConfigured')}</small>
+          <small>{configured ? `${backend} · ${enabled ? (value('duplex_router_mode') || 'active') : t('settingsPanel.agent.a2aDisabled')}` : t('settingsPanel.agent.a2aNotConfigured')}</small>
         </div>
         <div className="settings-agent-media__actions">
           <Button
@@ -121,6 +139,13 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
             />
           ) : null}
         </div>
+        <Switch
+          checked={enabled}
+          onChange={(next) => void toggleEnabled(next)}
+          disabled={disabled || !isConnected || busy || !configured}
+          aria-label={t('settingsPanel.agent.a2aDuplexRouter')}
+          data-testid="settings-a2a-enabled-switch"
+        />
       </div>
       {draft ? (
         <FormDialog
