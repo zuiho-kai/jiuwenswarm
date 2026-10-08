@@ -496,7 +496,7 @@
       },
       "duplex_router_interrupt_threshold": {
         "title": "Interruption threshold",
-        "description": "Confidence threshold for an interruption decision, from 0.5 to 1.",
+        "description": "Interruption confidence must be greater than 0.5 and at most 1. Default: 0.9.",
         "placeholder": "e.g. 0.8"
       },
       "duplex_router_api_base": {

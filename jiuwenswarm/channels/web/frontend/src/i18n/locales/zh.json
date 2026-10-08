@@ -496,7 +496,7 @@
       },
       "duplex_router_interrupt_threshold": {
         "title": "打断阈值",
-        "description": "监工判定需要打断时使用的置信度阈值，范围为 0.5 到 1。",
+        "description": "打断置信度必须大于 0.5 且不超过 1，默认值为 0.9。",
         "placeholder": "例如：0.8"
       },
       "duplex_router_api_base": {

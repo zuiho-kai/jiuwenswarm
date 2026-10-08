@@ -1,16 +1,16 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { settingsActionIcons } from '../../../../assets/settings';
-import { Button, Select, Switch } from '../../../../components/ui';
+import { Button, Input, Select, Switch } from '../../../../components/ui';
 import { FormDialog } from '../../../../components/form';
-import { SettingsConfirmDialog } from '../../components';
+import { SettingRow, SettingsConfirmDialog } from '../../components';
 import type { SettingsCustomItemProps } from '../../registry/types';
 import { useSettingsServices } from '../../services/SettingsServicesProvider';
 import { useSettingsSource } from '../../services/SettingsSourceProvider';
 import { parseConfigBoolean } from '../../services/settingsContract';
 import './A2ADuplexSettings.css';
 
-type Draft = { mode: string; backend: string; model: string; apiBase: string; apiKey: string };
+type Draft = { mode: string; backend: string; model: string; apiBase: string; apiKey: string; interruptThreshold: string };
 const BACKENDS = ['sdk', 'jev', 'mindshub', 'clef'] as const;
 const MODES = ['off', 'shadow', 'active'] as const;
 
@@ -60,12 +60,19 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
       model: value('duplex_router_model_name') || value('duplex_router_model'),
       apiBase: value('duplex_router_api_base'),
       apiKey: '',
+      interruptThreshold: value('duplex_router_interrupt_threshold') || '0.9',
     });
   };
 
   const saveDraft = async () => {
     if (!draft || !draft.model.trim()) {
       setError(t('settingsPanel.validation.required'));
+      return;
+    }
+    const threshold = Number(draft.interruptThreshold);
+    const usesThreshold = draft.backend === 'jev' || draft.backend === 'clef';
+    if (usesThreshold && (!Number.isFinite(threshold) || threshold <= 0.5 || threshold > 1)) {
+      setError(t('settingsPanel.fields.duplex_router_interrupt_threshold.description'));
       return;
     }
     setBusy(true);
@@ -77,6 +84,7 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
         duplex_router_backend: draft.backend,
         duplex_router_model_name: draft.model.trim(),
       };
+      if (usesThreshold) updates.duplex_router_interrupt_threshold = String(threshold);
       if (draft.apiBase.trim()) updates.duplex_router_api_base = draft.apiBase.trim();
       if (draft.apiKey.trim()) updates.duplex_router_api_key = draft.apiKey.trim();
       await source.save(updates, 'a2a-duplex-router');
@@ -166,6 +174,25 @@ export function A2ADuplexSettings({ disabled }: SettingsCustomItemProps) {
             <label><span>{t('settingsPanel.fields.duplex_router_api_base.title')}</span><input value={draft.apiBase} onChange={(event) => setDraft({ ...draft, apiBase: event.target.value })} placeholder="https://api.example.com/v1" autoComplete="off" /></label>
             <label><span>{t('settingsPanel.fields.duplex_router_api_key.title')}</span><input type="password" value={draft.apiKey} placeholder={secretPlaceholder(source.values.duplex_router_api_key)} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} autoComplete="off" /></label>
           </div>
+          {draft.backend === 'jev' || draft.backend === 'clef' ? (
+            <SettingRow
+              title={<label htmlFor="a2a-interrupt-threshold" data-testid="settings-a2a-interrupt-threshold-label">{t('settingsPanel.fields.duplex_router_interrupt_threshold.title')}</label>}
+              description={<span id="a2a-interrupt-threshold-description" data-testid="settings-a2a-interrupt-threshold-description">{t('settingsPanel.fields.duplex_router_interrupt_threshold.description')}</span>}
+            >
+              <Input
+                id="a2a-interrupt-threshold"
+                type="number"
+                min="0.5"
+                max="1"
+                step="any"
+                value={draft.interruptThreshold}
+                onChange={(next) => setDraft({ ...draft, interruptThreshold: next })}
+                changeOnBlur={false}
+                aria-describedby="a2a-interrupt-threshold-description"
+                data-testid="settings-a2a-interrupt-threshold-input"
+              />
+            </SettingRow>
+          ) : null}
           <p className="a2a-duplex-settings__hint">{t('settingsPanel.agent.a2aDefaultsHint')}</p>
         </FormDialog>
       ) : null}
