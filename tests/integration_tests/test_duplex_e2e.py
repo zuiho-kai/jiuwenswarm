@@ -42,6 +42,7 @@ class Endpoint:
     def __init__(self):
         self.calls = []
         self.fast_action = "INTERRUPT"
+        self.fast_actions = []
         self.jev_probability = 0.95
         self.jev_status = 200
         self.fast_error = False
@@ -58,6 +59,11 @@ class Endpoint:
         self.final_content = "Finished using PostgreSQL."
         self.on_slow_request = None
         self.slow_responder = None
+        self.fast_decider = None
+        self.outcome_hold = None
+        self.outcome_hold_limit = 0
+        self.outcome_held = 0
+        self.outcome_release = asyncio.Event()
 
     async def handle(self, request):
         body = await request.json()
@@ -69,6 +75,13 @@ class Endpoint:
                              "finish_reason": "stop"}], "usage": {"total_tokens": 1}})
         self.calls.append(body)
         model = body["model"]
+        if (model == "slow" and self.outcome_hold
+                and self.outcome_held < self.outcome_hold_limit
+                and self.outcome_hold in json.dumps(body["messages"])
+                and not self.outcome_release.is_set()):
+            self.outcome_held += 1
+            self.model_entered.set()
+            await self.outcome_release.wait()
         if model == "slow" and self.on_slow_request is not None:
             self.on_slow_request()
         call = sum(c["model"] == model for c in self.calls)
@@ -81,7 +94,8 @@ class Endpoint:
             assert json.loads(body["messages"][1]["content"])["messages"]
             if self.fast_error:
                 return web.json_response({"error": {"message": "scripted failure"}}, status=500)
-            message["content"] = json.dumps({"action": self.fast_action})
+            action = self.fast_actions.pop(0) if self.fast_actions else self.fast_action
+            message["content"] = json.dumps({"action": action})
         elif model == "fast":
             self.fast_entered.set()
             await self.fast_gate.wait()
@@ -90,7 +104,11 @@ class Endpoint:
             function = next(t["function"] for t in body["tools"]
                             if t["function"]["name"] == "structured_output")
             assert set(function["parameters"]["properties"]) == {"action"}
-            result = {"action": self.fast_action}
+            if self.fast_decider is not None:
+                action = self.fast_decider(body)
+            else:
+                action = self.fast_actions.pop(0) if self.fast_actions else self.fast_action
+            result = {"action": action}
             message = self.tool_message("structured_output", result)
         elif self.slow_responder is not None:
             message = self.slow_responder(body)
@@ -281,6 +299,7 @@ async def world(tmp_path, monkeypatch, request):
             assert isinstance(result.native, DuplexNativeHarness), "real TeamHarness must construct duplex native"
         yield result
     finally:
+        endpoint.outcome_release.set()
         endpoint.model_gate.set()
         endpoint.fast_gate.set()
         tool.gate.set()
@@ -577,6 +596,50 @@ async def test_append_survives_a_later_interrupt_before_it_is_consumed(world):
     assert recovered.count(first) == 1
     assert recovered.count(second) == 1
     assert w.tool.path.read_text() == "committed\n"
+
+
+@pytest.mark.asyncio
+async def test_current_router_does_not_review_pending_group_when_correction_arrives_mid_drain(world):
+    """Characterize the pre-review framework; this is not the target behavior."""
+    w = world
+    await w.harness.send("Implement the order event system.")
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+
+    stale = [
+        "Implement the producer with Kafka.",
+        "Implement the consumer with Kafka.",
+        "Deploy and monitor the Kafka cluster.",
+    ]
+    correction = "Correction: do not use Kafka. Use Redis instead."
+    message_ids = [await send_message(w, text) for text in stale]
+
+    w.endpoint.fast_actions = ["APPEND", "APPEND", "APPEND", "INTERRUPT"]
+    w.endpoint.fast_entered.clear()
+    w.endpoint.fast_gate.clear()
+    drain = asyncio.create_task(poll_and_apply(w))
+    await asyncio.wait_for(w.endpoint.fast_entered.wait(), 3)
+
+    correction_id = await send_message(w, correction)
+    message_ids.append(correction_id)
+    w.endpoint.fast_gate.set()
+    await asyncio.wait_for(drain, 6)
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+
+    fast_calls = [call for call in w.endpoint.calls if call["model"] == "fast"]
+    assert len(fast_calls) == 4
+    screened_ids = set()
+    for call in fast_calls:
+        request = json.dumps(call)
+        present = {message_id for message_id in message_ids if message_id in request}
+        assert len(present) == 1
+        screened_ids.update(present)
+    assert screened_ids == set(message_ids)
+
+    admitted = json.dumps([call for call in w.endpoint.calls if call["model"] == "slow"][-1]["messages"])
+    for message_id, text in zip(message_ids, [*stale, correction], strict=True):
+        assert admitted.count(message_id) == 1
+        assert admitted.count(text) == 1
+    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
 
 
 @pytest.mark.asyncio
@@ -1348,3 +1411,101 @@ async def test_live_monitor_automatically_routes_real_artifact_correction(world,
         if not job.done():
             job.cancel()
         await asyncio.gather(job, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["current_router", "oracle"])
+async def test_coupled_team_outcome_changes_final_artifacts(world, tmp_path, arm):
+    """Fixed high-coupling team. The live master does not form this topology."""
+    from jiuwenswarm.benchmarks.duplex_metrics import Events
+    from jiuwenswarm.benchmarks.duplex_outcome import (
+        coupling_record, fold_instructions, load_case, member_name, score_artifact,
+    )
+    from jiuwenswarm.benchmarks.duplex_database_peer import DatabasePeer
+
+    case = load_case(Path(__file__).parents[1] / "fixtures/duplex/outcome/coupled-order-platform-migration.json")
+    names = [member["name"] for member in case["members"]]
+    w = world
+    w.endpoint.block_model = False
+    w.endpoint.outcome_hold = "Prepare an implementation-ready migration package"
+    w.endpoint.outcome_hold_limit = len(names)
+    w.endpoint.outcome_release.clear()
+    w.endpoint.slow_responder = lambda body: {
+        "role": "assistant",
+        "content": json.dumps(fold_instructions(json.dumps(body["messages"]))),
+    }
+    w.endpoint.fast_decider = lambda body: (
+        "INTERRUPT" if "Set backend to redis." in json.dumps(body) else "APPEND")
+    fast = w.host.tiny_agent_model_resolver("fast")
+    slow = fast.model_copy(update={"model_request_config": fast.model_request_config.model_copy(
+        update={"model_name": "slow"})})
+    events = Events(tmp_path / f"{arm}-events.jsonl")
+    peers = {}
+    for member in case["members"]:
+        name = member["name"]
+        peers[name] = DatabasePeer(
+            database=tmp_path / "team.sqlite3", team="coupled-outcome", name=name,
+            models={"slow": slow, "fast": fast}, policy="model",
+            system_prompt=case["initial_prompt"] + f"Your name: {name}.\n",
+            tools=[WriteOnce(tmp_path / f"{name}.txt")], events=events,
+            goal=lambda prompt=case["initial_prompt"]: prompt, max_iterations=4, max_model_calls=8)
+        peers[name].duplex_settings["timeout_seconds"] = 5
+    try:
+        for peer in peers.values():
+            await peer.start()
+        for peer in peers.values():
+            await peer.send(case["initial_prompt"])
+        await wait_until(lambda: w.endpoint.outcome_held == len(names), timeout=20)
+        w.endpoint.fast_gate.clear()
+        for index, member in enumerate(case["members"]):
+            sender = peers[names[(index + 1) % len(names)]]
+            first = member["assignment"] if arm == "current_router" else member["oracle"]
+            await sender.send_to(member["name"], first)
+        await wait_until(lambda: sum(call["model"] == "fast" for call in w.endpoint.calls) >= len(names), timeout=15)
+        if arm == "current_router":
+            for index, member in enumerate(case["members"]):
+                sender = peers[names[(index + 1) % len(names)]]
+                await sender.send_to(member["name"], member["correction"])
+        w.endpoint.fast_gate.set()
+
+        def resumed(member):
+            calls = [call for call in w.endpoint.calls if call["model"] == "slow"
+                     and member_name(json.dumps(call)) == member["name"]]
+            return calls[-1] if calls else None
+
+        def admitted(member):
+            call = resumed(member)
+            blob = json.dumps(call) if call is not None else ""
+            return member["oracle"] in blob if arm == "oracle" else member["correction"] in blob
+
+        await wait_until(lambda: all(admitted(member) for member in case["members"]), timeout=20)
+        scores = {}
+        for member in case["members"]:
+            calls = [call for call in w.endpoint.calls if call["model"] == "slow"
+                     and member_name(json.dumps(call)) == member["name"]]
+            blob = json.dumps(calls[-1]["messages"])
+            assert "implementation-ready migration package" in blob
+            scores[member["name"]] = score_artifact(
+                member["expected"], case["forbidden"], fold_instructions(blob))
+        report = {
+            "arm": arm,
+            "layer": case["layer"],
+            "prompt_sha256": case["prompt_sha256"],
+            "coupling": coupling_record(case["members"]),
+            "scores": scores,
+            "natural_master_formation": "not_run",
+        }
+        (tmp_path / "outcome-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        for name, score in scores.items():
+            if arm == "current_router":
+                assert score["stale_fields"] == [name], score
+                assert score["requirement_met"] is False
+            else:
+                assert score["requirement_met"] is True, score
+                assert score["stale_fields"] == []
+    finally:
+        w.endpoint.outcome_release.set()
+        w.endpoint.fast_gate.set()
+        for peer in reversed(list(peers.values())):
+            if peer.db is not None:
+                await peer.close()

@@ -1,0 +1,38 @@
+{
+  "case_id": "coupled-order-platform-migration",
+  "kind": "conflict",
+  "coupling": "high",
+  "layer": "causal-fixed-topology",
+  "initial_prompt_file": "prompts/coupled-order-platform-migration.md",
+  "prompt_sha256": "a8a607a4dea9efc26512a0e78d839d7781041d0ec754ac6e55ca5d5ca8d9e77f",
+  "forbidden": ["kafka"],
+  "members": [
+    {
+      "name": "producer",
+      "owns": ["producer.json"],
+      "depends_on": ["backend"],
+      "assignment": "Set producer to kafka. Set backend to kafka.",
+      "correction": "Set backend to redis.",
+      "oracle": "Set producer to redis. Set backend to redis.",
+      "expected": {"producer": "redis", "backend": "redis"}
+    },
+    {
+      "name": "consumer",
+      "owns": ["consumer.json"],
+      "depends_on": ["backend"],
+      "assignment": "Set consumer to kafka. Set backend to kafka.",
+      "correction": "Set backend to redis.",
+      "oracle": "Set consumer to redis. Set backend to redis.",
+      "expected": {"consumer": "redis", "backend": "redis"}
+    },
+    {
+      "name": "deployment",
+      "owns": ["deployment.json"],
+      "depends_on": ["backend"],
+      "assignment": "Set deployment to kafka. Set backend to kafka.",
+      "correction": "Set backend to redis.",
+      "oracle": "Set deployment to redis. Set backend to redis.",
+      "expected": {"deployment": "redis", "backend": "redis"}
+    }
+  ]
+}
