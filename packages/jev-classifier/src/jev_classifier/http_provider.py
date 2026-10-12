@@ -2,6 +2,7 @@
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -18,12 +19,25 @@ class JevHttpConfig:
     model: str
     api_key: str = field(repr=False)
     max_response_bytes: int = 65536
+    instructions: str = INSTRUCTIONS
+    criteria: Mapping[str, str] = field(default_factory=lambda: dict(CRITERIA))
 
     def __post_init__(self) -> None:
-        for name in ("endpoint", "model", "api_key"):
+        for name in ("endpoint", "model", "api_key", "instructions"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be nonempty text")
+        criteria = self.criteria
+        if (isinstance(criteria, str) or not isinstance(criteria, Mapping)
+                or set(criteria) != {"INTERRUPT", "APPEND"}):
+            raise ValueError("criteria must describe exactly INTERRUPT and APPEND")
+        copied = {}
+        for label in ("INTERRUPT", "APPEND"):
+            text = criteria[label]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"criteria[{label}] must be nonempty text")
+            copied[label] = text
+        object.__setattr__(self, "criteria", copied)
         try:
             url = httpx.URL(self.endpoint)
         except (httpx.InvalidURL, ValueError):
@@ -81,8 +95,8 @@ class JevHttpProvider:
         payload = {"model": self.config.model,
                    "state": {"context": context, "messages": list(messages)},
                    "questions": {"action": {
-                       "type": "choice", "instructions": INSTRUCTIONS,
-                       "criteria": dict(CRITERIA),
+                       "type": "choice", "instructions": self.config.instructions,
+                       "criteria": dict(self.config.criteria),
                    }}}
         client = self.client if self.client is not None else httpx.AsyncClient()
         try:

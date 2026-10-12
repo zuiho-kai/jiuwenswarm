@@ -116,6 +116,9 @@ state to fill in missing information.
 
 The built-in provider uses the typed-choice wire format already used by this
 repository: `model`, object `state`, and `questions.action` with two criteria.
+`JevHttpConfig` sends `INSTRUCTIONS` and `CRITERIA` unless `instructions` or
+`criteria` is supplied. Custom criteria must still describe exactly `INTERRUPT`
+and `APPEND`; only the wording changes. The returned label stays one of those two.
 It expects `answers.action` to contain `type="choice"`, a valid `choice`, numeric
 `confidence`, and probabilities for exactly INTERRUPT and APPEND. Probabilities
 must be in [0, 1], sum to one within 1e-5, and agree with the selected choice.
