@@ -11,10 +11,12 @@ from .errors import (
     ProviderError,
 )
 from .http_provider import JevHttpConfig, JevHttpProvider
+from .prompts import CRITERIA, INSTRUCTIONS
 
 __all__ = [
-    "ClassifierConfig", "Decision", "DecisionProvider", "InputTooLargeError",
-    "InsufficientContextError", "InvalidInputError", "InvalidResponseError", "JevClassifier",
-    "JevError", "JevHttpConfig", "JevHttpProvider", "JevTimeoutError", "ProviderError",
+    "CRITERIA", "ClassifierConfig", "Decision", "DecisionProvider", "INSTRUCTIONS",
+    "InputTooLargeError", "InsufficientContextError", "InvalidInputError",
+    "InvalidResponseError", "JevClassifier", "JevError", "JevHttpConfig", "JevHttpProvider",
+    "JevTimeoutError", "ProviderError",
 ]
 

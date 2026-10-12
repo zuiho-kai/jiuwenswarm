@@ -60,6 +60,38 @@ def test_http_contract_and_low_confidence_interrupt_is_not_rewritten():
     assert action["instructions"] == INSTRUCTIONS
     assert action["criteria"] == CRITERIA
     assert "test-secret" not in request.content.decode()
+
+
+def test_custom_instructions_and_criteria_are_sent_unchanged():
+    supplied = {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
+    config = replace(CONFIG, instructions="Custom routing instructions.", criteria=dict(supplied))
+    supplied["INTERRUPT"] = "mutated after construction"
+
+    def handler(request):
+        action = json.loads(request.content)["questions"]["action"]
+        assert action["instructions"] == "Custom routing instructions."
+        assert action["criteria"] == {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
+        return httpx.Response(200, json=answer())
+
+    assert asyncio.run(classify_http(handler, config=config)) == "INTERRUPT"
+
+
+@pytest.mark.parametrize("criteria", [
+    {},
+    {"INTERRUPT": "Stop."},
+    {"INTERRUPT": "Stop.", "APPEND": "Continue.", "OTHER": "No."},
+    {"INTERRUPT": "Stop.", "APPEND": " "},
+    {"INTERRUPT": "Stop.", "APPEND": None},
+    "INTERRUPT or APPEND",
+])
+def test_criteria_must_keep_both_routing_labels(criteria):
+    with pytest.raises(ValueError):
+        replace(CONFIG, criteria=criteria)
+
+
+def test_blank_instructions_are_rejected():
+    with pytest.raises(ValueError):
+        replace(CONFIG, instructions="  ")
     assert "test-secret" not in repr(CONFIG)
 
 
