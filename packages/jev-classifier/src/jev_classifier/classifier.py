@@ -4,7 +4,7 @@ import asyncio
 import json
 import math
 from dataclasses import dataclass
-from typing import Literal, Protocol, cast
+from typing import Any, Protocol
 
 from .errors import (
     InputTooLargeError,
@@ -16,14 +16,14 @@ from .errors import (
     ProviderError,
 )
 
-Decision = Literal["INTERRUPT", "APPEND"]
+Decision = dict[str, str]
 
 
 class DecisionProvider(Protocol):
     """An HTTP, SDK or test adapter. Implementations must honor cancellation."""
 
     async def decide(self, *, context: str, messages: tuple[str, ...]) -> Decision:
-        """Return one delivery decision for the supplied batch, or raise."""
+        """Return one choice for each configured question, or raise."""
         ...
 
 
@@ -80,6 +80,20 @@ def _validate_input(
     return batch
 
 
+def _validate_decision(decision: Any) -> Decision:
+    """Accept the provider's choices. Allowed labels come from each question's criteria."""
+    if not isinstance(decision, dict) or not decision:
+        raise InvalidResponseError("provider must return a choice for each question")
+    choices: Decision = {}
+    for name, choice in decision.items():
+        if type(name) is not str or not name.strip() or name != name.strip():
+            raise InvalidResponseError("each question name must be nonempty text")
+        if type(choice) is not str or not choice.strip() or choice != choice.strip():
+            raise InvalidResponseError("each question choice must be nonempty text")
+        choices[name] = choice
+    return choices
+
+
 class JevClassifier:
     """One provider call per batch; no routing, state lookup or message delivery."""
 
@@ -88,7 +102,7 @@ class JevClassifier:
         self.config = config if config is not None else ClassifierConfig()
 
     async def classify(self, *, context: str, messages: list[str] | tuple[str, ...]) -> Decision:
-        """Return exactly INTERRUPT or APPEND; failures are exceptions.
+        """Return one choice per question; failures are exceptions.
 
         Messages are ordered and classified jointly against one recipient's
         context. The caller owns correlation and the applicability of a result.
@@ -105,7 +119,5 @@ class JevClassifier:
             # Raw provider errors may include credentials or input content.
             raise ProviderError("decision provider failed") from None
         # CancelledError is a BaseException and propagates to the caller.
-        if type(decision) is not str or decision not in ("INTERRUPT", "APPEND"):
-            raise InvalidResponseError("provider must return exactly INTERRUPT or APPEND")
-        return cast(Decision, decision)
+        return _validate_decision(decision)
 

@@ -16,8 +16,8 @@ from jev_classifier import (
 
 
 class StubProvider:
-    def __init__(self, result="APPEND"):
-        self.result = result
+    def __init__(self, result=...):
+        self.result = {"action": "APPEND"} if result is ... else result
         self.calls = []
 
     async def decide(self, *, context, messages):
@@ -25,12 +25,12 @@ class StubProvider:
         return self.result
 
 
-@pytest.mark.parametrize("label", ["APPEND", "INTERRUPT"])
+@pytest.mark.parametrize("label", ["APPEND", "INTERRUPT", "NOW"])
 def test_classifies_whole_batch_once_without_runtime_metadata(label):
-    provider = StubProvider(label)
+    provider = StubProvider({"action": label})
     classifier = JevClassifier(provider)
     messages = ["Use revised data.", "Keep the agreed report format."]
-    assert asyncio.run(classifier.classify(context="Computing the report.", messages=messages)) == label
+    assert asyncio.run(classifier.classify(context="Computing the report.", messages=messages)) == {"action": label}
     assert provider.calls == [("Computing the report.", tuple(messages))]
 
 
@@ -58,7 +58,7 @@ def test_input_limit_counts_utf8_and_json_overhead_without_truncating():
     ).encode("utf-8"))
     provider = StubProvider()
     exact = JevClassifier(provider, ClassifierConfig(max_input_bytes=size))
-    assert asyncio.run(exact.classify(context=context, messages=messages)) == "APPEND"
+    assert asyncio.run(exact.classify(context=context, messages=messages)) == {"action": "APPEND"}
     too_small = JevClassifier(provider, ClassifierConfig(max_input_bytes=size - 1))
     with pytest.raises(InputTooLargeError):
         asyncio.run(too_small.classify(context=context, messages=messages))
@@ -73,8 +73,11 @@ def test_message_count_limit_prevents_provider_call():
     assert provider.calls == []
 
 
-@pytest.mark.parametrize("value", [None, {}, {"action": "APPEND"}, "append", "APPEND\n", "ABORT"])
-def test_custom_provider_output_must_be_exact_label(value):
+@pytest.mark.parametrize("value", [
+    None, {}, "APPEND", {"action": ""}, {"action": None}, {"": "APPEND"},
+    {"action": " APPEND"}, {" action": "APPEND"},
+])
+def test_malformed_provider_choices_are_rejected(value):
     with pytest.raises(InvalidResponseError):
         asyncio.run(JevClassifier(StubProvider(value)).classify(context="working", messages=["update"]))
 
@@ -152,14 +155,14 @@ def test_concurrent_requests_keep_their_own_context():
         class Provider:
             async def decide(self, *, context, messages):
                 await asyncio.sleep(0)
-                return "INTERRUPT" if context == "affected work" else "APPEND"
+                return {"action": "INTERRUPT"} if context == "affected work" else {"action": "APPEND"}
 
         classifier = JevClassifier(Provider())
         results = await asyncio.gather(
             classifier.classify(context="affected work", messages=["correction"]),
             classifier.classify(context="unrelated work", messages=["correction"]),
         )
-        assert results == ["INTERRUPT", "APPEND"]
+        assert results == [{"action": "INTERRUPT"}, {"action": "APPEND"}]
 
     asyncio.run(run())
 

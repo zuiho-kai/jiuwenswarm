@@ -1,4 +1,4 @@
-"""Context + new messages -> INTERRUPT or APPEND; no agent runtime dependency."""
+"""Context and new messages, plus the configured questions, produce one choice each."""
 
 from .classifier import ClassifierConfig, Decision, DecisionProvider, JevClassifier
 from .errors import (

@@ -7,6 +7,7 @@ import pytest
 
 from jev_classifier import (
     ClassifierConfig,
+    InvalidInputError,
     InvalidResponseError,
     JevClassifier,
     JevHttpConfig,
@@ -18,6 +19,7 @@ from jev_classifier.http_provider import parse_response
 from jev_classifier.prompts import CRITERIA, INSTRUCTIONS
 
 CONFIG = JevHttpConfig("https://jev.example/v1/systemone", "test-model", "test-secret")
+BARE = JevHttpConfig.without_questions(CONFIG.endpoint, CONFIG.model, "test-secret")
 
 
 def answer(choice="INTERRUPT", p_interrupt=0.95):
@@ -45,7 +47,8 @@ def test_http_contract_and_low_confidence_interrupt_is_not_rewritten():
         requests.append(request)
         return httpx.Response(200, json=answer(p_interrupt=0.6))
 
-    assert asyncio.run(classify_http(handler)) == "INTERRUPT"
+    assert asyncio.run(classify_http(handler)) == {"action": "INTERRUPT"}
+    assert "test-secret" not in repr(CONFIG)
     request, = requests
     assert request.method == "POST"
     assert str(request.url) == CONFIG.endpoint
@@ -64,7 +67,7 @@ def test_http_contract_and_low_confidence_interrupt_is_not_rewritten():
 
 def test_custom_instructions_and_criteria_are_sent_unchanged():
     supplied = {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
-    config = replace(CONFIG, instructions="Custom routing instructions.", criteria=dict(supplied))
+    config = BARE.add_question(instructions="Custom routing instructions.", criteria=dict(supplied))
     supplied["INTERRUPT"] = "mutated after construction"
 
     def handler(request):
@@ -73,37 +76,93 @@ def test_custom_instructions_and_criteria_are_sent_unchanged():
         assert action["criteria"] == {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
         return httpx.Response(200, json=answer())
 
-    assert asyncio.run(classify_http(handler, config=config)) == "INTERRUPT"
+    assert asyncio.run(classify_http(handler, config=config)) == {"action": "INTERRUPT"}
+
+
+def test_constructor_installs_the_original_prompt():
+    assert CONFIG.questions["action"].instructions == INSTRUCTIONS
+    assert CONFIG.questions["action"].criteria == CRITERIA
+    added = BARE.add_question()
+    assert added.questions["action"].instructions == INSTRUCTIONS
+    assert added.questions["action"].criteria == CRITERIA
+    assert BARE.questions == {}
+
+
+def test_no_questions_is_rejected_before_the_request():
+    def handler(request):
+        raise AssertionError("request must not be sent")
+
+    with pytest.raises(InvalidInputError, match="question"):
+        asyncio.run(classify_http(handler, config=BARE))
+
+
+def test_additional_question_uses_its_own_criteria():
+    urgency = {"NOW": "Do it now.", "LATER": "Wait."}
+    config = CONFIG.add_question("urgency", instructions="Pick urgency.", criteria=dict(urgency))
+    urgency["NOW"] = "mutated"
+    body = answer()
+    body["answers"]["urgency"] = {
+        "type": "choice", "choice": "NOW", "confidence": 0.7,
+        "probabilities": {"NOW": 0.8, "LATER": 0.2},
+    }
+
+    def handler(request):
+        questions = json.loads(request.content)["questions"]
+        assert set(questions) == {"action", "urgency"}
+        assert questions["urgency"]["criteria"] == {"NOW": "Do it now.", "LATER": "Wait."}
+        assert questions["action"]["criteria"] == CRITERIA
+        return httpx.Response(200, json=body)
+
+    assert asyncio.run(classify_http(handler, config=config)) == {"action": "INTERRUPT", "urgency": "NOW"}
+    with pytest.raises(InvalidResponseError):
+        parse_response(answer(), config.questions)
 
 
 @pytest.mark.parametrize("criteria", [
     {},
-    {"INTERRUPT": "Stop."},
-    {"INTERRUPT": "Stop.", "APPEND": "Continue.", "OTHER": "No."},
-    {"INTERRUPT": "Stop.", "APPEND": " "},
-    {"INTERRUPT": "Stop.", "APPEND": None},
-    "INTERRUPT or APPEND",
+    {"ONLY": "One."},
+    {"NOW": " ", "LATER": "Wait."},
+    {"NOW": None, "LATER": "Wait."},
+    {" NOW": "Do it now.", "LATER": "Wait."},
+    "NOW or LATER",
 ])
-def test_criteria_must_keep_both_routing_labels(criteria):
+def test_invalid_criteria(criteria):
     with pytest.raises(ValueError):
-        replace(CONFIG, criteria=criteria)
+        BARE.add_question("urgency", instructions="Pick urgency.", criteria=criteria)
+
+
+@pytest.mark.parametrize("config,kwargs", [
+    (BARE, {"instructions": "  "}),
+    (BARE, {"criteria": CRITERIA}),
+    (BARE, {"instructions": INSTRUCTIONS}),
+    (BARE, {"name": " "}),
+    (CONFIG, {"name": "action"}),
+])
+def test_invalid_question(config, kwargs):
+    with pytest.raises(ValueError):
+        config.add_question(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"instructions": None}, {"criteria": None}])
+def test_constructor_requires_both_prompt_parts(kwargs):
+    with pytest.raises(ValueError):
+        JevHttpConfig(CONFIG.endpoint, CONFIG.model, "test-secret", **kwargs)
 
 
 def test_blank_instructions_are_rejected():
     with pytest.raises(ValueError):
-        replace(CONFIG, instructions="  ")
-    assert "test-secret" not in repr(CONFIG)
+        BARE.add_question(instructions="  ", criteria=CRITERIA)
 
 
 @pytest.mark.parametrize("choice,probability", [("APPEND", 0.1), ("INTERRUPT", 1), ("APPEND", 0.5)])
 def test_valid_response(choice, probability):
-    assert parse_response(answer(choice, probability)) == choice
+    assert parse_response(answer(choice, probability), CONFIG.questions) == {"action": choice}
 
 
 @pytest.mark.parametrize("body", [None, [], {}, {"answers": []}, {"answers": {"action": []}}])
 def test_missing_response_shape(body):
     with pytest.raises(InvalidResponseError):
-        parse_response(body)
+        parse_response(body, CONFIG.questions)
 
 
 @pytest.mark.parametrize("patch", [
@@ -122,7 +181,7 @@ def test_invalid_typed_answer(patch):
     body = answer()
     body["answers"]["action"].update(patch)
     with pytest.raises(InvalidResponseError):
-        parse_response(body)
+        parse_response(body, CONFIG.questions)
 
 
 @pytest.mark.parametrize("status", [302, 401, 422, 429, 500, 503])
@@ -213,7 +272,7 @@ def test_owned_client_is_closed(monkeypatch):
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=answer())))
     monkeypatch.setattr("jev_classifier.http_provider.httpx.AsyncClient", lambda: client)
     classifier = JevClassifier(JevHttpProvider(CONFIG))
-    assert asyncio.run(classifier.classify(context="working", messages=["update"])) == "INTERRUPT"
+    assert asyncio.run(classifier.classify(context="working", messages=["update"])) == {"action": "INTERRUPT"}
     assert client.is_closed
 
 

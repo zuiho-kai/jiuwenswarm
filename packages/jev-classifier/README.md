@@ -3,8 +3,8 @@
 An async Python component with one public classification operation:
 
 ```python
-behavior = await classifier.classify(context="...", messages=["...", "..."])
-# Exactly "INTERRUPT" or "APPEND" on success; explicit exceptions on failure.
+choices = await classifier.classify(context="...", messages=["...", "..."])
+# One choice per configured question, for example {"action": "INTERRUPT"}.
 ```
 
 The package depends on `httpx` and Python 3.11+, with no JiuwenSwarm, agent-core,
@@ -44,11 +44,11 @@ async def main():
             JevHttpProvider(config, client=client),
             ClassifierConfig(timeout_seconds=2.0),
         )
-        behavior = await classifier.classify(
+        choices = await classifier.classify(
             context="The user requested a revenue report. I am calculating totals from input v1.",
             messages=["The user supplied corrected input v2. Use it for the current report."],
         )
-        print(behavior)
+        print(choices)
 
 asyncio.run(main())
 ```
@@ -63,7 +63,9 @@ call when run with those variables set. No live API call is made during tests.
 | `context` | Nonempty text describing one recipient's relevant task, current activity, requirements and conversation. Callers may serialize structured context into this string. There is no required runtime schema. |
 | `messages` | Nonempty list or tuple of nonempty strings, in caller-supplied order. The sequence is copied before awaiting the provider. |
 
-The output is one label for the **whole batch**:
+`JevHttpConfig` installs the module prompt as a question named `action`. Pass `instructions` and `criteria` to replace that prompt. `JevHttpConfig.without_questions()` starts empty, and `add_question()` with no arguments installs the same prompt. Further calls add more named questions. Each question needs at least two criteria, and those labels do not have to be `INTERRUPT` and `APPEND`.
+
+The output is one choice per question for the **whole batch**. For the original `action` question the labels are:
 
 - `INTERRUPT`: the messages require changing ongoing work before it continues.
 - `APPEND`: the messages can be incorporated without interrupting ongoing work.
@@ -88,7 +90,7 @@ result still applies to the work before acting on it.
 
 | Exception | Meaning |
 | --- | --- |
-| `InvalidInputError` | Wrong input type, empty message, or invalid Unicode. |
+| `InvalidInputError` | Wrong input type, empty message, invalid Unicode, or no questions configured. |
 | `InsufficientContextError` | Context is blank. This is a subtype of InvalidInputError. |
 | `InputTooLargeError` | More than 64 messages or over 32,768 UTF-8 bytes by default. |
 | `InvalidResponseError` | Invalid typed answer, invalid probabilities, malformed JSON or response over the configured size. |
@@ -115,18 +117,20 @@ state to fill in missing information.
 ## Provider contract
 
 The built-in provider uses the typed-choice wire format already used by this
-repository: `model`, object `state`, and `questions.action` with two criteria.
-`JevHttpConfig` sends `INSTRUCTIONS` and `CRITERIA` unless `instructions` or
-`criteria` is supplied. Custom criteria must still describe exactly `INTERRUPT`
-and `APPEND`; only the wording changes. The returned label stays one of those two.
-It expects `answers.action` to contain `type="choice"`, a valid `choice`, numeric
-`confidence`, and probabilities for exactly INTERRUPT and APPEND. Probabilities
-must be in [0, 1], sum to one within 1e-5, and agree with the selected choice.
-Additional provider metadata is ignored.
+repository: `model`, object `state` with `context` and `messages`, and a `questions`
+object with one entry per configured question. Each entry has `type="choice"`,
+`instructions`, and `criteria`. Omitting questions is rejected before the request.
+`JevHttpConfig` sends that prompt by default: `INSTRUCTIONS` and `CRITERIA` on the `action` question. `without_questions()` sends nothing until `add_question()` adds one.
 
-The validated choice is returned directly. There is no probability threshold that
-silently converts INTERRUPT into APPEND. Confidence is validated but does not
-change the label. There are no automatic retries or redirects. The module does
+Each `answers` entry must match a requested question and contain `type="choice"`,
+a `choice` that is one of that question's criteria, numeric `confidence`, and
+probabilities for exactly those criteria. Probabilities must be in [0, 1], sum to
+one within 1e-5, and agree with the selected choice. Additional provider metadata
+is ignored.
+
+The validated choices are returned directly. There is no probability threshold that
+silently converts one label into another. Confidence is validated but does not
+change the choice. There are no automatic retries or redirects. The module does
 not log credentials, input text or raw response bodies. Injected HTTP clients stay
 caller-owned; otherwise a temporary client is created and closed for each call.
 
@@ -134,7 +138,7 @@ An SDK-backed provider can implement `DecisionProvider` without changing callers
 
 ```python
 class MyProvider:
-    async def decide(self, *, context: str, messages: tuple[str, ...]) -> str:
+    async def decide(self, *, context: str, messages: tuple[str, ...]) -> dict[str, str]:
         # Call a configured provider/SDK and validate its response here.
         ...
 ```
