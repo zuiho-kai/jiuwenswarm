@@ -1,7 +1,8 @@
 """Real SQLite -> SDK mailbox -> TinyAgent HTTP -> Native/ReAct/tools -> ACK.
 
-Only model responses are scripted. No dispatcher, harness, context, tool
-executor, fast-model adapter, or message-manager method is mocked.
+Model responses are scripted. The Stage 0 trace test additionally installs an
+explicit test-only parking adapter; it does not implement a production hold.
+The SDK dispatcher, harness, context, tools and message manager remain real.
 """
 from __future__ import annotations
 
@@ -319,6 +320,87 @@ async def send_message(world, text="Customer forbids Kafka. Use PostgreSQL."):
 
 async def poll_and_apply(world):
     await world.handler.on_poll_mailbox(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("world", [{"mode": "off"}], indirect=True)
+@pytest.mark.parametrize("park", [False, True], ids=["sdk_queue", "park_contract"])
+async def test_message_review_stage0_delivery_trace(world, tmp_path, monkeypatch, park):
+    """Separate delivery/ACK from admission using the real SDK mailbox.
+
+    Parking is only a file-backed handoff contract fixture. It neither pauses
+    the recipient nor proves Stage 1's race, crash or recovery guarantees.
+    """
+    w = world
+    trace = []
+    trace_path = tmp_path / "message-review-stage0-trace.json"
+    parked_path = tmp_path / "parked-input.json"
+    message_id = None
+
+    def emit(event):
+        trace.append({"schema_version": 1, "sequence": len(trace) + 1,
+                      "message_id": message_id, "recipient": "A2", "event": event,
+                      "parking_fixture": park})
+        trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+
+    def observe_admission():
+        latest = w.endpoint.calls[-1]
+        if (message_id and message_id in json.dumps(latest["messages"])
+                and not any(row["event"] == "model_admitted" for row in trace)):
+            emit("model_admitted")
+
+    w.endpoint.on_slow_request = observe_admission
+    await w.harness.send("Implement the order event system.")
+    await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
+    message_id = await send_message(w, "Retain idempotency in the producer.")
+    emit("mailbox_persisted")
+    original_delivery = w.host.deliver_input
+
+    async def delivery(content, *, use_steer=True):
+        assert content.message.message_id == message_id
+        if park:
+            # Persist identity and the original rendering BEFORE returning
+            # ownership to the SDK, which will then acknowledge this message.
+            with parked_path.open("w", encoding="utf-8") as stream:
+                json.dump({"schema_version": 1, "message_id": message_id,
+                           "sender": content.message.sender, "recipient": "A2",
+                           "original_content": content.message.content,
+                           "rendered_input": str(content)}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            emit("application_parked")
+        else:
+            await original_delivery(content, use_steer=use_steer)
+            emit("runtime_accepted")
+        emit("sdk_delivered")
+
+    monkeypatch.setattr(w.host, "deliver_input", delivery)
+    await asyncio.wait_for(poll_and_apply(w), 6)
+    assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
+    emit("sdk_acknowledged")
+    assert not any(row["event"] == "model_admitted" for row in trace)
+
+    # Let the existing execution finish. Normal steering reaches a later
+    # request; a parked input remains absent even though the SDK ACKed it.
+    w.endpoint.model_gate.set()
+    await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+    if park:
+        assert not any(row["event"] == "model_admitted" for row in trace)
+        parked = json.loads(parked_path.read_text(encoding="utf-8"))
+        assert parked["message_id"] == message_id
+        assert parked["original_content"] == "Retain idempotency in the producer."
+        emit("application_released")
+        await original_delivery(parked["rendered_input"])
+        await wait_until(lambda: any(row["event"] == "model_admitted" for row in trace))
+        await wait_until(lambda: w.harness.state is HarnessState.IDLE)
+
+    events = [row["event"] for row in trace]
+    assert events == (["mailbox_persisted", "application_parked", "sdk_delivered",
+                       "sdk_acknowledged", "application_released", "model_admitted"]
+                      if park else ["mailbox_persisted", "runtime_accepted",
+                                    "sdk_delivered", "sdk_acknowledged", "model_admitted"])
+    assert all(row["message_id"] == message_id for row in trace)
+    assert not any(call["model"] == "fast" for call in w.endpoint.calls)
 
 
 @pytest.mark.asyncio
@@ -1166,15 +1248,19 @@ async def test_four_strategies_at_same_tool_boundary(world, group, use_steer, re
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("world", [{"mode": "shadow"}], indirect=True)
-async def test_inactive_mode_uses_original_native_without_fast_call(world):
+@pytest.mark.parametrize("world,fast_calls", [({"mode": "off"}, 0),
+                                             ({"mode": "shadow"}, 1)], indirect=["world"])
+async def test_inactive_modes_preserve_original_native_without_interrupt(world, fast_calls):
+    from jiuwenswarm.agents.harness.team.duplex_shadow import drain_shadow_observations
+
     w = world
     assert not isinstance(w.native, DuplexNativeHarness)
     await w.harness.send("Implement the order system.")
     await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
     await send_message(w)
     await poll_and_apply(w)
-    assert not any(c["model"] == "fast" for c in w.endpoint.calls)
+    await asyncio.wait_for(drain_shadow_observations(), 3)
+    assert sum(c["model"] == "fast" for c in w.endpoint.calls) == fast_calls
     assert w.harness.state is HarnessState.RUNNING
     assert w.native.active_round.round_id == 1
     assert not any(t["function"]["name"] == "update_working_intent"
