@@ -5,19 +5,19 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from jev_classifier import (
+from choice_classifier import (
     ChoiceAnswer,
     ClassifierConfig,
     InvalidInputError,
     InvalidResponseError,
-    JevClassifier,
+    ChoiceClassifier,
     TypedChoiceConfig,
     TypedChoiceProvider,
-    JevTimeoutError,
+    ClassifierTimeoutError,
     ProviderError,
 )
-from jev_classifier.typed_choice_provider import parse_response
-from jev_classifier.prompts import CRITERIA, INSTRUCTIONS
+from choice_classifier.typed_choice_provider import parse_response
+from choice_classifier.prompts import CRITERIA, INSTRUCTIONS
 
 CONFIG = TypedChoiceConfig("https://jev.example/v1/systemone", "test-model", "test-secret")
 BARE = TypedChoiceConfig.without_questions(CONFIG.endpoint, CONFIG.model, "test-secret")
@@ -34,7 +34,7 @@ async def classify_http(handler, *, config=CONFIG, classifier_config=None):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
         provider = TypedChoiceProvider(config, client=client)
         try:
-            return await JevClassifier(provider, classifier_config).classify(
+            return await ChoiceClassifier(provider, classifier_config).classify(
                 context="Calculate using input v1.", messages=["Use corrected input v2.", "Keep CSV output."],
             )
         finally:
@@ -210,7 +210,7 @@ def test_http_errors_are_not_retried_or_redirected(status):
 
 
 @pytest.mark.parametrize("exc,error", [
-    (httpx.ReadTimeout("secret timeout detail"), JevTimeoutError),
+    (httpx.ReadTimeout("secret timeout detail"), ClassifierTimeoutError),
     (httpx.ConnectError("secret transport detail"), ProviderError),
 ])
 def test_transport_failure(exc, error):
@@ -258,7 +258,7 @@ def test_stream_limit_closes_response():
 
 def test_deadline_includes_response_body_and_closes_stream():
     stream = BodyStream(block=True)
-    with pytest.raises(JevTimeoutError):
+    with pytest.raises(ClassifierTimeoutError):
         asyncio.run(classify_http(
             lambda request: httpx.Response(200, stream=stream),
             classifier_config=ClassifierConfig(timeout_seconds=0.02),
@@ -281,8 +281,8 @@ def test_http_caller_cancellation_closes_stream():
 
 def test_owned_client_is_closed(monkeypatch):
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=answer())))
-    monkeypatch.setattr("jev_classifier.typed_choice_provider.httpx.AsyncClient", lambda: client)
-    classifier = JevClassifier(TypedChoiceProvider(CONFIG))
+    monkeypatch.setattr("choice_classifier.typed_choice_provider.httpx.AsyncClient", lambda: client)
+    classifier = ChoiceClassifier(TypedChoiceProvider(CONFIG))
     assert asyncio.run(classifier.classify(context="working", messages=["update"])) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8)}
     assert client.is_closed
 

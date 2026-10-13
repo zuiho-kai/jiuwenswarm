@@ -1,11 +1,11 @@
 """Classification failures, kept separate from successful delivery decisions."""
 
 
-class JevError(Exception):
+class ClassifierError(Exception):
     """Base class for failures handled by the integration's fallback policy."""
 
 
-class InvalidInputError(JevError):
+class InvalidInputError(ClassifierError):
     """Input has an invalid type or empty message."""
 
 
@@ -17,14 +17,14 @@ class InputTooLargeError(InvalidInputError):
     """Input exceeds the configured limit; no content was truncated."""
 
 
-class InvalidResponseError(JevError):
+class InvalidResponseError(ClassifierError):
     """Provider response does not satisfy the decision contract."""
 
 
-class JevTimeoutError(JevError):
+class ClassifierTimeoutError(ClassifierError):
     """The classification deadline or transport timeout expired."""
 
 
-class ProviderError(JevError):
+class ProviderError(ClassifierError):
     """The provider or HTTP transport failed."""
 

@@ -3,15 +3,15 @@ import json
 
 import pytest
 
-from jev_classifier import (
+from choice_classifier import (
     ChoiceAnswer,
     ClassifierConfig,
     InputTooLargeError,
     InsufficientContextError,
     InvalidInputError,
     InvalidResponseError,
-    JevClassifier,
-    JevTimeoutError,
+    ChoiceClassifier,
+    ClassifierTimeoutError,
     ProviderError,
 )
 
@@ -33,7 +33,7 @@ class StubProvider:
 @pytest.mark.parametrize("label", ["APPEND", "INTERRUPT", "NOW"])
 def test_classifies_whole_batch_once_without_runtime_metadata(label):
     provider = StubProvider({"action": full_answer(label)})
-    classifier = JevClassifier(provider)
+    classifier = ChoiceClassifier(provider)
     messages = ["Use revised data.", "Keep the agreed report format."]
     assert asyncio.run(classifier.classify(context="Computing the report.", messages=messages)) == {"action": full_answer(label)}
     assert provider.calls == [("Computing the report.", tuple(messages))]
@@ -52,7 +52,7 @@ def test_classifies_whole_batch_once_without_runtime_metadata(label):
 def test_invalid_input_never_calls_provider(context, messages, error):
     provider = StubProvider()
     with pytest.raises(error):
-        asyncio.run(JevClassifier(provider).classify(context=context, messages=messages))
+        asyncio.run(ChoiceClassifier(provider).classify(context=context, messages=messages))
     assert provider.calls == []
 
 
@@ -62,9 +62,9 @@ def test_input_limit_counts_utf8_and_json_overhead_without_truncating():
         {"context": context, "messages": messages}, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8"))
     provider = StubProvider()
-    exact = JevClassifier(provider, ClassifierConfig(max_input_bytes=size))
+    exact = ChoiceClassifier(provider, ClassifierConfig(max_input_bytes=size))
     assert asyncio.run(exact.classify(context=context, messages=messages)) == {"action": full_answer("APPEND")}
-    too_small = JevClassifier(provider, ClassifierConfig(max_input_bytes=size - 1))
+    too_small = ChoiceClassifier(provider, ClassifierConfig(max_input_bytes=size - 1))
     with pytest.raises(InputTooLargeError):
         asyncio.run(too_small.classify(context=context, messages=messages))
     assert len(provider.calls) == 1
@@ -72,7 +72,7 @@ def test_input_limit_counts_utf8_and_json_overhead_without_truncating():
 
 def test_message_count_limit_prevents_provider_call():
     provider = StubProvider()
-    classifier = JevClassifier(provider, ClassifierConfig(max_messages=1))
+    classifier = ChoiceClassifier(provider, ClassifierConfig(max_messages=1))
     with pytest.raises(InputTooLargeError):
         asyncio.run(classifier.classify(context="working", messages=["one", "two"]))
     assert provider.calls == []
@@ -90,7 +90,7 @@ def test_message_count_limit_prevents_provider_call():
 ])
 def test_malformed_provider_choices_are_rejected(value):
     with pytest.raises(InvalidResponseError):
-        asyncio.run(JevClassifier(StubProvider(value)).classify(context="working", messages=["update"]))
+        asyncio.run(ChoiceClassifier(StubProvider(value)).classify(context="working", messages=["update"]))
 
 
 @pytest.mark.parametrize("timeout", [True, 0, -1, "2", float("nan"), float("inf"), 10**1000])
@@ -117,8 +117,8 @@ def test_deadline_cancels_provider_and_does_not_return_append():
                 finally:
                     cancelled.set()
 
-        classifier = JevClassifier(WaitingProvider(), ClassifierConfig(timeout_seconds=0.02))
-        with pytest.raises(JevTimeoutError):
+        classifier = ChoiceClassifier(WaitingProvider(), ClassifierConfig(timeout_seconds=0.02))
+        with pytest.raises(ClassifierTimeoutError):
             await classifier.classify(context="working", messages=["update"])
         assert cancelled.is_set()
 
@@ -137,7 +137,7 @@ def test_caller_cancellation_propagates_and_batch_is_copied():
                 await asyncio.Event().wait()
 
         messages = ["original"]
-        task = asyncio.create_task(JevClassifier(WaitingProvider()).classify(
+        task = asyncio.create_task(ChoiceClassifier(WaitingProvider()).classify(
             context="working", messages=messages,
         ))
         await asyncio.wait_for(entered.wait(), 1)
@@ -156,7 +156,7 @@ def test_unexpected_provider_failure_is_sanitized():
             raise RuntimeError("secret-token and private-message-content")
 
     with pytest.raises(ProviderError) as error:
-        asyncio.run(JevClassifier(BrokenProvider()).classify(context="working", messages=["update"]))
+        asyncio.run(ChoiceClassifier(BrokenProvider()).classify(context="working", messages=["update"]))
     assert str(error.value) == "decision provider failed"
     assert error.value.__suppress_context__
 
@@ -168,7 +168,7 @@ def test_concurrent_requests_keep_their_own_context():
                 await asyncio.sleep(0)
                 return {"action": full_answer("INTERRUPT")} if context == "affected work" else {"action": full_answer("APPEND")}
 
-        classifier = JevClassifier(Provider())
+        classifier = ChoiceClassifier(Provider())
         results = await asyncio.gather(
             classifier.classify(context="affected work", messages=["correction"]),
             classifier.classify(context="unrelated work", messages=["correction"]),

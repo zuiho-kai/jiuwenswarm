@@ -1,4 +1,4 @@
-# Independent JEV classifier
+# Independent choice classifier
 
 An async Python component with one public classification operation:
 
@@ -13,7 +13,7 @@ The package depends on `httpx` and Python 3.11+, with no JiuwenSwarm, agent-core
 native-harness, database or queue dependency. It reads only the supplied input.
 The caller assembles context and applies delivery behavior.
 
-Keep this package at `packages/jev-classifier` and install it on its own.
+Keep this package at `packages/choice-classifier` and install it on its own.
 JiuwenSwarm integration, including when to call it and how to apply the label,
 stays outside this package.
 
@@ -22,7 +22,7 @@ stays outside this package.
 From the repository root:
 
 ```shell
-python -m pip install ./packages/jev-classifier
+python -m pip install ./packages/choice-classifier
 ```
 
 Supply the endpoint, model and credential explicitly. The library does not read
@@ -33,7 +33,7 @@ uses caller-owned environment variables and an HTTP client for connection reuse.
 import asyncio
 import os
 import httpx
-from jev_classifier import ClassifierConfig, JevClassifier, TypedChoiceConfig, TypedChoiceProvider
+from choice_classifier import ClassifierConfig, ChoiceClassifier, TypedChoiceConfig, TypedChoiceProvider
 
 async def main():
     config = TypedChoiceConfig(
@@ -42,7 +42,7 @@ async def main():
         api_key=os.environ["JEV_API_KEY"],
     )
     async with httpx.AsyncClient() as client:
-        classifier = JevClassifier(
+        classifier = ChoiceClassifier(
             TypedChoiceProvider(config, client=client),
             ClassifierConfig(timeout_seconds=2.0),
         )
@@ -78,7 +78,7 @@ class ChoiceAnswer:
     confidence: float
 ```
 
-Both `DecisionProvider.decide()` and `JevClassifier.classify()` return this type.
+Both `DecisionProvider.decide()` and `ChoiceClassifier.classify()` return this type.
 This replaces the previous `dict[str, str]` result; use `result[name].choice` for
 just the label. `TypedChoiceConfig` and `TypedChoiceProvider` replace the previous
 `JevHttpConfig` and `JevHttpProvider` names.
@@ -92,7 +92,7 @@ A compatible addition or a task explicitly requested for later usually means
 APPEND. A correction invalidating the current activity usually means INTERRUPT.
 If context explicitly describes an idle recipient, there is no ongoing work to
 interrupt, so the prompt calls for APPEND. This is a semantic judgment; the module
-still calls JEV when invoked. It does not implement an idle bypass.
+still calls the provider when invoked. It does not implement an idle bypass.
 
 Use one call per recipient context. If individual messages require independent
 decisions, call separately. A batch decision does not identify messages to discard
@@ -112,10 +112,10 @@ result still applies to the work before acting on it.
 | `InsufficientContextError` | Context is blank. This is a subtype of InvalidInputError. |
 | `InputTooLargeError` | More than 64 messages or over 32,768 UTF-8 bytes by default. |
 | `InvalidResponseError` | Invalid typed answer, invalid probabilities, malformed JSON or response over the configured size. |
-| `JevTimeoutError` | Provider call exceeded the total deadline or had a transport timeout. |
+| `ClassifierTimeoutError` | Provider call exceeded the total deadline or had a transport timeout. |
 | `ProviderError` | HTTP failure or unexpected injected-provider failure. |
 
-All these inherit from `JevError`. Invalid configuration raises `ValueError` at
+All these inherit from `ClassifierError`. Invalid configuration raises `ValueError` at
 construction. Caller cancellation propagates as `asyncio.CancelledError`.
 Failures never become APPEND. Jiuwen chooses fallback behavior separately.
 
@@ -155,7 +155,7 @@ caller-owned; otherwise a temporary client is created and closed for each call.
 An SDK-backed provider can implement `DecisionProvider` without changing callers:
 
 ```python
-from jev_classifier import Decision
+from choice_classifier import Decision
 
 class MyProvider:
     async def decide(self, *, context: str, messages: tuple[str, ...]) -> Decision:
@@ -163,10 +163,45 @@ class MyProvider:
         ...
 ```
 
-Use `TypedChoiceProvider` through `JevClassifier`, which supplies input
-validation and the total deadline. It supports JEV, Yale, and MCL services that
-share the typed-choice wire contract. Select the service using only endpoint,
-model, and API key.
+Use either built-in provider through `ChoiceClassifier`, which supplies input
+validation and the total deadline.
+
+## Logprob LLM provider
+
+`TypedChoiceProvider` supports JEV, Yale, and MCL services that share the typed-choice
+wire contract. Select the service using only endpoint, model, and API key.
+`LogprobLLMProvider` supports OpenAI-compatible chat completion APIs with token
+logprobs. Both implement `DecisionProvider` and share answer validation.
+
+```python
+from choice_classifier import ChoiceClassifier, LogprobLLMConfig, LogprobLLMProvider
+
+config = LogprobLLMConfig(
+    endpoint="https://your-provider.example/v1",  # Base URL; /chat/completions is appended.
+    model="your-logprob-capable-model",
+    api_key="caller-supplied-credential",
+)
+classifier = ChoiceClassifier(LogprobLLMProvider(config))
+```
+
+The question configuration API is the same as `TypedChoiceConfig`, including
+`without_questions()` and `add_question()`. Each question supports 2–26 criteria,
+assigned letters A–Z in insertion order. Each question makes one request;
+multiple questions run concurrently within the classifier's total deadline.
+Requests use `max_tokens=1`, `logprobs=true`, `top_logprobs=20`, and `temperature=0`.
+Thinking is disabled, so that single token is the answer letter. A reasoning model
+otherwise spends it on hidden reasoning and returns no content logprobs. Set
+`disable_thinking=False` to omit that field.
+
+For each letter, the provider strips token whitespace, exponentiates its logprob,
+and normalizes over the returned label tokens. Whitespace variants of the same
+letter contribute to the same label; absent labels receive probability zero.
+The winning label becomes `choice`, and its probability becomes `confidence`.
+These probabilities are conditional on the label tokens present in the returned
+top 20, rather than the full model vocabulary. Missing logprobs or no matching
+letters raises `InvalidResponseError`; response text is never used as a fallback.
+Sibling requests are cancelled if one fails. Client ownership and response-size
+limits follow the typed-choice provider's contract.
 
 ## Jiuwen integration boundary
 
@@ -180,12 +215,12 @@ and mindshub/clef migration belong outside this package and this PR.
 From the repository root, using a Python environment with this package's test extra:
 
 ```shell
-python -m pip install -e "./packages/jev-classifier[test]"
-python -m pytest -c packages/jev-classifier/pyproject.toml packages/jev-classifier/tests
+python -m pip install -e "./packages/choice-classifier[test]"
+python -m pytest -c packages/choice-classifier/pyproject.toml packages/choice-classifier/tests
 ```
 
 Tests exercise input validation, typed-response validation, batch preservation,
-concurrent questions, deadlines,
+logprob normalization and missing-label cases, concurrent questions, deadlines,
 cancellation, HTTP failures, response limits and client ownership using
 injected providers and mock HTTP transports. They do not measure model accuracy.
 
@@ -198,5 +233,5 @@ using `jev-1.13.0`: default construction, no-argument `add_question()`, rewritte
 criteria, custom labels, multiple questions, and an addition explicitly deferred
 until later. Each returned a complete validated `ChoiceAnswer`; the observed
 choices matched the expected labels. This checks API compatibility on those
-examples, not benchmark accuracy.
+examples, not benchmark accuracy. Logprob provider tests use mock responses only.
 

@@ -13,8 +13,8 @@ from .errors import (
     InsufficientContextError,
     InvalidInputError,
     InvalidResponseError,
-    JevError,
-    JevTimeoutError,
+    ClassifierError,
+    ClassifierTimeoutError,
     ProviderError,
 )
 
@@ -94,7 +94,7 @@ def _validate_decision(decision: Any) -> Decision:
     return answers
 
 
-class JevClassifier:
+class ChoiceClassifier:
     """One provider call per batch; no routing, state lookup or message delivery."""
 
     def __init__(self, provider: DecisionProvider, config: ClassifierConfig | None = None):
@@ -112,8 +112,8 @@ class JevClassifier:
             async with asyncio.timeout(self.config.timeout_seconds):
                 decision = await self.provider.decide(context=context, messages=batch)
         except TimeoutError:
-            raise JevTimeoutError("classification timed out") from None
-        except JevError:
+            raise ClassifierTimeoutError("classification timed out") from None
+        except ClassifierError:
             raise
         except Exception:
             # Raw provider errors may include credentials or input content.

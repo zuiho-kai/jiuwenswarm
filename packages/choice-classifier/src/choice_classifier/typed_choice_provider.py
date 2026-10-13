@@ -10,7 +10,7 @@ from typing import Any, Self
 import httpx
 
 from .answers import ChoiceAnswer, Decision, validate_answer
-from .errors import InvalidInputError, InvalidResponseError, JevTimeoutError, ProviderError
+from .errors import InvalidInputError, InvalidResponseError, ClassifierTimeoutError, ProviderError
 from .prompts import CRITERIA, INSTRUCTIONS
 
 
@@ -132,7 +132,7 @@ def parse_response(body: Any, questions: Mapping[str, ChoiceQuestion]) -> Decisi
 class TypedChoiceProvider:
     """One HTTP request, no redirects/retries; injected client stays caller-owned.
 
-    Use through JevClassifier, which supplies the total deadline including body
+    Use through ChoiceClassifier, which supplies the total deadline including body
     streaming. If no client is injected, a short-lived client is created per call.
     """
 
@@ -179,7 +179,7 @@ async def post_json(
         except (ValueError, UnicodeError, RecursionError):
             raise InvalidResponseError("provider response is not valid JSON") from None
     except httpx.TimeoutException:
-        raise JevTimeoutError("provider HTTP request timed out") from None
+        raise ClassifierTimeoutError("provider HTTP request timed out") from None
     except httpx.HTTPError:
         raise ProviderError("provider HTTP request failed") from None
     finally:
