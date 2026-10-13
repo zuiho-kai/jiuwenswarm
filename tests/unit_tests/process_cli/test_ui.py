@@ -11,6 +11,41 @@ from jiuwenswarm.channels.process_cli.ui import HumanRunUI, ProcessCliUI
 from jiuwenswarm.runtime.events import RuntimeEvent
 
 
+@pytest.mark.parametrize("output_format", ["human", "json", "jsonl"])
+def test_team_member_text_does_not_interleave_with_human_leader_answer(
+    output_format,
+) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    renderer = EventRenderer(
+        output_format,
+        stdout=stdout,
+        stderr=stderr,
+        show_reasoning=True,
+        show_tools=True,
+    )
+    for payload in (
+        {"event_type": "chat.delta", "role": "leader", "delta": "Leader "},
+        {"event_type": "chat.delta", "role": "teammate", "delta": "MEMBER_DELTA"},
+        {"event_type": "chat.reasoning", "role": "teammate", "text": "MEMBER_THINKING"},
+        {"event_type": "chat.final", "role": "teammate", "content": "MEMBER_FINAL"},
+        {"event_type": "chat.tool_result", "role": "teammate", "text": "MEMBER_TOOL"},
+        {"event_type": "chat.delta", "role": "leader", "delta": "answer."},
+        {"event_type": "chat.final", "role": "leader", "content": "Leader answer."},
+    ):
+        renderer.render(RuntimeEvent("request", "process_cli", "session", payload))
+    renderer.finish(session_id="session", request_id="request")
+    assert len(renderer.events) == 7
+    if output_format == "human":
+        assert stdout.getvalue().strip() == "Leader answer."
+        assert "MEMBER_THINKING" not in stderr.getvalue()
+        assert "MEMBER_TOOL" in stderr.getvalue()
+    else:
+        assert "MEMBER_DELTA" in stdout.getvalue()
+        assert "MEMBER_FINAL" in stdout.getvalue()
+        assert "MEMBER_THINKING" in stdout.getvalue()
+
+
 class TtyBuffer(io.StringIO):
     @property
     def encoding(self) -> str:
@@ -105,9 +140,7 @@ def test_process_cli_diagnostics_use_the_configured_stream() -> None:
 
     ui.diagnostics(["worker failure", "trace tail"])
 
-    assert output.getvalue() == (
-        "\n工作进程诊断信息：\nworker failure\ntrace tail\n"
-    )
+    assert output.getvalue() == ("\n工作进程诊断信息：\nworker failure\ntrace tail\n")
 
 
 def test_process_cli_renders_installed_and_available_skills(monkeypatch) -> None:
@@ -227,6 +260,40 @@ def test_human_renderer_ignores_none_terminal_sentinel() -> None:
 
     assert output.getvalue() == ""
     assert renderer.events[0]["payload"] is None
+
+
+def test_human_renderer_summarizes_provider_denial_without_dumping_response() -> None:
+    output = TtyBuffer()
+    renderer = EventRenderer("human", stdout=output, stderr=output, concise_errors=True)
+    message = (
+        "[181001] model call failed: Error code: 400 - "
+        "{'error': {'message': 'Access denied, please check your account', "
+        "'details': '" + "x" * 500 + "'}}"
+    )
+
+    renderer.render(
+        RuntimeEvent(
+            request_id="denied-request",
+            channel_id="process_cli",
+            session_id="runtime-session",
+            payload={"event_type": "chat.error", "message": message},
+        )
+    )
+
+    assert "模型服务拒绝访问（HTTP 400）" in output.getvalue()
+    assert "please check your account" not in output.getvalue()
+    assert len(output.getvalue()) < 200
+
+    interactive_output = TtyBuffer()
+    EventRenderer("human", stdout=interactive_output, stderr=interactive_output).render(
+        RuntimeEvent(
+            request_id="interactive-denied-request",
+            channel_id="process_cli",
+            session_id="runtime-session",
+            payload={"event_type": "chat.error", "message": message},
+        )
+    )
+    assert "please check your account" in interactive_output.getvalue()
 
 
 def test_human_renderer_displays_skills_list_without_chat_completion(

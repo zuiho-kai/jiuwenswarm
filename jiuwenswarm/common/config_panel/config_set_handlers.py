@@ -39,9 +39,11 @@ from jiuwenswarm.agents.harness.common.rails.permissions.auto_config import (
 )
 from jiuwenswarm.common.config import (
     DEFAULT_SWARMFLOW_ENABLED,
+    DEFAULT_SWARMFLOW_WORKTREE_ENABLED,
     EXTERNAL_CLI_AGENTS_CONFIG_PATH,
     SWARMFLOW_BUDGET_CONFIG_PATH,
     SWARMFLOW_ENABLED_CONFIG_PATH,
+    SWARMFLOW_WORKTREE_CONFIG_PATH,
     get_config,
     get_config_raw,
     replace_teams_in_config,
@@ -65,6 +67,7 @@ from jiuwenswarm.common.config import (
     update_swarmflow_enabled_in_config,
     update_symphony_in_config,
     update_task_full_duplex_in_config,
+    update_team_organization_ui_in_config,
     update_task_asr_in_config,
     update_trajectory_ui_in_config,
     update_default_models_in_config,
@@ -203,7 +206,7 @@ class ConfigChangeSet:
                 scopes.add("agent_runtime")
             elif key_text == "trajectory_ui_enabled":
                 scopes.update({"agent_runtime", "web_ui"})
-            elif key_text == "task_full_duplex_enabled":
+            elif key_text in {"task_full_duplex_enabled", "team_organization_ui_enabled"}:
                 scopes.add("web_ui")
             elif key_text.startswith("a2ui_") or key_text == "setup_guide_enabled":
                 scopes.add("web_ui")
@@ -361,6 +364,7 @@ CONFIG_YAML_KEYS = frozenset({
     "rsi_enabled",
     "trajectory_ui_enabled",
     "task_full_duplex_enabled",
+    "team_organization_ui_enabled",
     "task_asr_enabled",
     "proactive_recommendation_enabled",
     "proactive_recommendation_max_recommend_per_day",
@@ -553,6 +557,12 @@ def flatten_swarmflow_for_config_panel(raw: dict[str, Any]) -> dict[str, str]:
     flat = {"swarmflow_enabled": "true" if enabled else "false"}
     if budget is not None:
         flat["swarmflow_budget"] = str(budget)
+    worktree_enabled = get_nested_config_value(
+        raw,
+        SWARMFLOW_WORKTREE_CONFIG_PATH,
+        DEFAULT_SWARMFLOW_WORKTREE_ENABLED,
+    )
+    flat["swarmflow_worktree"] = "true" if worktree_enabled else "false"
     return flat
 
 
@@ -1333,6 +1343,8 @@ def apply_config_payload(
                 update_trajectory_ui_in_config(parsed)
             elif param_key == "task_full_duplex_enabled":
                 update_task_full_duplex_in_config(parsed)
+            elif param_key == "team_organization_ui_enabled":
+                update_team_organization_ui_in_config(parsed)
             elif param_key == "task_asr_enabled":
                 update_task_asr_in_config(parsed)
             elif param_key == "proactive_recommendation_enabled":
@@ -1554,6 +1566,9 @@ async def config_get_handler(
             "true" if trajectory_cfg.get("enabled", False) else "false"
         )
         experimental_cfg = raw.get("experimental") or {}
+        payload["team_organization_ui_enabled"] = (
+            "true" if experimental_cfg.get("team_organization_ui_enabled", False) else "false"
+        )
         payload["task_full_duplex_enabled"] = (
             "true" if experimental_cfg.get("task_full_duplex_enabled", False) else "false"
         )
@@ -1594,6 +1609,7 @@ async def config_get_handler(
             payload.setdefault(key, value)
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("task_full_duplex_enabled", "false")
+        payload.setdefault("team_organization_ui_enabled", "false")
         payload.setdefault("task_asr_enabled", "false")
         for key, (_, value_type, default) in {
             **SYMPHONY_CONFIG_SPECS,
@@ -1624,6 +1640,7 @@ async def config_set_handler(
     agent_client: Any = None,
     ensure_codex_dependency: Any = None,
     ensure_claude_dependency: Any = None,
+    on_free_models_toggled: Any = None,
 ) -> None:
     """根据前端消息内容更新配置（支持 .env 与 config.yaml 中的键），并写回对应文件。"""
     if not isinstance(params, dict):
@@ -1655,12 +1672,11 @@ async def config_set_handler(
         logger.warning("[config.set] on_config_saved failed: %s", exc)
         applied_without_restart = False
 
-    if "enable_free_models" in apply_result.yaml_updated:
+    if "enable_free_models" in apply_result.yaml_updated and on_free_models_toggled is not None:
         try:
-            from jiuwenswarm.server.runtime.opencode_zen import warm_zen_free_models
-            await warm_zen_free_models(reason="config-toggle")
+            await on_free_models_toggled()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[config.set] warm_zen_free_models failed: %s", exc)
+            logger.warning("[config.set] zen free-model warmup failed: %s", exc)
 
     updated_param_keys = [k for k, e in CONFIG_SET_ENV_MAP.items() if e in env_updates] + yaml_updated
     payload = {"updated": updated_param_keys, "applied_without_restart": applied_without_restart}
@@ -1706,6 +1722,7 @@ async def config_save_all_handler(
     agent_client: Any = None,
     ensure_codex_dependency: Any = None,
     ensure_claude_dependency: Any = None,
+    on_free_models_toggled: Any = None,
 ) -> None:
     """Batch-save config panel changes and trigger a single hot reload.
 
@@ -1804,12 +1821,11 @@ async def config_save_all_handler(
             agent_client=agent_client,
         )
 
-        if "enable_free_models" in yaml_updated:
+        if "enable_free_models" in yaml_updated and on_free_models_toggled is not None:
             try:
-                from jiuwenswarm.server.runtime.opencode_zen import warm_zen_free_models
-                await warm_zen_free_models(reason="config-toggle")
+                await on_free_models_toggled()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[config.save_all] warm_zen_free_models failed: %s", exc)
+                logger.warning("[config.save_all] zen free-model warmup failed: %s", exc)
 
         payload = {
             "updated": [k for k, e in CONFIG_SET_ENV_MAP.items() if e in env_updates] + yaml_updated,
