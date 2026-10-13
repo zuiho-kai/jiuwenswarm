@@ -393,8 +393,7 @@ async def test_route_bypass_logs_reason_without_content(monkeypatch, mode, use_s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sender,notified", [("user", True), ("A1", False)])
-async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, sender, notified):
+async def test_interrupt_failure_reraises_without_steer_fallback(monkeypatch):
     from jiuwenswarm.agents.harness.team import duplex_native
 
     class FakeNative:
@@ -412,9 +411,8 @@ async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, s
     emit = AsyncMock()
     monkeypatch.setattr(shadow, "_emit_duplex_error", emit)
     original = AsyncMock(return_value="sent")
-    message = InboundMessage("m1", sender, "Stop using Kafka")
+    message = InboundMessage("m1", "A1", "Stop using Kafka")
 
-    # A group @ from the user reaches the safe interrupt; its failure is user-visible.
     with pytest.raises(RuntimeError, match="supervisor stopped"):
         await shadow.deliver_routed(NS(harness=native), shadow.RoutedInput(
                                         "Stop using Kafka", message, "group_mention"),
@@ -423,7 +421,4 @@ async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, s
 
     original.assert_not_awaited()
     assert "m1" not in native._duplex_received
-    assert emit.await_count == int(notified)
-    if notified:
-        assert emit.await_args.kwargs["phase"] == "interrupt"
-    assert "未送达" in shadow._duplex_error_text("clef", "interrupt", RuntimeError())
+    emit.assert_not_awaited()

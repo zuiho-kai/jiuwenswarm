@@ -117,8 +117,6 @@ def _duplex_error_text(backend: str, phase: str, exc: BaseException | None = Non
                      "team_model": "团队模型", "openai": "OpenAI", "custom": "自定义模型",
                      }.get(str(backend).lower(), str(backend or "未知"))
     reason = status or type(exc).__name__ if exc is not None else status or "响应失败"
-    if phase == "interrupt":
-        return "A2A 监工异常：打断投递失败，当前消息未送达，请重新发送。"
     if phase == "config":
         detail = "配置无效"
     elif reason in {"timeout", "TimeoutError", "ClassifierTimeoutError"}:
@@ -298,10 +296,7 @@ async def _interrupt(host, native, content, message, verdict, snapshot, send, ba
             effective = await native.interrupt(text, version=version, message_id=message.message_id)
         except Exception as exc:
             # No steer fallback: it would override a pause/stop or double-deliver a pushed replan.
-            # A2A rows stay unread and are redelivered; U2A input has no row, so tell the user.
-            if message.sender == "user":
-                await _emit_duplex_error(host, native, message_id=message.message_id,
-                                         backend=str(backend), phase="interrupt", exc=exc)
+            # Only A2A rows reach the interrupt; they stay unread and are redelivered.
             logger.warning("duplex route interrupt failed backend=%s message_id=%s sender=%s error_type=%s",
                            backend, message.message_id, message.sender, type(exc).__name__)
             raise
