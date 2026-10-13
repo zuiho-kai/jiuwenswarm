@@ -12,10 +12,10 @@ duplex_router:
     api_key_env: DUPLEX_ROUTER_API_KEY
     account_id_env: CLOUDFLARE_ACCOUNT_ID  # 仅 clef
   logprob_llm:
-    preset: team_model  # team_model / mindshub / openai / custom
+    preset: team_model  # team_model / openai / custom
     model_name: ""  # team_model：团队模型池中的模型名
-    api_base: https://api.mindshub.ai/v1  # mindshub / openai / custom
-    model: mindshub_air
+    api_base: ""  # openai / custom
+    model: ""
     api_key_env: DUPLEX_ROUTER_API_KEY
 
 # 配置版本号：与程序版本（jiuwenswarm/common/_build_config.py 的 VERSION）同步。

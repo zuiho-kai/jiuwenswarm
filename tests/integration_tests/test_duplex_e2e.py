@@ -40,6 +40,7 @@ class Endpoint:
         self.calls = []
         self.jev_calls = []
         self.fast_action = "INTERRUPT"
+        self.relevance = "DELIVER"
         self.fast_error = False
         self.fast_gate = asyncio.Event()
         self.fast_gate.set()
@@ -86,10 +87,15 @@ class Endpoint:
             await self.fast_gate.wait()
             if self.fast_error:
                 return web.json_response({"error": {"message": "scripted failure"}}, status=500)
-            # One-letter logprob answer: A = INTERRUPT, B = APPEND (urgency criteria order).
+            # One-letter logprob answer: A = INTERRUPT, B = APPEND (urgency criteria order);
+            # relevance is A = DELIVER, B = SKIP.
             assert body["max_tokens"] == 1 and body["logprobs"] is True
-            assert "A = INTERRUPT" in body["messages"][0]["content"]
-            winner, loser = ("A", "B") if self.fast_action == "INTERRUPT" else ("B", "A")
+            prompt = body["messages"][0]["content"]
+            if "A = DELIVER" in prompt:
+                winner, loser = ("A", "B") if self.relevance == "DELIVER" else ("B", "A")
+            else:
+                assert "A = INTERRUPT" in prompt
+                winner, loser = ("A", "B") if self.fast_action == "INTERRUPT" else ("B", "A")
             return web.json_response({"id": "fast", "object": "chat.completion", "model": model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": winner},
                              "logprobs": {"content": [{"token": winner, "logprob": -0.05, "top_logprobs": [
@@ -424,7 +430,7 @@ async def test_interrupt_during_tool_waits_for_commit_and_does_not_repeat(world)
 
 
 @pytest.mark.asyncio
-async def test_append_during_tool_is_adopted_without_restart(world):
+async def test_append_during_tool_queues_followup_without_restart(world):
     w = world
     w.endpoint.fast_action = "APPEND"
     w.endpoint.block_model = False
@@ -438,7 +444,9 @@ async def test_append_during_tool_is_adopted_without_restart(world):
     assert w.harness.state is HarnessState.RUNNING
     w.tool.gate.set()
     await wait_until(lambda: w.harness.state is HarnessState.IDLE)
-    assert w.native._st.round_id_counter == before
+    # APPEND queues a follow-up: the running round is not restarted, the
+    # message drives one more round after it ends.
+    assert w.native._st.round_id_counter == before + 1
     assert mid in json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1])
 
 
@@ -478,7 +486,7 @@ async def test_append_survives_a_later_interrupt_before_it_is_consumed(world):
 
 
 @pytest.mark.asyncio
-async def test_admitted_append_survives_repeated_interrupts(world):
+async def test_queued_followup_survives_repeated_interrupts(world):
     w = world
     original = "Implement the order system; retain idempotency."
     w.tool.gate.clear()
@@ -490,8 +498,6 @@ async def test_admitted_append_survives_repeated_interrupts(world):
     await asyncio.wait_for(poll_and_apply(w), 6)
     w.tool.gate.set()
     await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
-    admitted = [c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"]
-    assert appended in json.dumps(admitted)
 
     w.endpoint.fast_action = "INTERRUPT"
     w.endpoint.block_prompt = "Customer forbids Kafka"
@@ -507,7 +513,8 @@ async def test_admitted_append_survives_repeated_interrupts(world):
     for content in (original, appended, first, second, "Irreversible operation committed exactly once"):
         assert recovered.count(content) == 1
     assert "Request cancelled by user" not in recovered
-    assert w.native._st.round_id_counter == 3
+    # Original round, two interrupt replans, then the queued follow-up round.
+    assert w.native._st.round_id_counter == 4
     assert w.tool.path.read_text() == "committed\n"
     assert w.tool.cancelled == 0
     assert not await w.manager.get_messages(to_member_name="A2", unread_only=True)
@@ -650,7 +657,7 @@ async def test_failed_db_ack_retry_does_not_reexecute_delivery(world, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_user_input_uses_same_router(world):
+async def test_user_input_steers_without_classifier(world):
     from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
     from openjiuwen.agent_teams.agent.coordination.event_bus import InnerEventMessage, InnerEventType
     w = world
@@ -659,10 +666,13 @@ async def test_user_input_uses_same_router(world):
     handler = AgentLifecycleHandler(w.host, w.handler._blueprint, w.handler._infra, NS())
     await handler.on_user_input(InnerEventMessage(event_type=InnerEventType.USER_INPUT,
                               payload={"content": "Change goal: use PostgreSQL only.", "message_id": "u204"}))
+    w.endpoint.model_gate.set()
     await wait_until(lambda: w.harness.state is HarnessState.IDLE)
     recovered = json.dumps([c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
     assert "Change goal: use PostgreSQL only" in recovered
-    assert w.native._st.round_id_counter == 2
+    # User input is never judged or downgraded: a plain steer into the same round.
+    assert not any(c["model"] == "fast" for c in w.endpoint.calls)
+    assert w.native._st.round_id_counter == 1
 
 
 @pytest.mark.asyncio
@@ -687,9 +697,15 @@ async def test_real_event_bus_wakes_receiver_and_broadcast_watermark_advances(wo
         await asyncio.wait_for(w.endpoint.model_entered.wait(), 6)
         await w.manager.broadcast_message(content="Customer forbids Kafka. Use PostgreSQL.")
         await asyncio.wait_for(handled.wait(), 6)
+        w.endpoint.model_gate.set()
         await wait_until(lambda: w.harness.state is HarnessState.IDLE)
         assert not await w.manager.get_broadcast_messages(member_name="A2", unread_only=True)
-        assert w.native._st.round_id_counter == 2
+        # Relevant + INTERRUPT broadcast steers; a broadcast never runs the safe interrupt.
+        assert w.native._st.round_id_counter == 1
+        fast = [c for c in w.endpoint.calls if c["model"] == "fast"]
+        assert len(fast) == 2
+        assert "Customer forbids Kafka" in json.dumps(
+            [c for c in w.endpoint.calls if c["model"] == "slow"][-1]["messages"])
         assert w.tool.path.read_text() == "committed\n"
     finally:
         await w.messager.unsubscribe(topic)

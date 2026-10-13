@@ -123,7 +123,7 @@ def test_install_is_idempotent():
     assert group_installed._duplex_shadow
 
 
-GROUP_META = json.dumps({"type": "group_chat", "client_message_id": "c1"})
+GROUP_META = json.dumps({"type": "group_chat", "client_message_id": "c1", "mentions": ["A2"]})
 
 
 def group_message(mid, sender="user", meta=GROUP_META):
@@ -167,6 +167,7 @@ async def test_group_mention_is_routed_with_raw_content_and_sdk_delivery_text(mo
     # Delivery text is exactly the SDK excerpt; the classifier gets only the new message.
     assert str(routed[0]) == "<excerpt>@A2 Customer forbids Kafka</excerpt>"
     assert routed[0].message == InboundMessage("g1", sender, "@A2 Customer forbids Kafka")
+    assert routed[0].source == "group_mention"
     assert built.call_count == 1
     mm.mark_messages_read.assert_awaited_once_with(messages, "A2")
 
@@ -179,6 +180,7 @@ async def test_non_group_broadcast_through_group_handler_is_wrapped_once(monkeyp
     assert len(routed) == 1 and isinstance(routed[0], shadow.RoutedInput)
     assert routed[0].message.message_id == "b1"
     assert routed[0].message.content == "@A2 Customer forbids Kafka"
+    assert routed[0].source == "broadcast"
     assert built.call_count == 1
 
 
@@ -186,18 +188,20 @@ async def test_non_group_broadcast_through_group_handler_is_wrapped_once(monkeyp
 @pytest.mark.parametrize("decision_result,expected,phase", [
     (urgency(0.95), "INTERRUPT", None),
     (urgency(0.9), "INTERRUPT", None),
-    (urgency(0.89), "APPEND", None),  # INTERRUPT choice below the threshold still appends.
-    (urgency(0.1), "APPEND", None),
-    (ClassifierTimeoutError("timed out"), "APPEND", "route"),
-    (ProviderError("unavailable"), "APPEND", "route"),
-    (ClassifierConfigError("missing key"), "APPEND", "config"),
-    (RuntimeError("bug"), "APPEND", "route"),
+    (urgency(0.89), "FOLLOWUP", None),  # INTERRUPT choice below the threshold queues.
+    (urgency(0.1), "FOLLOWUP", None),
+    (ClassifierTimeoutError("timed out"), "FOLLOWUP", "route"),
+    (ProviderError("unavailable"), "FOLLOWUP", "route"),
+    (ClassifierConfigError("missing key"), "FOLLOWUP", "config"),
+    (RuntimeError("bug"), "FOLLOWUP", "route"),
 ])
 async def test_urgency_routes_by_threshold_and_falls_back(monkeypatch, decision_result, expected, phase):
     from jiuwenswarm.agents.harness.team import duplex_native
+    from jiuwenswarm.agents.harness.team.duplex_delivery import DeliveryScheduler
 
     class FakeNative:
         _duplex_received = set()
+        active_round = object()  # busy
 
         def __init__(self):
             self.interrupt = AsyncMock(return_value="INTERRUPT")
@@ -208,20 +212,23 @@ async def test_urgency_routes_by_threshold_and_falls_back(monkeypatch, decision_
                          return_value=None if failure else decision_result)
     emit = AsyncMock()
     monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
+    monkeypatch.setattr(shadow, "SCHEDULER", DeliveryScheduler())
     monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
     monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot())
     monkeypatch.setattr(shadow, "classify", classify)
     monkeypatch.setattr(shadow, "_emit_duplex_error", emit)
     original = AsyncMock(return_value="sent")
     config = {"mode": "active", "provider": "logprob_llm",
-              "logprob_llm": {"preset": "mindshub", "api_key_env": "TEST_KEY"}}
-    host = NS(harness=native)
+              "logprob_llm": {"preset": "openai", "api_key_env": "TEST_KEY"}}
+    host = NS(harness=native, blueprint=NS(member_name="A2"))
 
     result = await shadow.deliver_routed(
         host, shadow.RoutedInput("Customer forbids Kafka", MESSAGES[0]),
         use_steer=True, original=original, settings=config)
 
-    classify.assert_awaited_once_with(host, config, snapshot(), (MESSAGES[0],), (URGENCY,))
+    # The classifier sees who sent the message.
+    judged = InboundMessage("m204", "A1", "from A1: Customer forbids Kafka")
+    classify.assert_awaited_once_with(host, config, snapshot(), (judged,), (URGENCY,))
     if expected == "INTERRUPT":
         assert result == "INTERRUPT"
         assert native.interrupt.await_args.kwargs == {"version": "v1", "message_id": "m204"}
@@ -229,11 +236,11 @@ async def test_urgency_routes_by_threshold_and_falls_back(monkeypatch, decision_
     else:
         assert result == "sent"
         native.interrupt.assert_not_awaited()
-        original.assert_awaited_once()
+        original.assert_awaited_once_with(host, "Customer forbids Kafka", use_steer=False)
     assert emit.await_count == int(phase is not None)
     if phase is not None:
         assert emit.await_args.kwargs["phase"] == phase
-        assert emit.await_args.kwargs["backend"] == "mindshub"
+        assert emit.await_args.kwargs["backend"] == "openai"
 
 
 def test_error_text_names_provider_and_reason():
@@ -247,7 +254,6 @@ def test_error_text_names_provider_and_reason():
 @pytest.mark.parametrize("mode,use_steer,has_snapshot,reason", [
     ("off", True, True, "mode_not_active"),
     ("active", False, True, "use_steer_false"),
-    ("active", True, False, "no_snapshot"),
 ])
 async def test_route_bypass_logs_reason_without_content(monkeypatch, mode, use_steer, has_snapshot, reason):
     from jiuwenswarm.agents.harness.team import duplex_native
@@ -281,6 +287,8 @@ async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, s
     from jiuwenswarm.agents.harness.team import duplex_native
 
     class FakeNative:
+        active_round = object()  # busy
+
         def __init__(self):
             self._duplex_received = set()
             self.interrupt = AsyncMock(side_effect=RuntimeError("supervisor stopped"))
@@ -295,8 +303,10 @@ async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, s
     original = AsyncMock(return_value="sent")
     message = InboundMessage("m1", sender, "Stop using Kafka")
 
+    # A group @ from the user reaches the safe interrupt; its failure is user-visible.
     with pytest.raises(RuntimeError, match="supervisor stopped"):
-        await shadow.deliver_routed(NS(harness=native), shadow.RoutedInput("Stop using Kafka", message),
+        await shadow.deliver_routed(NS(harness=native), shadow.RoutedInput(
+                                        "Stop using Kafka", message, "group_mention"),
                                     use_steer=True, original=original,
                                     settings={"mode": "active", "provider": "typed_choice", "timeout_seconds": 1})
 

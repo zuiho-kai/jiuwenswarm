@@ -6,8 +6,7 @@ duplex_router settings select one of two provider kinds:
 - typed_choice: a JEV-style service returns choices and probabilities itself
   (presets jev, clef).
 - logprob_llm: an OpenAI-compatible chat model answers one letter and the
-  token logprobs give the probabilities (presets team_model, mindshub, openai,
-  custom).
+  token logprobs give the probabilities (presets team_model, openai, custom).
 
 This module only classifies. It has no fallback: every failure raises a
 ClassifierError subclass, and routing policy decides what to do with it.
@@ -75,7 +74,7 @@ QUESTIONS: Mapping[str, ChoiceQuestion] = {
 
 PROVIDERS = ("typed_choice", "logprob_llm")
 TYPED_CHOICE_PRESETS = ("jev", "clef")
-LOGPROB_LLM_PRESETS = ("team_model", "mindshub", "openai", "custom")
+LOGPROB_LLM_PRESETS = ("team_model", "openai", "custom")
 
 _DEFAULT_KEY_ENV = "DUPLEX_ROUTER_API_KEY"
 _JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
@@ -83,8 +82,6 @@ _JEV_MODEL = "jev-1.13.0"
 _CLEF_BASE = "https://api.cloudflare.com/client/v4"
 _CLEF_MODELS = {"clef": "@cf/cloudflare/clef", "clef-flash": "@cf/cloudflare/clef-flash"}
 _ACCOUNT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_MINDSHUB_BASE = "https://api.mindshub.ai/v1"
-_MINDSHUB_MODEL = "mindshub_air"
 _OPENAI_BASE = "https://api.openai.com/v1"
 # Team model clients that do not speak OpenAI chat completions with logprobs.
 _NON_OPENAI_PROVIDERS = frozenset({"anthropic", "intelli_router", "openaiaccount"})
@@ -203,10 +200,9 @@ def _logprob_llm(host: Any, section: Mapping[str, Any], questions: dict[str, Cho
         endpoint, api_key, model, http = _team_model(host, section)
     else:
         api_key = _credential(section, preset)
-        defaults = {"mindshub": (_MINDSHUB_BASE, _MINDSHUB_MODEL), "openai": (_OPENAI_BASE, "")}
-        base_default, model_default = defaults.get(preset, ("", ""))
+        base_default = _OPENAI_BASE if preset == "openai" else ""
         endpoint = _text(section, "api_base", base_default)
-        model = _text(section, "model", model_default)
+        model = _text(section, "model")
         if not endpoint or not model:
             raise ClassifierConfigError(f"logprob_llm.api_base and model are required for the {preset} preset")
         if preset == "openai":

@@ -17,7 +17,7 @@ test('each preset shows only its own fields', () => {
   assert.deepEqual(duplexPresetFields('team_model'), ['model_name']);
   assert.deepEqual(duplexPresetFields('jev'), ['endpoint', 'model', 'api_key']);
   assert.deepEqual(duplexPresetFields('clef'), ['account_id', 'api_key', 'model']);
-  for (const preset of ['mindshub', 'openai', 'custom']) {
+  for (const preset of ['openai', 'custom']) {
     assert.deepEqual(duplexPresetFields(preset), ['api_base', 'model', 'api_key']);
   }
 });
@@ -25,7 +25,7 @@ test('each preset shows only its own fields', () => {
 test('legacy backend values map to kind and preset', () => {
   const cases = [
     [{ duplex_router_backend: 'sdk', duplex_router_model_name: 'team-a' }, 'logprob_llm', 'team_model', 'team-a'],
-    [{ duplex_router_backend: 'mindshub' }, 'logprob_llm', 'mindshub', 'mindshub_air'],
+    [{ duplex_router_backend: 'mindshub' }, 'typed_choice', 'jev', 'jev-1.13.0'],
     [{ duplex_router_backend: 'jev', duplex_router_model_name: 'jev-2' }, 'typed_choice', 'jev', 'jev-2'],
     [{ duplex_router_backend: 'clef', duplex_router_model: 'clef-flash' }, 'typed_choice', 'clef', 'clef-flash'],
     [{}, 'logprob_llm', 'team_model', ''],
@@ -42,6 +42,10 @@ test('legacy backend values map to kind and preset', () => {
     duplex_router_endpoint_path: 'decisions',
   });
   assert.equal(jev.endpoint, 'https://j.example/v1/decisions');
+  const mindshub = readDuplexSettings({ duplex_router_backend: 'mindshub' });
+  assert.equal(mindshub.endpoint, 'https://api.mindshub.ai/v1/decisions');
+  const stale = readDuplexSettings({ duplex_router_provider: 'logprob_llm', duplex_router_llm_preset: 'mindshub' });
+  assert.equal(stale.preset, 'team_model');
 });
 
 test('new provider values are read as saved', () => {

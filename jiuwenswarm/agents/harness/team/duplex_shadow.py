@@ -16,20 +16,28 @@ import uuid
 from functools import wraps
 from typing import Any
 
-from jiuwenswarm.common.duplex_classifier import (
-    DEFAULT_INTERRUPT_THRESHOLD, URGENCY, ClassifierConfigError, classify, provider_label,
+from jiuwenswarm.common.delivery_policy import (
+    SRC_BROADCAST, SRC_DM, SRC_GROUP_MENTION, SRC_GROUP_PLAIN, SRC_USER_TEXT, TargetState,
+    final_action, plan, resolve,
 )
+from jiuwenswarm.common.duplex_classifier import ClassifierConfigError, classify, provider_label
 from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage
+
+from .duplex_delivery import (
+    RUN_DELIVER, RUN_FOLLOWUP, RUN_REJECT, RUN_STEER, RUN_VISIBLE, SCHEDULER, envelope_for,
+    rate_limited_decision, runtime_action,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class RoutedInput(str):
-    """Original SDK rendering plus DB identity; not a second message history."""
+    """Original SDK rendering plus DB identity and policy source; not a second history."""
 
-    def __new__(cls, text, message):
+    def __new__(cls, text, message, source=SRC_DM):
         obj = super().__new__(cls, text)
         obj.message = message
+        obj.source = source
         return obj
 
 
@@ -104,7 +112,7 @@ def _duplex_context(host: Any, native: Any | None = None) -> tuple[str, str]:
 
 def _duplex_error_text(backend: str, phase: str, exc: BaseException | None = None,
                        status: str | None = None) -> str:
-    backend_label = {"jev": "Jev", "mindshub": "Mindshub", "clef": "Cloudflare Clef",
+    backend_label = {"jev": "Jev", "clef": "Cloudflare Clef",
                      "team_model": "团队模型", "openai": "OpenAI", "custom": "自定义模型",
                      }.get(str(backend).lower(), str(backend or "未知"))
     reason = status or type(exc).__name__ if exc is not None else status or "响应失败"
@@ -186,37 +194,64 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
                     backend, message.message_id,
                     "mode_not_active" if config.get("mode") != "active" else "unsupported_harness")
         return await original(host, str(content), use_steer=use_steer)
+    if not use_steer:
+        # SDK reminders and nudges append by design; they are never judged.
+        logger.info("duplex route bypass backend=%s message_id=%s reason=use_steer_false",
+                    backend, message.message_id)
+        return await original(host, str(content), use_steer=use_steer)
     if message.message_id in native._duplex_received:
         logger.info("duplex route bypass backend=%s message_id=%s reason=duplicate", backend, message.message_id)
         return
 
-    async def steer():
-        result = await original(host, str(content), use_steer=use_steer)
+    async def send(steer: bool):
+        result = await original(host, str(content), use_steer=steer)
         native._duplex_received.add(message.message_id)
         return result
 
-    snapshot = snapshot_from_native(native)
-    if not use_steer or snapshot is None:
-        reason = "use_steer_false" if not use_steer else "no_snapshot"
-        logger.info("duplex route bypass backend=%s message_id=%s reason=%s",
-                    backend, message.message_id, reason)
-        return await steer()
-    logger.info("duplex route start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
-                backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
-    action, failure = await _urgency_action(host, config, snapshot, message)
-    if failure is not None:
-        await _emit_duplex_error(host, native, message_id=message.message_id, backend=backend,
-                                 phase="config" if isinstance(failure, ClassifierConfigError) else "route",
-                                 exc=failure)
-    if action == "APPEND":
-        result = await steer()
-        logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=%s",
-                    backend, message.message_id,
-                    "model_append" if failure is None else type(failure).__name__)
-        return result
+    target = str(getattr(getattr(host, "blueprint", None), "member_name", "") or "unknown")
+    env = envelope_for(message, source=content.source, target=target)
+    state = TargetState(idle=_target_idle(native))
+    decided = plan(env, state)
+    snapshot = None
+    if decided.questions and env.source == SRC_BROADCAST and not SCHEDULER.allow_broadcast(target, env.sender):
+        decision = rate_limited_decision(env, state.idle)
+    else:
+        answers = None
+        if decided.questions:
+            snapshot = snapshot_from_native(native) or _placeholder_snapshot(state.idle)
+            asked = snapshot
+
+            async def ask(questions, messages):
+                return await classify(host, config, asked, messages, questions)
+
+            logger.info("duplex route start backend=%s message_id=%s round_id=%s checkpoint_id=%s "
+                        "phase=%s questions=%s", backend, message.message_id, snapshot.round_id,
+                        snapshot.checkpoint_id, snapshot.phase, ",".join(decided.questions))
+            answers, failure = await SCHEDULER.judge(target, decided.questions,
+                                                     _classifier_message(message), ask)
+            if failure is not None:
+                logger.warning("duplex route fallback message_id=%s error_type=%s",
+                               message.message_id, type(failure).__name__)
+                await _emit_duplex_error(host, native, message_id=message.message_id, backend=backend,
+                                         phase="config" if isinstance(failure, ClassifierConfigError)
+                                         else "route", exc=failure)
+        decision = resolve(env, decided, answers, state)
+    action = final_action(decision, target_idle_now=_target_idle(native))
+    run = runtime_action(env, decided, decision, action)
+    logger.info("duplex decision backend=%s message_id=%s sender=%s recipient=%s final=%s run=%s %s",
+                backend, message.message_id, message.sender, target, action.value, run, decision.reason)
+    if run == RUN_REJECT:
+        return None
+    if run == RUN_VISIBLE:
+        # Returning without delivery lets the SDK drain mark the row read; the
+        # row stays in the team message history, the agent is not woken.
+        native._duplex_received.add(message.message_id)
+        return None
+    if run in (RUN_STEER, RUN_FOLLOWUP, RUN_DELIVER):
+        return await send(use_steer if run == RUN_DELIVER else run == RUN_STEER)
+    version = (snapshot_from_native(native) or snapshot or _placeholder_snapshot(False)).context_version
     try:
-        effective = await native.interrupt(str(content), version=snapshot.context_version,
-                                           message_id=message.message_id)
+        effective = await native.interrupt(str(content), version=version, message_id=message.message_id)
     except Exception as exc:
         # No steer fallback: it would override a pause/stop or double-deliver a pushed replan.
         # A2A rows stay unread and are redelivered; U2A input has no row, so tell the user.
@@ -227,8 +262,8 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
                        backend, message.message_id, message.sender, type(exc).__name__)
         raise
     if effective == "UNAVAILABLE":
-        result = await steer()
-        logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=inactive_or_pending",
+        result = await send(True)
+        logger.info("duplex route effective backend=%s message_id=%s action=STEER reason=inactive_or_pending",
                     backend, message.message_id)
         return result
     logger.info("duplex route effective backend=%s message_id=%s action=%s",
@@ -236,16 +271,20 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     return effective
 
 
-async def _urgency_action(host, config, snapshot, message) -> tuple[str, Exception | None]:
-    """Ask URGENCY once; INTERRUPT needs p(INTERRUPT) >= the threshold, failures APPEND."""
-    try:
-        answers = await classify(host, config, snapshot, (message,), (URGENCY,))
-    except Exception as exc:  # CancelledError is not an Exception and propagates.
-        logger.warning("duplex route fallback message_id=%s error_type=%s effective=APPEND",
-                       message.message_id, type(exc).__name__)
-        return "APPEND", exc
-    interrupt = answers[URGENCY].probabilities["INTERRUPT"]
-    return ("INTERRUPT" if interrupt >= DEFAULT_INTERRUPT_THRESHOLD else "APPEND"), None
+def _target_idle(native: Any) -> bool:
+    return getattr(native, "active_round", None) is None
+
+
+def _placeholder_snapshot(idle: bool) -> ControlSnapshot:
+    """Context for a target with no checkpoint yet (idle, or a round just starting)."""
+    phase = "idle" if idle else "starting"
+    return ControlSnapshot(context_version=phase, round_id="", checkpoint_id="", phase=phase)
+
+
+def _classifier_message(message: InboundMessage) -> InboundMessage:
+    """Name the sender so the classifier can tell the user from a teammate."""
+    return InboundMessage(message.message_id, message.sender,
+                          f"from {message.sender}: {message.content}")
 
 
 def _install_group_render() -> None:
@@ -272,9 +311,12 @@ def _install_group_render() -> None:
         if isinstance(text, RoutedInput):  # non-group rows went through the patched base
             return text
         try:
-            if not is_human_agent and msg.broadcast and group_metadata(msg):
+            meta = group_metadata(msg) if msg.broadcast else {}
+            if not is_human_agent and meta:
+                mentioned = self._blueprint.member_name in (meta.get("mentions") or ())
                 text = RoutedInput(text, InboundMessage(str(msg.message_id),
-                                   str(msg.from_member_name), str(msg.content or "")))
+                                   str(msg.from_member_name), str(msg.content or "")),
+                                   SRC_GROUP_MENTION if mentioned else SRC_GROUP_PLAIN)
         except Exception:
             logger.warning("duplex group shadow skipped; delivery unchanged", exc_info=True)
         return text
@@ -316,7 +358,8 @@ def install_shadow_observer() -> bool:
         try:
             if not is_human_agent and not expanded.is_template and msg.protocol in (None, "", "text", "plain"):
                 text = RoutedInput(text, InboundMessage(str(msg.message_id),
-                                   str(msg.from_member_name), expanded.body))
+                                   str(msg.from_member_name), expanded.body),
+                                   SRC_BROADCAST if msg.broadcast else SRC_DM)
         except Exception:
             logger.warning("duplex shadow skipped; delivery unchanged", exc_info=True)
         return text
@@ -350,7 +393,7 @@ def install_shadow_observer() -> bool:
             message = InboundMessage(str(event.payload.get("message_id") or f"u2a-{uuid.uuid4().hex}"),
                                      "user", content)
             event = event.model_copy(update={"payload": {**event.payload,
-                                                          "content": RoutedInput(content, message)}})
+                                                          "content": RoutedInput(content, message, SRC_USER_TEXT)}})
             logger.info("duplex user input wrapped message_id=%s sender=user", message.message_id)
         return await user_input(self, event)
 

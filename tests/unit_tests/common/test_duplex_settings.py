@@ -68,8 +68,8 @@ async def test_logprob_llm_settings_round_trip(settings_file):
     ({"backend": "sdk", "model_name": "team-a"},
      {"provider": "logprob_llm", "llm_preset": "team_model", "llm_model_name": "team-a"}),
     ({"backend": "mindshub", "model_name": "", "mindshub": {"api_base": "https://m.example/v1"}},
-     {"provider": "logprob_llm", "llm_preset": "mindshub", "llm_api_base": "https://m.example/v1",
-      "llm_model": "mindshub_air"}),
+     {"provider": "typed_choice", "typed_preset": "jev",
+      "typed_endpoint": "https://api.mindshub.ai/v1/decisions", "typed_model": "jev-1.13.0"}),
     ({"backend": "jev", "model_name": "jev-2", "jev": {"api_base": "https://j.example/v1/",
                                                       "endpoint_path": "decisions"}},
      {"provider": "typed_choice", "typed_preset": "jev", "typed_endpoint": "https://j.example/v1/decisions",
@@ -94,6 +94,7 @@ def test_supervisor_can_be_disabled_without_clearing_settings(settings_file):
 @pytest.mark.parametrize("params", [
     {"duplex_router_mode": "shadow"}, {"duplex_router_provider": "sdk"},
     {"duplex_router_typed_preset": "mindshub"}, {"duplex_router_llm_preset": "jev"},
+    {"duplex_router_llm_preset": "mindshub"},
     {"duplex_router_timeout_seconds": "nan"}, {"duplex_router_timeout_seconds": "0"},
     {"duplex_router_llm_api_base": "file:///tmp/secret"},
     {"duplex_router_typed_endpoint": "https://user:pw@api.example/v1"},

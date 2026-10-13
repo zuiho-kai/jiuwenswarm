@@ -59,6 +59,8 @@ def env_secret(name: str) -> str:
     return value
 
 
+MINDSHUB_DECISIONS_ENDPOINT = "https://api.mindshub.ai/v1/decisions"
+MINDSHUB_JEV_MODEL = "jev-1.13.0"
 # Keys of the pre-provider settings shape: backend: sdk | jev | mindshub | clef.
 _LEGACY_KEYS = ("backend", "model_name", "jev", "mindshub", "clef")
 
@@ -71,8 +73,9 @@ def is_legacy_router_settings(section: Any) -> bool:
 def migrate_legacy_router_settings(section: dict[str, Any]) -> bool:
     """Rewrite a legacy duplex_router section in place to the provider shape.
 
-    sdk -> logprob_llm/team_model, mindshub -> logprob_llm/mindshub,
-    jev -> typed_choice/jev, clef -> typed_choice/clef. Per-backend
+    sdk -> logprob_llm/team_model, jev -> typed_choice/jev, clef -> typed_choice/clef,
+    mindshub -> typed_choice/jev on MindsHub's decisions endpoint (MindsHub chat
+    ignores logprobs, so it cannot back the logprob_llm kind). Per-backend
     interrupt_threshold values are dropped; thresholds belong to routing policy.
     Works on plain dicts and ruamel CommentedMaps. Returns whether it changed.
     """
@@ -84,10 +87,13 @@ def migrate_legacy_router_settings(section: dict[str, Any]) -> bool:
            for name in ("jev", "mindshub", "clef")}
     for key in _LEGACY_KEYS:
         section.pop(key, None)
-    if backend in ("jev", "clef"):
+    if backend in ("jev", "clef", "mindshub"):
         settings = old[backend]
-        typed: dict[str, Any] = {"preset": backend}
-        if backend == "jev":
+        typed: dict[str, Any] = {"preset": "clef" if backend == "clef" else "jev"}
+        if backend == "mindshub":
+            typed["endpoint"] = MINDSHUB_DECISIONS_ENDPOINT
+            typed["model"] = MINDSHUB_JEV_MODEL
+        elif backend == "jev":
             base = str(settings.get("api_base") or "https://api.typesafe.ai/v1").rstrip("/")
             typed["endpoint"] = f"{base}/{settings.get('endpoint_path') or 'systemone'}"
             typed["model"] = model_name or "jev-1.13.0"
@@ -100,15 +106,6 @@ def migrate_legacy_router_settings(section: dict[str, Any]) -> bool:
         section["provider"] = "typed_choice"
         section["typed_choice"] = typed
     else:
-        llm: dict[str, Any] = {"preset": "mindshub" if backend == "mindshub" else "team_model"}
-        if backend == "mindshub":
-            settings = old["mindshub"]
-            llm["api_base"] = str(settings.get("api_base") or "https://api.mindshub.ai/v1")
-            llm["model"] = model_name or "mindshub_air"
-            if settings.get("api_key_env"):
-                llm["api_key_env"] = str(settings["api_key_env"])
-        else:
-            llm["model_name"] = model_name
         section["provider"] = "logprob_llm"
-        section["logprob_llm"] = llm
+        section["logprob_llm"] = {"preset": "team_model", "model_name": model_name}
     return True

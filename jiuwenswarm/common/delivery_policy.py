@@ -175,8 +175,8 @@ def _check(env: Envelope) -> None:
 def _directed_mode(env: Envelope) -> tuple[Action, bool]:
     """Return (effective mode, abort_was_unauthorized)."""
     if env.mode is None:
-        default = Action.STEER if env.source == SRC_USER_VOICE else Action.FOLLOWUP
-        return default, False
+        # A directed message without a mode asks whether it must interrupt.
+        return Action.STEER, False
     mode = Action(env.mode)
     can_abort = env.source in USER_SOURCES or env.sender_can_abort
     if mode is Action.ABORT and not can_abort:

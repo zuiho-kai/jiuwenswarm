@@ -4,30 +4,29 @@
  * Two provider kinds:
  * - typed_choice: the server returns the decision probability (presets jev / clef).
  * - logprob_llm: a general LLM; the probability comes from logprobs
- *   (presets team_model / mindshub / openai / custom).
+ *   (presets team_model / openai / custom).
  */
 
 export type DuplexProvider = 'typed_choice' | 'logprob_llm';
 export type TypedPreset = 'jev' | 'clef';
-export type LlmPreset = 'team_model' | 'mindshub' | 'openai' | 'custom';
+export type LlmPreset = 'team_model' | 'openai' | 'custom';
 export type DuplexPreset = TypedPreset | LlmPreset;
 
 export const DUPLEX_PROVIDERS: readonly DuplexProvider[] = ['typed_choice', 'logprob_llm'];
 export const TYPED_PRESETS: readonly TypedPreset[] = ['jev', 'clef'];
-export const LLM_PRESETS: readonly LlmPreset[] = ['team_model', 'mindshub', 'openai', 'custom'];
+export const LLM_PRESETS: readonly LlmPreset[] = ['team_model', 'openai', 'custom'];
 export const CLEF_MODELS = ['clef', 'clef-flash'] as const;
 
 export const JEV_DEFAULT_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+export const MINDSHUB_DECISIONS_ENDPOINT = 'https://api.mindshub.ai/v1/decisions';
 export const TYPED_DEFAULT_MODELS: Record<TypedPreset, string> = { jev: 'jev-1.13.0', clef: 'clef' };
 export const LLM_DEFAULT_API_BASES: Record<LlmPreset, string> = {
   team_model: '',
-  mindshub: 'https://api.mindshub.ai/v1',
   openai: 'https://api.openai.com/v1',
   custom: '',
 };
 export const LLM_DEFAULT_MODELS: Record<LlmPreset, string> = {
   team_model: '',
-  mindshub: 'mindshub_air',
   openai: 'gpt-4o-mini',
   custom: '',
 };
@@ -38,11 +37,11 @@ export type DuplexDraft = {
   preset: DuplexPreset;
   /** team_model: name from the team model pool. */
   model_name: string;
-  /** mindshub / openai / custom. */
+  /** openai / custom. */
   api_base: string;
   /** jev: full decision URL. */
   endpoint: string;
-  /** jev / clef / mindshub / openai / custom. */
+  /** jev / clef / openai / custom. */
   model: string;
   api_key: string;
   account_id: string;
@@ -94,13 +93,14 @@ function readLegacy(
     };
   }
   if (backend === 'mindshub') {
+    // MindsHub chat ignores logprobs; its decisions endpoint is JEV-compatible.
     return {
-      provider: 'logprob_llm',
-      preset: 'mindshub',
+      provider: 'typed_choice',
+      preset: 'jev',
       model_name: '',
-      api_base: apiBase || LLM_DEFAULT_API_BASES.mindshub,
-      endpoint: '',
-      model: modelName || LLM_DEFAULT_MODELS.mindshub,
+      api_base: '',
+      endpoint: MINDSHUB_DECISIONS_ENDPOINT,
+      model: TYPED_DEFAULT_MODELS.jev,
     };
   }
   return {

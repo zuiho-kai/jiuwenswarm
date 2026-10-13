@@ -1163,10 +1163,10 @@ _DUPLEX_CHOICES = {
     "mode": {"off", "active"},
     "provider": {"typed_choice", "logprob_llm"},
     "typed_choice.preset": {"jev", "clef"},
-    "logprob_llm.preset": {"team_model", "mindshub", "openai", "custom"},
+    "logprob_llm.preset": {"team_model", "openai", "custom"},
 }
 _DUPLEX_CLEF_MODELS = {"clef", "clef-flash"}
-_DUPLEX_DEFAULT_LLM_BASES = {"mindshub": "https://api.mindshub.ai/v1", "openai": "https://api.openai.com/v1"}
+_DUPLEX_DEFAULT_LLM_BASES = {"openai": "https://api.openai.com/v1"}
 
 
 def _duplex_http_url(raw: str) -> bool:
@@ -1239,9 +1239,10 @@ def _duplex_router_view(duplex: dict[str, Any]) -> dict[str, str]:
             provider = "typed_choice"
             typed = {"preset": "clef", "model": str(legacy.get("model") or "clef")}
         elif backend == "mindshub":
-            provider = "logprob_llm"
-            llm = {"preset": "mindshub", "api_base": str(legacy.get("api_base") or ""),
-                   "model": model_name or "mindshub_air"}
+            # MindsHub chat ignores logprobs; its decisions endpoint is JEV-compatible.
+            provider = "typed_choice"
+            typed = {"preset": "jev", "endpoint": "https://api.mindshub.ai/v1/decisions",
+                     "model": "jev-1.13.0"}
         else:
             provider = "logprob_llm"
             llm = {"preset": "team_model", "model_name": model_name}

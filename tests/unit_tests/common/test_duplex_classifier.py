@@ -114,14 +114,13 @@ async def test_clef_builds_account_url_and_unwraps_workers_envelope(server, monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preset,url,tokens_field", [
-    ("mindshub", "https://api.mindshub.ai/v1/chat/completions", "max_tokens"),
+    ("custom", "https://llm.example/v1/chat/completions", "max_tokens"),
     ("openai", "https://api.openai.com/v1/chat/completions", "max_completion_tokens"),
 ])
 async def test_logprob_presets(server, preset, url, tokens_field):
     server.respond = lambda request: httpx.Response(200, json=logprob_answer(0.97))
     section = {"preset": preset, "model": "m1"}
-    if preset == "openai":
-        section["api_base"] = ""
+    section["api_base"] = "" if preset == "openai" else "https://llm.example/v1"
     answers = await dc.classify(None, {"provider": "logprob_llm", "logprob_llm": section},
                                 SNAPSHOT, MESSAGES, (dc.URGENCY,))
     assert answers[dc.URGENCY].choice == "INTERRUPT"
@@ -215,8 +214,10 @@ async def test_deadline_comes_from_timeout_seconds(server):
      {"provider": "logprob_llm", "logprob_llm": {"preset": "team_model", "model_name": "fast"}}),
     ({"backend": "mindshub", "model_name": "", "mindshub": {"api_base": "https://m.example/v1",
                                                             "api_key_env": "MH_KEY"}},
-     {"provider": "logprob_llm", "logprob_llm": {"preset": "mindshub", "api_base": "https://m.example/v1",
-                                                 "model": "mindshub_air", "api_key_env": "MH_KEY"}}),
+     # MindsHub chat ignores logprobs; its JEV-compatible decisions endpoint is used instead.
+     {"provider": "typed_choice", "typed_choice": {"preset": "jev",
+                                                   "endpoint": "https://api.mindshub.ai/v1/decisions",
+                                                   "model": "jev-1.13.0", "api_key_env": "MH_KEY"}}),
     ({"backend": "jev", "model_name": "jev-2", "jev": {"api_base": "https://j.example/v1/",
                                                        "endpoint_path": "decisions",
                                                        "interrupt_threshold": 0.95}},

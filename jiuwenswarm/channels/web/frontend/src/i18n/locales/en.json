@@ -338,7 +338,6 @@
         "jev": "JEV",
         "clef": "Cloudflare Clef",
         "team_model": "Team model",
-        "mindshub": "MindsHub",
         "openai": "OpenAI",
         "custom": "Custom"
       },
@@ -346,7 +345,6 @@
         "jev": "Enter the full decision endpoint URL.",
         "clef": "The endpoint is built from the account ID. The token is stored as the shared API key.",
         "team_model": "Pick one of the team models. Its URL and key are managed in model settings.",
-        "mindshub": "The model must support logprobs.",
         "openai": "The model must support logprobs.",
         "custom": "Enter an OpenAI-compatible URL. The model must support logprobs."
       },

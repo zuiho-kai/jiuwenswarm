@@ -338,7 +338,6 @@
         "jev": "JEV",
         "clef": "Cloudflare Clef",
         "team_model": "团队模型",
-        "mindshub": "MindsHub",
         "openai": "OpenAI",
         "custom": "自定义"
       },
@@ -346,7 +345,6 @@
         "jev": "地址填完整的决策接口 URL。",
         "clef": "接口地址由账号 ID 生成。Token 存在共享 API Key 中。",
         "team_model": "从团队模型里选一个。地址和密钥在模型设置中管理。",
-        "mindshub": "模型需要支持 logprobs。",
         "openai": "模型需要支持 logprobs。",
         "custom": "填 OpenAI 兼容地址。模型需要支持 logprobs。"
       },
