@@ -245,3 +245,37 @@ async def test_route_bypass_logs_reason_without_content(monkeypatch, mode, use_s
     assert f"reason={reason}" in logged
     assert "recipient=A2" in logged
     assert "private-message-never-log" not in logged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender,notified", [("user", True), ("A1", False)])
+async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, sender, notified):
+    from jiuwenswarm.agents.harness.team import duplex_native
+
+    class FakeNative:
+        def __init__(self):
+            self._duplex_received = set()
+            self.interrupt = AsyncMock(side_effect=RuntimeError("supervisor stopped"))
+
+    native = FakeNative()
+    monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
+    monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
+    monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot())
+    monkeypatch.setattr(shadow, "_classifier",
+                        lambda *_: AsyncMock(return_value={"action": "INTERRUPT"}))
+    emit = AsyncMock()
+    monkeypatch.setattr(shadow, "_emit_duplex_error", emit)
+    original = AsyncMock(return_value="sent")
+    message = InboundMessage("m1", sender, "Stop using Kafka")
+
+    with pytest.raises(RuntimeError, match="supervisor stopped"):
+        await shadow.deliver_routed(NS(harness=native), shadow.RoutedInput("Stop using Kafka", message),
+                                    use_steer=True, original=original,
+                                    settings={"mode": "active", "backend": "clef", "timeout_seconds": 1})
+
+    original.assert_not_awaited()
+    assert "m1" not in native._duplex_received
+    assert emit.await_count == int(notified)
+    if notified:
+        assert emit.await_args.kwargs["phase"] == "interrupt"
+    assert "未送达" in shadow._duplex_error_text("clef", "interrupt", RuntimeError())

@@ -119,6 +119,8 @@ def _duplex_error_text(backend: str, phase: str, exc: BaseException | None = Non
     backend_label = {"jev": "Jev", "mindshub": "Mindshub", "clef": "Cloudflare Clef",
                      "sdk": "SDK"}.get(str(backend).lower(), str(backend or "未知"))
     reason = status or type(exc).__name__ if exc is not None else status or "响应失败"
+    if phase == "interrupt":
+        return "A2A 监工异常：打断投递失败，当前消息未送达，请重新发送。"
     if phase == "config":
         detail = "配置无效"
     elif reason in {"timeout", "TimeoutError", "asyncio.TimeoutError"}:
@@ -281,8 +283,18 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
                     backend, message.message_id,
                     observation.status if observation.status != "ok" else "model_append")
         return result
-    effective = await native.interrupt(str(content), version=observation.context_version,
-                                       message_id=message.message_id)
+    try:
+        effective = await native.interrupt(str(content), version=observation.context_version,
+                                           message_id=message.message_id)
+    except Exception as exc:
+        # No steer fallback: it would override a pause/stop or double-deliver a pushed replan.
+        # A2A rows stay unread and are redelivered; U2A input has no row, so tell the user.
+        if message.sender == "user":
+            await _emit_duplex_error(host, native, message_id=message.message_id,
+                                     backend=str(backend), phase="interrupt", exc=exc)
+        logger.warning("duplex route interrupt failed backend=%s message_id=%s sender=%s error_type=%s",
+                       backend, message.message_id, message.sender, type(exc).__name__)
+        raise
     if effective == "UNAVAILABLE":
         result = await steer()
         logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=inactive_or_pending",
