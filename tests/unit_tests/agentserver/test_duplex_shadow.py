@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from jiuwenswarm.common.duplex_router import (
-    ControlSnapshot, InboundMessage, observe, prompt_for,
-)
+from choice_classifier import ChoiceAnswer, ClassifierTimeoutError, ProviderError
+
+from jiuwenswarm.common.duplex_classifier import ClassifierConfigError, URGENCY
+from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage, context_for
 from jiuwenswarm.agents.harness.team import duplex_shadow as shadow
 
 
@@ -18,53 +18,13 @@ def snapshot():
                            next_action="Use Kafka")
 
 
-def decision(s, action="INTERRUPT"):
-    return {"action": action}
+def urgency(p_interrupt):
+    choice = "INTERRUPT" if p_interrupt >= 0.5 else "APPEND"
+    probabilities = {"INTERRUPT": p_interrupt, "APPEND": 1 - p_interrupt}
+    return {URGENCY: ChoiceAnswer(choice, probabilities, probabilities[choice])}
 
 
 MESSAGES = (InboundMessage("m204", "A1", "Customer forbids Kafka"),)
-
-
-@pytest.mark.asyncio
-async def test_observation_reports_proposed_action():
-    s = snapshot()
-    result = await observe(s, MESSAGES, classify=AsyncMock(return_value=decision(s)))
-    assert result.proposed_action == "INTERRUPT"
-    assert result.message_ids == ("m204",)
-    assert result.status == "ok"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("response", [None, "INTERRUPT", {},
-    dict(action="DELETE"),
-    dict(action="INTERRUPT", context_version="v0", round_id="r1", checkpoint_id="c1")])
-async def test_invalid_response_produces_no_decision(response):
-    s = snapshot()
-    result = await observe(s, MESSAGES, classify=AsyncMock(return_value=response))
-    assert result.status == "error"
-    assert result.proposed_action == "UNDECIDED"
-
-
-@pytest.mark.asyncio
-async def test_timeout_and_external_cancellation():
-    s = snapshot()
-    cancelled = asyncio.Event()
-
-    async def blocked(*_):
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    result = await observe(s, MESSAGES, classify=blocked,
-                            timeout_seconds=0.01)
-    assert result.status == "timeout"
-    assert cancelled.is_set()
-    task = asyncio.create_task(observe(s, MESSAGES, classify=blocked))
-    await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
 
 def native_state():
@@ -82,9 +42,10 @@ def test_native_snapshot_excludes_history_and_tracks_phase_and_checkpoint():
     harness = native_state()
     before = shadow.snapshot_from_native(harness)
     assert before.next_action == "Implement Kafka"
-    assert "SECRET_REASONING" not in prompt_for(before, MESSAGES)
-    payload = json.loads(prompt_for(before, MESSAGES))
-    assert set(payload["snapshot"]) == {"goal", "next_action", "last_action", "phase"}
+    assert "SECRET_REASONING" not in context_for(before)
+    payload = json.loads(context_for(before))
+    assert payload == {"goal": "Order system", "current_plan": "Implement Kafka", "last_action": "",
+                       "phase": "model"}
     harness.active_round.iter_phase = "tool"
     assert before.context_version != shadow.snapshot_from_native(harness).context_version
     harness.active_round = None
@@ -221,25 +182,19 @@ async def test_non_group_broadcast_through_group_handler_is_wrapped_once(monkeyp
     assert built.call_count == 1
 
 
-def test_prompt_preserves_full_messages_and_tail_constraints():
-    messages = tuple(InboundMessage(str(i), "A1", "x" * 13000 + "DO NOT SEND") for i in range(32))
-    payload = json.loads(prompt_for(snapshot(), messages))
-    assert len(payload["messages"]) == 32
-    assert all(m["content"] == messages[i].content for i, m in enumerate(payload["messages"]))
-    assert all(m["content"].endswith("DO NOT SEND") for m in payload["messages"])
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("backend", ["clef", "mindshub"])
-@pytest.mark.parametrize("decision_result,expected", [
-    ({"action": "INTERRUPT"}, "INTERRUPT"),
-    ({"action": "APPEND"}, "APPEND"),
-    (RuntimeError("Clef unavailable"), "APPEND"),
+@pytest.mark.parametrize("decision_result,expected,phase", [
+    (urgency(0.95), "INTERRUPT", None),
+    (urgency(0.9), "INTERRUPT", None),
+    (urgency(0.89), "APPEND", None),  # INTERRUPT choice below the threshold still appends.
+    (urgency(0.1), "APPEND", None),
+    (ClassifierTimeoutError("timed out"), "APPEND", "route"),
+    (ProviderError("unavailable"), "APPEND", "route"),
+    (ClassifierConfigError("missing key"), "APPEND", "config"),
+    (RuntimeError("bug"), "APPEND", "route"),
 ])
-async def test_external_backend_routes_and_falls_back(
-        monkeypatch, backend, decision_result, expected):
+async def test_urgency_routes_by_threshold_and_falls_back(monkeypatch, decision_result, expected, phase):
     from jiuwenswarm.agents.harness.team import duplex_native
-    from jiuwenswarm.common import duplex_clef, duplex_mindshub
 
     class FakeNative:
         _duplex_received = set()
@@ -248,34 +203,44 @@ async def test_external_backend_routes_and_falls_back(
             self.interrupt = AsyncMock(return_value="INTERRUPT")
 
     native = FakeNative()
-    classify = AsyncMock(side_effect=decision_result if isinstance(decision_result, Exception) else None,
-                         return_value=decision_result if isinstance(decision_result, dict) else None)
+    failure = isinstance(decision_result, Exception)
+    classify = AsyncMock(side_effect=decision_result if failure else None,
+                         return_value=None if failure else decision_result)
+    emit = AsyncMock()
     monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
     monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
     monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot())
-    module = duplex_clef if backend == "clef" else duplex_mindshub
-    monkeypatch.setattr(module, f"classify_{backend}", classify)
+    monkeypatch.setattr(shadow, "classify", classify)
+    monkeypatch.setattr(shadow, "_emit_duplex_error", emit)
     original = AsyncMock(return_value="sent")
-    config = {"mode": "active", "backend": backend, "model_name": "configured-model",
-              "timeout_seconds": 1.5, backend: {"api_key_env": "TEST_KEY"}}
+    config = {"mode": "active", "provider": "logprob_llm",
+              "logprob_llm": {"preset": "mindshub", "api_key_env": "TEST_KEY"}}
+    host = NS(harness=native)
 
     result = await shadow.deliver_routed(
-        NS(harness=native), shadow.RoutedInput("Customer forbids Kafka", MESSAGES[0]),
+        host, shadow.RoutedInput("Customer forbids Kafka", MESSAGES[0]),
         use_steer=True, original=original, settings=config)
 
-    classify.assert_awaited_once()
-    expected_options = {"settings": config[backend], "timeout_seconds": 1.5}
-    if backend == "mindshub":
-        expected_options["model_name"] = "configured-model"
-    assert classify.await_args.kwargs == expected_options
+    classify.assert_awaited_once_with(host, config, snapshot(), (MESSAGES[0],), (URGENCY,))
     if expected == "INTERRUPT":
         assert result == "INTERRUPT"
-        native.interrupt.assert_awaited_once()
+        assert native.interrupt.await_args.kwargs == {"version": "v1", "message_id": "m204"}
         original.assert_not_awaited()
     else:
         assert result == "sent"
         native.interrupt.assert_not_awaited()
         original.assert_awaited_once()
+    assert emit.await_count == int(phase is not None)
+    if phase is not None:
+        assert emit.await_args.kwargs["phase"] == phase
+        assert emit.await_args.kwargs["backend"] == "mindshub"
+
+
+def test_error_text_names_provider_and_reason():
+    assert shadow._duplex_error_text("team_model", "route", ClassifierTimeoutError()) == (
+        "A2A 监工异常：团队模型请求超时，当前消息已按追加方式继续处理。")
+    assert "Jev连接或响应解析失败" in shadow._duplex_error_text("jev", "route", ProviderError())
+    assert "配置无效" in shadow._duplex_error_text("clef", "config", ClassifierConfigError())
 
 
 @pytest.mark.asyncio
@@ -301,7 +266,7 @@ async def test_route_bypass_logs_reason_without_content(monkeypatch, mode, use_s
     content = shadow.RoutedInput("private-message-never-log", MESSAGES[0])
     result = await shadow.deliver_routed(NS(harness=native, blueprint=NS(member_name="A2")), content,
                                         use_steer=use_steer, original=original,
-                                        settings={"mode": mode, "backend": "clef"})
+                                        settings={"mode": mode, "provider": "typed_choice"})
     assert result == "sent"
     original.assert_awaited_once()
     logged = "\n".join(call.args[0] % call.args[1:] for call in log.call_args_list)
@@ -324,8 +289,7 @@ async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, s
     monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeNative)
     monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
     monkeypatch.setattr(shadow, "snapshot_from_native", lambda _: snapshot())
-    monkeypatch.setattr(shadow, "_classifier",
-                        lambda *_: AsyncMock(return_value={"action": "INTERRUPT"}))
+    monkeypatch.setattr(shadow, "classify", AsyncMock(return_value=urgency(0.97)))
     emit = AsyncMock()
     monkeypatch.setattr(shadow, "_emit_duplex_error", emit)
     original = AsyncMock(return_value="sent")
@@ -334,7 +298,7 @@ async def test_interrupt_failure_notifies_user_input_and_reraises(monkeypatch, s
     with pytest.raises(RuntimeError, match="supervisor stopped"):
         await shadow.deliver_routed(NS(harness=native), shadow.RoutedInput("Stop using Kafka", message),
                                     use_steer=True, original=original,
-                                    settings={"mode": "active", "backend": "clef", "timeout_seconds": 1})
+                                    settings={"mode": "active", "provider": "typed_choice", "timeout_seconds": 1})
 
     original.assert_not_awaited()
     assert "m1" not in native._duplex_received

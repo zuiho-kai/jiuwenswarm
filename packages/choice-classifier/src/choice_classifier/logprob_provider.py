@@ -12,7 +12,7 @@ import httpx
 
 from .answers import ChoiceAnswer, Decision, validate_answer
 from .errors import InvalidInputError, InvalidResponseError
-from .typed_choice_provider import ChoiceQuestion, TypedChoiceConfig, post_json
+from .typed_choice_provider import ChoiceQuestion, TypedChoiceConfig, post_json, unwrap_body
 
 
 # Request fields the provider owns; extra_body cannot replace them.
@@ -138,7 +138,7 @@ class LogprobLLMProvider:
             self.config, payload, client=client,
             endpoint=self.config.endpoint.rstrip("/") + "/chat/completions",
         )
-        return parse_logprobs(body, question)
+        return parse_logprobs(unwrap_body(self.config, body), question)
 
     async def decide(self, *, context: str, messages: tuple[str, ...]) -> Decision:
         if not self.config.questions:

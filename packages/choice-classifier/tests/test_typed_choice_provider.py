@@ -300,3 +300,47 @@ def test_invalid_http_configuration(name, value):
     with pytest.raises(ValueError):
         replace(CONFIG, **{name: value})
 
+
+
+def _envelope(body):
+    """A Workers-AI style REST envelope around the typed-choice body."""
+    if not isinstance(body, dict) or body.get("success") is False:
+        raise ValueError("request failed")
+    return body["result"]
+
+
+def test_unwrap_extracts_enveloped_answers():
+    config = replace(CONFIG, unwrap=_envelope)
+    result = asyncio.run(classify_http(
+        lambda request: httpx.Response(200, json={"success": True, "result": answer()}), config=config))
+    assert result["action"].choice == "INTERRUPT"
+    assert "unwrap" not in repr(config)
+
+
+@pytest.mark.parametrize("body", [{"success": False, "errors": ["secret detail"]}, ["not", "a", "dict"], {}])
+def test_unwrap_failure_is_invalid_response_without_chaining(body):
+    config = replace(CONFIG, unwrap=_envelope)
+    with pytest.raises(InvalidResponseError) as caught:
+        asyncio.run(classify_http(lambda request: httpx.Response(200, json=body), config=config))
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert "secret detail" not in str(caught.value)
+
+
+def test_unwrap_may_raise_classifier_errors_directly():
+    def reject(body):
+        raise ProviderError("vendor rejected the request")
+
+    with pytest.raises(ProviderError, match="vendor rejected"):
+        asyncio.run(classify_http(lambda request: httpx.Response(200, json=answer()),
+                                  config=replace(CONFIG, unwrap=reject)))
+
+
+def test_without_unwrap_an_envelope_is_rejected():
+    with pytest.raises(InvalidResponseError):
+        asyncio.run(classify_http(lambda request: httpx.Response(200, json={"result": answer()})))
+
+
+def test_unwrap_must_be_callable():
+    with pytest.raises(ValueError, match="unwrap"):
+        TypedChoiceConfig("https://jev.example/v1/systemone", "m", "k", unwrap="result")
+    assert TypedChoiceConfig.without_questions(CONFIG.endpoint, "m", "k", unwrap=_envelope).unwrap is _envelope

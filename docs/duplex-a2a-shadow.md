@@ -105,7 +105,7 @@ duplex_router:
 - 接入使用 SDK 私有 hooks，已在 SDK 0.1.19 上核对。升级 SDK 时需要重新验证。签名变化时，`install_shadow_observer` 自动关闭双工，只记一条警告，消息照常投递。
 
 ```bash
-python -m pytest --no-cov -q tests/unit_tests/common/test_duplex_choice.py tests/unit_tests/common/test_duplex_jev.py tests/unit_tests/common/test_duplex_mindshub.py tests/unit_tests/common/test_duplex_settings.py tests/unit_tests/agentserver/test_duplex_shadow.py tests/unit_tests/agentserver/test_team_leader_stop_prompt.py tests/integration_tests/test_duplex_e2e.py
+python -m pytest --no-cov -q tests/unit_tests/common/test_duplex_classifier.py tests/unit_tests/common/test_duplex_settings.py tests/unit_tests/agentserver/test_duplex_shadow.py tests/unit_tests/agentserver/test_team_leader_stop_prompt.py tests/integration_tests/test_duplex_e2e.py
 ```
 
 测试覆盖请求协议、阈值、错误降级、设置保存，以及真实 SDK + SQLite + 本地 HTTP 下的打断、上下文和工具结果保留、去重、生命周期、已读确认和群聊 @。测试不依赖外部数据集。

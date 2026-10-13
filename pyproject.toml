@@ -156,11 +156,13 @@ jiuwenbox-server = "jiuwenbox.server.launcher:main"
 py-modules = []
 include-package-data = true
 license-files = ["LICENSE", "OPEN_SOURCE_SOFTWARE_NOTICE.md"]
-package-dir = {"jiuwenbox" = "jiuwenbox/src/jiuwenbox"}
+# choice_classifier is developed as an independent package under packages/
+# and bundled into this wheel, like jiuwenbox; its only dependency is httpx.
+package-dir = {"jiuwenbox" = "jiuwenbox/src/jiuwenbox", "choice_classifier" = "packages/choice-classifier/src/choice_classifier"}
 
 [tool.setuptools.packages.find]
-where = [".", "jiuwenbox/src"]
-include = ["jiuwenswarm*", "jiuwenbox*"]
+where = [".", "jiuwenbox/src", "packages/choice-classifier/src"]
+include = ["jiuwenswarm*", "jiuwenbox*", "choice_classifier*"]
 exclude = ["jiuwenswarm.web*"]
 namespaces = false
 
@@ -187,6 +189,7 @@ jiuwenbox = [
     "configs/**/*",
     "configs/*",
 ]
+choice_classifier = ["py.typed"]
 
 [tool.setuptools.exclude-package-data]
 jiuwenswarm = [

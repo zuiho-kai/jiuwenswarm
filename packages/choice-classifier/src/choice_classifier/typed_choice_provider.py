@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Self
 
 import httpx
 
 from .answers import ChoiceAnswer, Decision, validate_answer
-from .errors import InvalidInputError, InvalidResponseError, ClassifierTimeoutError, ProviderError
+from .errors import (
+    ClassifierError, ClassifierTimeoutError, InvalidInputError, InvalidResponseError, ProviderError,
+)
 from .prompts import CRITERIA, INSTRUCTIONS
 
 
@@ -44,8 +46,12 @@ class TypedChoiceConfig:
     questions: Mapping[str, ChoiceQuestion] = field(default_factory=dict)
     instructions: str | None = field(default=INSTRUCTIONS, repr=False)
     criteria: Mapping[str, str] | None = field(default_factory=lambda: dict(CRITERIA), repr=False)
+    # Extracts the answer body from a vendor envelope, e.g. a REST {"result": ...} wrapper.
+    unwrap: Callable[[Any], Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.unwrap is not None and not callable(self.unwrap):
+            raise ValueError("unwrap must be callable or None")
         for name in ("endpoint", "model", "api_key"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
@@ -83,11 +89,12 @@ class TypedChoiceConfig:
     @classmethod
     def without_questions(
         cls, endpoint: str, model: str, api_key: str, max_response_bytes: int = 65536,
+        unwrap: Callable[[Any], Any] | None = None,
     ) -> Self:
         """Build a config with no questions. add_question() can install them later."""
         return cls(
             endpoint, model, api_key, max_response_bytes=max_response_bytes,
-            instructions=None, criteria=None,
+            instructions=None, criteria=None, unwrap=unwrap,
         )
 
     def add_question(
@@ -151,7 +158,20 @@ class TypedChoiceProvider:
                        for name, question in self.config.questions.items()
                    }}
         parsed = await post_json(self.config, payload, client=self.client)
-        return parse_response(parsed, self.config.questions)
+        return parse_response(unwrap_body(self.config, parsed), self.config.questions)
+
+
+def unwrap_body(config: TypedChoiceConfig, body: Any) -> Any:
+    """Apply the configured envelope unwrapper; its failures are invalid responses."""
+    if config.unwrap is None:
+        return body
+    try:
+        return config.unwrap(body)
+    except ClassifierError:
+        raise
+    except Exception:
+        # The unwrapper sees the raw body; do not chain it into the error.
+        raise InvalidResponseError("provider response envelope is invalid") from None
 
 
 async def post_json(

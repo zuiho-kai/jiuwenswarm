@@ -59,9 +59,10 @@ class Endpoint:
         self.jev_calls.append(await request.json())
         self.fast_entered.set()
         await self.fast_gate.wait()
-        return web.json_response({"answers": {"action": {
+        return web.json_response({"answers": {"urgency": {
             "type": "choice", "choice": self.fast_action, "confidence": 0.95,
-            "probabilities": {"INTERRUPT": 0.95, "APPEND": 0.05},
+            "probabilities": {"INTERRUPT": 0.95, "APPEND": 0.05} if self.fast_action == "INTERRUPT"
+            else {"INTERRUPT": 0.05, "APPEND": 0.95},
         }}})
 
     async def handle(self, request):
@@ -85,11 +86,15 @@ class Endpoint:
             await self.fast_gate.wait()
             if self.fast_error:
                 return web.json_response({"error": {"message": "scripted failure"}}, status=500)
-            function = next(t["function"] for t in body["tools"]
-                            if t["function"]["name"] == "structured_output")
-            assert set(function["parameters"]["properties"]) == {"action"}
-            result = {"action": self.fast_action}
-            message = self.tool_message("structured_output", result)
+            # One-letter logprob answer: A = INTERRUPT, B = APPEND (urgency criteria order).
+            assert body["max_tokens"] == 1 and body["logprobs"] is True
+            assert "A = INTERRUPT" in body["messages"][0]["content"]
+            winner, loser = ("A", "B") if self.fast_action == "INTERRUPT" else ("B", "A")
+            return web.json_response({"id": "fast", "object": "chat.completion", "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": winner},
+                             "logprobs": {"content": [{"token": winner, "logprob": -0.05, "top_logprobs": [
+                                 {"token": winner, "logprob": -0.05}, {"token": loser, "logprob": -3.0}]}]},
+                             "finish_reason": "length"}]})
         elif self.slow_responder is not None:
             message = self.slow_responder(body)
         elif self.tool_first and (slow_call == 1 or (self.repeat_tool_without_result and not any(
@@ -182,7 +187,8 @@ async def wait_until(predicate, timeout=6):
 async def world(tmp_path, monkeypatch, request):
     from jiuwenswarm.common import config
 
-    settings = {"duplex_router": {"mode": "active", "model_name": "fast", "timeout_seconds": 2}}
+    settings = {"duplex_router": {"mode": "active", "provider": "logprob_llm", "timeout_seconds": 2,
+                                  "logprob_llm": {"preset": "team_model", "model_name": "fast"}}}
     settings["duplex_router"].update(getattr(request, "param", {}))
     monkeypatch.setattr(config, "get_config", lambda: settings)
     install_shadow_observer()
@@ -195,9 +201,10 @@ async def world(tmp_path, monkeypatch, request):
     site = web.TCPSite(server, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    if settings["duplex_router"].get("backend") == "jev":
-        settings["duplex_router"]["jev"] = {"api_base": f"http://127.0.0.1:{port}/v1"}
-        monkeypatch.setenv("TYPESAFE_API_KEY", "local-jev-test")
+    if settings["duplex_router"]["provider"] == "typed_choice":
+        settings["duplex_router"]["typed_choice"] = {"preset": "jev", "model": "jev-1.13.0",
+                                                     "endpoint": f"http://127.0.0.1:{port}/v1/systemone"}
+        monkeypatch.setenv("DUPLEX_ROUTER_API_KEY", "local-jev-test")
     client = ModelClientConfig(client_provider="OpenAI", api_base=f"http://127.0.0.1:{port}/v1",
                               api_key="local-test", max_retries=0)
     fast = TeamModelConfig(model_client_config=client,
@@ -436,14 +443,9 @@ async def test_append_during_tool_is_adopted_without_restart(world):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("timeout_source", ["router", "sdk_model"])
-async def test_fast_timeout_falls_back_and_db_message_is_not_lost(world, timeout_source):
+async def test_fast_timeout_falls_back_and_db_message_is_not_lost(world):
     w = world
-    if timeout_source == "router":
-        w.settings["duplex_router"]["timeout_seconds"] = 0.05
-    else:
-        w.settings["duplex_router"].pop("timeout_seconds")
-        w.host.tiny_agent_model_resolver("fast").model_client_config.timeout = 0.05
+    w.settings["duplex_router"]["timeout_seconds"] = 0.05
     w.endpoint.fast_gate.clear()
     w.endpoint.block_model = False
     w.tool.gate.clear()
@@ -711,7 +713,7 @@ async def test_inactive_mode_uses_original_native_without_fast_call(world):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("world", [{"backend": "sdk"}, {"backend": "jev"}], indirect=True)
+@pytest.mark.parametrize("world", [{"provider": "logprob_llm"}, {"provider": "typed_choice"}], indirect=True)
 async def test_pending_decision_survives_new_input_and_preserves_both_messages(world):
     """A state hash change must not discard a supervisor decision or either input."""
     w = world
@@ -735,10 +737,11 @@ async def test_pending_decision_survives_new_input_and_preserves_both_messages(w
         assert "Also include migration steps." in recovered
         assert recovered.count(mid) == 1
         assert w.native._st.round_id_counter > int(before.round_id)
-        requests = (w.endpoint.jev_calls if w.settings["duplex_router"]["backend"] == "jev"
+        requests = (w.endpoint.jev_calls if w.settings["duplex_router"]["provider"] == "typed_choice"
                     else [c for c in w.endpoint.calls if c["model"] == "fast"])
         assert len(requests) == 1
-        assert mid in json.dumps(requests[0])
+        # The classifier sees message bodies and the snapshot context, not delivery ids.
+        assert "Customer forbids Kafka. Use PostgreSQL." in json.dumps(requests[0], ensure_ascii=False)
     finally:
         w.endpoint.fast_gate.set()
         await asyncio.wait_for(delivery, 6)

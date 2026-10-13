@@ -3083,6 +3083,17 @@ def _migrate_legacy_kv_cache_affinity_config(user_data: dict[str, Any]) -> None:
         user_data[APPLICATION_KV_CACHE_CONFIG_KEY] = deepcopy(legacy)
 
 
+def _migrate_legacy_duplex_router_config(user_data: dict[str, Any]) -> bool:
+    """Move duplex_router.backend (sdk/jev/mindshub/clef) to provider + preset."""
+    from jiuwenswarm.common.duplex_router import migrate_legacy_router_settings
+
+    section = user_data.get("duplex_router")
+    if not isinstance(section, dict) or not migrate_legacy_router_settings(section):
+        return False
+    logger.info("config migration: duplex_router backend settings moved to provider presets")
+    return True
+
+
 def migrate_config_from_template(
     template_path: Path,
     user_config_path: Path,
@@ -3141,10 +3152,11 @@ def migrate_config_from_template(
     # 必须在 _deep_merge 之前执行，否则旧子节点会被静默丢弃而非迁移。
     _migrate_legacy_agent_submode_memory(user_data)
     _migrate_legacy_kv_cache_affinity_config(user_data)
+    migrated = _migrate_legacy_duplex_router_config(user_data)
 
     # Deep merge: template provides defaults, user values preserved.
     # user_data is updated in place, which keeps comments and formatting.
-    changes = _deep_merge(template_data, user_data, prune=prune)
+    changes = _deep_merge(template_data, user_data, prune=prune) + int(migrated)
 
     # Guard against an empty result overwriting a valid user config
     if not user_data:
