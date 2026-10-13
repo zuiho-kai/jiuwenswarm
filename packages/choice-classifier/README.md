@@ -188,10 +188,23 @@ The question configuration API is the same as `TypedChoiceConfig`, including
 `without_questions()` and `add_question()`. Each question supports 2–26 criteria,
 assigned letters A–Z in insertion order. Each question makes one request;
 multiple questions run concurrently within the classifier's total deadline.
-Requests use `max_tokens=1`, `logprobs=true`, `top_logprobs=20`, and `temperature=0`.
-Thinking is disabled, so that single token is the answer letter. A reasoning model
-otherwise spends it on hidden reasoning and returns no content logprobs. Set
-`disable_thinking=False` to omit that field.
+Requests use `max_tokens=1`, `logprobs=true`, `top_logprobs=20`, and `temperature=0`,
+and no other fields by default. Vendor differences are configuration:
+
+- `max_tokens_field="max_completion_tokens"` renames the one-token limit.
+- `extra_body` adds vendor fields, for example `{"thinking": {"type": "disabled"}}`
+  for services whose reasoning models would otherwise spend the single token on
+  hidden reasoning and return no content logprobs. It cannot replace the fields above.
+
+OpenAI rejects unknown fields and uses `max_completion_tokens`. Use the preset:
+
+```python
+config = LogprobLLMConfig.openai(model="gpt-4.1-mini", api_key=key)
+# Reasoning-capable models return logprobs only without reasoning:
+config = LogprobLLMConfig.openai(model="gpt-5.2", api_key=key, reasoning_effort="none")
+```
+
+The preset defaults to `https://api.openai.com/v1`; pass `endpoint=` for a relay.
 
 For each letter, the provider strips token whitespace, exponentiates its logprob,
 and normalizes over the returned label tokens. Whitespace variants of the same

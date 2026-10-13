@@ -42,7 +42,6 @@ def test_request_contract_and_normalized_answer_ignores_text_choice():
         assert {k: v for k, v in payload.items() if k != "messages"} == {
             "model": "test-model", "max_tokens": 1, "logprobs": True,
             "top_logprobs": 20, "temperature": 0,
-            "thinking": {"type": "disabled"},
         }
         assert "A = INTERRUPT:" in payload["messages"][0]["content"]
         assert "B = APPEND:" in payload["messages"][0]["content"]
@@ -161,17 +160,43 @@ def test_config_limits_and_empty_questions_make_no_request():
         bare.add_question("many", "Choose", {str(i): "option" for i in range(27)})
     with pytest.raises(InvalidInputError):
         asyncio.run(classify(lambda req: pytest.fail("unexpected request"), bare))
-    with pytest.raises(ValueError, match="disable_thinking"):
-        replace(CONFIG, disable_thinking=1)
+    with pytest.raises(ValueError, match="max_tokens_field"):
+        replace(CONFIG, max_tokens_field="max_output_tokens")
+    for extra, message in [("x", "mapping"), ({1: 2}, "text"), ({"logprobs": False}, "logprobs"),
+                           ({"max_completion_tokens": 5}, "max_completion_tokens"), ({"x": object()}, "JSON")]:
+        with pytest.raises(ValueError, match=message):
+            replace(CONFIG, extra_body=extra)
 
 
-def test_thinking_field_can_be_omitted():
+def sent_payload(config):
+    sent = []
+
     def handler(request):
-        assert "thinking" not in json.loads(request.content)
+        sent.append(json.loads(request.content))
         return httpx.Response(200, json=response())
 
-    result = asyncio.run(classify(handler, replace(CONFIG, disable_thinking=False)))
-    assert result["action"].choice == "INTERRUPT"
+    assert asyncio.run(classify(handler, config))["action"].choice == "INTERRUPT"
+    return sent[0]
+
+
+def test_extra_body_adds_vendor_fields():
+    payload = sent_payload(replace(CONFIG, extra_body={"thinking": {"type": "disabled"}}))
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["max_tokens"] == 1
+
+
+def test_openai_preset():
+    config = LogprobLLMConfig.openai("gpt-4.1-mini", "test-secret")
+    assert config.endpoint == "https://api.openai.com/v1"
+    assert config.questions == CONFIG.questions
+    payload = sent_payload(config)
+    assert payload["max_completion_tokens"] == 1
+    assert "max_tokens" not in payload and "thinking" not in payload and "reasoning_effort" not in payload
+
+    payload = sent_payload(LogprobLLMConfig.openai(
+        "gpt-5.2", "test-secret", endpoint="https://relay.example/v1", reasoning_effort="none",
+    ))
+    assert payload["reasoning_effort"] == "none"
 
 
 @pytest.mark.parametrize("status", [302, 401, 429, 500])
