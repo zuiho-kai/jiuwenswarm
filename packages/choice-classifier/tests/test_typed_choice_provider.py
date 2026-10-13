@@ -1,0 +1,302 @@
+import asyncio
+import json
+from dataclasses import replace
+
+import httpx
+import pytest
+
+from choice_classifier import (
+    ChoiceAnswer,
+    ClassifierConfig,
+    InvalidInputError,
+    InvalidResponseError,
+    ChoiceClassifier,
+    TypedChoiceConfig,
+    TypedChoiceProvider,
+    ClassifierTimeoutError,
+    ProviderError,
+)
+from choice_classifier.typed_choice_provider import parse_response
+from choice_classifier.prompts import CRITERIA, INSTRUCTIONS
+
+CONFIG = TypedChoiceConfig("https://jev.example/v1/systemone", "test-model", "test-secret")
+BARE = TypedChoiceConfig.without_questions(CONFIG.endpoint, CONFIG.model, "test-secret")
+
+
+def answer(choice="INTERRUPT", p_interrupt=0.95):
+    return {"answers": {"action": {
+        "type": "choice", "choice": choice, "confidence": 0.8,
+        "probabilities": {"INTERRUPT": p_interrupt, "APPEND": 1 - p_interrupt},
+    }}}
+
+
+async def classify_http(handler, *, config=CONFIG, classifier_config=None):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+        provider = TypedChoiceProvider(config, client=client)
+        try:
+            return await ChoiceClassifier(provider, classifier_config).classify(
+                context="Calculate using input v1.", messages=["Use corrected input v2.", "Keep CSV output."],
+            )
+        finally:
+            assert not client.is_closed  # Adapter must not close caller-owned clients.
+
+
+def test_http_contract_and_low_confidence_interrupt_is_not_rewritten():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=answer(p_interrupt=0.6))
+
+    assert asyncio.run(classify_http(handler)) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.6, "APPEND": 0.4}, 0.8)}
+    assert "test-secret" not in repr(CONFIG)
+    request, = requests
+    assert request.method == "POST"
+    assert str(request.url) == CONFIG.endpoint
+    assert request.headers["authorization"] == "Bearer test-secret"
+    payload = json.loads(request.content)
+    assert payload["model"] == "test-model"
+    assert payload["state"] == {
+        "context": "Calculate using input v1.",
+        "messages": ["Use corrected input v2.", "Keep CSV output."],
+    }
+    action = payload["questions"]["action"]
+    assert action["instructions"] == INSTRUCTIONS
+    assert action["criteria"] == CRITERIA
+    assert "test-secret" not in request.content.decode()
+
+
+def test_custom_instructions_and_criteria_are_sent_unchanged():
+    supplied = {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
+    config = BARE.add_question(instructions="Custom routing instructions.", criteria=dict(supplied))
+    supplied["INTERRUPT"] = "mutated after construction"
+
+    def handler(request):
+        action = json.loads(request.content)["questions"]["action"]
+        assert action["instructions"] == "Custom routing instructions."
+        assert action["criteria"] == {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
+        return httpx.Response(200, json=answer())
+
+    assert asyncio.run(classify_http(handler, config=config)) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8)}
+
+
+def test_constructor_installs_the_original_prompt():
+    assert CONFIG.questions["action"].instructions == INSTRUCTIONS
+    assert CONFIG.questions["action"].criteria == CRITERIA
+    added = BARE.add_question()
+    assert added.questions["action"].instructions == INSTRUCTIONS
+    assert added.questions["action"].criteria == CRITERIA
+    assert BARE.questions == {}
+
+
+def test_no_questions_is_rejected_before_the_request():
+    def handler(request):
+        raise AssertionError("request must not be sent")
+
+    with pytest.raises(InvalidInputError, match="question"):
+        asyncio.run(classify_http(handler, config=BARE))
+
+
+def test_additional_question_uses_its_own_criteria():
+    urgency = {"NOW": "Do it now.", "LATER": "Wait."}
+    config = CONFIG.add_question("urgency", instructions="Pick urgency.", criteria=dict(urgency))
+    urgency["NOW"] = "mutated"
+    body = answer()
+    body["answers"]["urgency"] = {
+        "type": "choice", "choice": "NOW", "confidence": 0.7,
+        "probabilities": {"NOW": 0.8, "LATER": 0.2},
+    }
+
+    def handler(request):
+        questions = json.loads(request.content)["questions"]
+        assert set(questions) == {"action", "urgency"}
+        assert questions["urgency"]["criteria"] == {"NOW": "Do it now.", "LATER": "Wait."}
+        assert questions["action"]["criteria"] == CRITERIA
+        return httpx.Response(200, json=body)
+
+    assert asyncio.run(classify_http(handler, config=config)) == {
+        "action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8),
+        "urgency": ChoiceAnswer("NOW", {"NOW": 0.8, "LATER": 0.2}, 0.7),
+    }
+    with pytest.raises(InvalidResponseError):
+        parse_response(answer(), config.questions)
+
+
+@pytest.mark.parametrize("criteria", [
+    {},
+    {"ONLY": "One."},
+    {"NOW": " ", "LATER": "Wait."},
+    {"NOW": None, "LATER": "Wait."},
+    {" NOW": "Do it now.", "LATER": "Wait."},
+    "NOW or LATER",
+])
+def test_invalid_criteria(criteria):
+    with pytest.raises(ValueError):
+        BARE.add_question("urgency", instructions="Pick urgency.", criteria=criteria)
+
+
+@pytest.mark.parametrize("config,kwargs", [
+    (BARE, {"instructions": "  "}),
+    (BARE, {"criteria": CRITERIA}),
+    (BARE, {"instructions": INSTRUCTIONS}),
+    (BARE, {"name": " "}),
+    (CONFIG, {"name": "action"}),
+])
+def test_invalid_question(config, kwargs):
+    with pytest.raises(ValueError):
+        config.add_question(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"instructions": None}, {"criteria": None}])
+def test_constructor_requires_both_prompt_parts(kwargs):
+    with pytest.raises(ValueError):
+        TypedChoiceConfig(CONFIG.endpoint, CONFIG.model, "test-secret", **kwargs)
+
+
+def test_blank_instructions_are_rejected():
+    with pytest.raises(ValueError):
+        BARE.add_question(instructions="  ", criteria=CRITERIA)
+
+
+@pytest.mark.parametrize("choice,probability", [("APPEND", 0.1), ("INTERRUPT", 1), ("APPEND", 0.5)])
+def test_valid_response(choice, probability):
+    assert parse_response(answer(choice, probability), CONFIG.questions) == {"action": ChoiceAnswer(choice, {"INTERRUPT": probability, "APPEND": 1 - probability}, 0.8)}
+
+
+@pytest.mark.parametrize("body", [None, [], {}, {"answers": []}, {"answers": {"action": []}}])
+def test_missing_response_shape(body):
+    with pytest.raises(InvalidResponseError):
+        parse_response(body, CONFIG.questions)
+
+
+def test_extra_answer_question_is_rejected():
+    body = answer()
+    body["answers"]["unexpected"] = body["answers"]["action"]
+    with pytest.raises(InvalidResponseError, match="requested questions"):
+        parse_response(body, CONFIG.questions)
+
+
+@pytest.mark.parametrize("patch", [
+    {"type": "text"}, {"choice": "abort"}, {"choice": ["APPEND"]}, {"choice": "APPEND"},
+    {"confidence": None}, {"confidence": True}, {"confidence": float("inf")},
+    {"probabilities": {}},
+    {"probabilities": {"APPEND": 0, "INTERRUPT": 1, "OTHER": 0}},
+    {"probabilities": {"APPEND": 0.2, "INTERRUPT": 0.95}},
+    {"probabilities": {"APPEND": -0.1, "INTERRUPT": 1.1}},
+    {"probabilities": {"APPEND": False, "INTERRUPT": True}},
+    {"probabilities": {"APPEND": "0.05", "INTERRUPT": "0.95"}},
+    {"probabilities": {"APPEND": 0.05, "INTERRUPT": float("nan")}},
+    {"probabilities": {"APPEND": 0.05, "INTERRUPT": 10**1000}},
+])
+def test_invalid_typed_answer(patch):
+    body = answer()
+    body["answers"]["action"].update(patch)
+    with pytest.raises(InvalidResponseError):
+        parse_response(body, CONFIG.questions)
+
+
+@pytest.mark.parametrize("status", [302, 401, 422, 429, 500, 503])
+def test_http_errors_are_not_retried_or_redirected(status):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, headers={"location": "https://other.example/"}, text="private body")
+
+    with pytest.raises(ProviderError, match=f"HTTP status {status}") as error:
+        asyncio.run(classify_http(handler))
+    assert len(calls) == 1
+    assert "private body" not in str(error.value)
+
+
+@pytest.mark.parametrize("exc,error", [
+    (httpx.ReadTimeout("secret timeout detail"), ClassifierTimeoutError),
+    (httpx.ConnectError("secret transport detail"), ProviderError),
+])
+def test_transport_failure(exc, error):
+    def handler(request):
+        raise exc
+
+    with pytest.raises(error) as result:
+        asyncio.run(classify_http(handler))
+    assert "secret" not in str(result.value)
+
+
+@pytest.mark.parametrize("body", [b"not json", b"\xff", b"", b"{\"answers\": null}"])
+def test_invalid_json(body):
+    with pytest.raises(InvalidResponseError):
+        asyncio.run(classify_http(lambda request: httpx.Response(200, content=body)))
+
+
+class BodyStream(httpx.AsyncByteStream):
+    def __init__(self, chunks=(), *, block=False):
+        self.chunks = chunks
+        self.block = block
+        self.closed = False
+        self.entered = asyncio.Event()
+
+    async def __aiter__(self):
+        self.entered.set()
+        for chunk in self.chunks:
+            yield chunk
+        if self.block:
+            await asyncio.Event().wait()
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_stream_limit_closes_response():
+    stream = BodyStream([b"x" * 32, b"x" * 32])
+    with pytest.raises(InvalidResponseError, match="max_response_bytes"):
+        asyncio.run(classify_http(
+            lambda request: httpx.Response(200, stream=stream),
+            config=replace(CONFIG, max_response_bytes=40),
+        ))
+    assert stream.closed
+
+
+def test_deadline_includes_response_body_and_closes_stream():
+    stream = BodyStream(block=True)
+    with pytest.raises(ClassifierTimeoutError):
+        asyncio.run(classify_http(
+            lambda request: httpx.Response(200, stream=stream),
+            classifier_config=ClassifierConfig(timeout_seconds=0.02),
+        ))
+    assert stream.closed
+
+
+def test_http_caller_cancellation_closes_stream():
+    async def run():
+        stream = BodyStream(block=True)
+        task = asyncio.create_task(classify_http(lambda request: httpx.Response(200, stream=stream)))
+        await asyncio.wait_for(stream.entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stream.closed
+
+    asyncio.run(run())
+
+
+def test_owned_client_is_closed(monkeypatch):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=answer())))
+    monkeypatch.setattr("choice_classifier.typed_choice_provider.httpx.AsyncClient", lambda: client)
+    classifier = ChoiceClassifier(TypedChoiceProvider(CONFIG))
+    assert asyncio.run(classifier.classify(context="working", messages=["update"])) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8)}
+    assert client.is_closed
+
+
+@pytest.mark.parametrize("endpoint", ["", "file:///tmp/jev", "https://user:pass@example.com/", "https://example.com/?key=x"])
+def test_invalid_endpoint(endpoint):
+    with pytest.raises(ValueError):
+        replace(CONFIG, endpoint=endpoint)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("api_key", ""), ("model", " "), ("max_response_bytes", 0), ("max_response_bytes", True),
+])
+def test_invalid_http_configuration(name, value):
+    with pytest.raises(ValueError):
+        replace(CONFIG, **{name: value})
+
