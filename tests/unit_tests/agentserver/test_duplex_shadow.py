@@ -26,6 +26,27 @@ def decision(s, action="INTERRUPT"):
 MESSAGES = (InboundMessage("m204", "A1", "Customer forbids Kafka"),)
 
 
+@pytest.mark.parametrize("code,reason", [(401, "密钥"), (403, "权限"),
+                                        (404, "不存在"), (429, "配额"), (503, "上游服务")])
+@pytest.mark.asyncio
+async def test_provider_failure_detail_reaches_ui_without_secrets(code, reason):
+    import httpx
+
+    response = httpx.Response(code, headers={"Retry-After": "30"},
+                              request=httpx.Request("POST", "https://example.test/private-secret"))
+    exc = httpx.HTTPStatusError("secret raw body", request=response.request, response=response)
+    result = await observe(snapshot(), MESSAGES, classify=AsyncMock(side_effect=exc),
+                           current_snapshot=snapshot)
+    text = shadow._duplex_error_text("jev", "route", status=result.status,
+                                     error_detail=result.error_detail)
+    assert f"HTTP {code}" in text and reason in text
+    assert "原因：" in text and "结果：" in text and "解决方案：" in text
+    assert "APPEND" in text
+    assert "secret" not in text
+    if code == 429:
+        assert "30 秒" in text
+
+
 @pytest.mark.asyncio
 async def test_interrupt_is_observed_only():
     s = snapshot()

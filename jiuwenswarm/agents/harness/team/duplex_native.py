@@ -9,8 +9,44 @@ from dataclasses import dataclass
 from openjiuwen.agent_teams.harness.control import _CmdAbort, _CmdPause, _CmdResume, _CmdSend
 from openjiuwen.agent_teams.harness.native_harness import NativeHarness
 from openjiuwen.agent_teams.harness.state import HarnessState, InboxMessage
+from openjiuwen.core.single_agent.rail.base import AgentRail
+from .duplex_thinking import ThinkingWindow
+from .duplex_progress import ProgressDraft, recovery_note
 
 logger = logging.getLogger(__name__)
+
+
+class _ThinkingRail(AgentRail):
+    def __init__(self, harness):
+        self.harness = harness
+
+    async def before_model_call(self, ctx):
+        active = self.harness.active_round
+        if active is not None:
+            self.harness._duplex_thinking.begin(active.round_id)
+            draft = getattr(self.harness, "_duplex_progress", None)
+            if draft is not None:
+                draft.begin(active.round_id)
+                inspectors = ctx.extra.setdefault("_stream_chunk_inspectors", {})
+                if isinstance(inspectors, dict):
+                    inspectors["duplex_progress"] = lambda _ctx, chunk: draft.capture(chunk)
+                else:
+                    # SDK also accepts inspector lists. Avoid accumulating callbacks.
+                    inspectors[:] = [inspector for inspector in inspectors
+                                     if getattr(inspector, "__name__", "") != "duplex_progress_inspector"]
+                    def duplex_progress_inspector(_ctx, chunk):
+                        draft.capture(chunk)
+                    inspectors.append(duplex_progress_inspector)
+
+    async def after_model_call(self, ctx):
+        active = self.harness.active_round
+        response = getattr(ctx.inputs, "response", None)
+        if (active is not None and not active.pause_requested and response is not None
+                and (getattr(response, "content", None) or getattr(response, "tool_calls", None))):
+            self.harness._duplex_thinking.output()
+            draft = getattr(self.harness, "_duplex_progress", None)
+            if draft is not None:
+                draft.text = ""  # complete responses are preserved by SDK history
 
 
 class DeliverySuperseded(RuntimeError):
@@ -23,6 +59,9 @@ class _RouteInput:
     version: str
     message_id: str
     ack: asyncio.Future
+    progress_policy: str = "DISCARD"
+    progress_draft: str = ""
+    progress_round: str = ""
 
 
 class DuplexNativeHarness(NativeHarness):
@@ -30,6 +69,9 @@ class DuplexNativeHarness(NativeHarness):
         super().__init__(*args, **kwargs)
         self._duplex_pending: _RouteInput | None = None
         self._duplex_received: set[str] = set()
+        self._duplex_thinking = ThinkingWindow()
+        self._duplex_progress = ProgressDraft()
+        self.add_rail(_ThinkingRail(self))
 
         # Internal model cancellation leaves admitted messages and completed
         # tool pairs intact. Keep that live prefix untouched for continuation
@@ -43,11 +85,13 @@ class DuplexNativeHarness(NativeHarness):
 
         self.react_agent._handle_context_abort = handle_context_abort
 
-    async def interrupt(self, content, *, version, message_id):
+    async def interrupt(self, content, *, version, message_id, progress_policy="DISCARD",
+                        progress_draft="", progress_round=""):
         self._require_alive()
         logger.info("duplex interrupt queued message_id=%s snapshot_version=%s", message_id, version)
         ack = asyncio.get_running_loop().create_future()
-        await self._control.put(_RouteInput(str(content), version, message_id, ack))
+        await self._control.put(_RouteInput(str(content), version, message_id, ack,
+                                          progress_policy, progress_draft, progress_round))
         return await ack
 
     async def _dispatch(self, cmd):
@@ -70,6 +114,11 @@ class DuplexNativeHarness(NativeHarness):
             self._ack(cmd.ack, "DUPLICATE")
             return
         current = snapshot_from_native(self)
+        if self._duplex_thinking.remaining() > 0:
+            logger.info("duplex interrupt rejected message_id=%s reason=thinking_window remaining_seconds=%.3f",
+                        cmd.message_id, self._duplex_thinking.remaining())
+            self._ack(cmd.ack, "STALE")
+            return
         if (self.state is not HarnessState.RUNNING or current is None
                 or (duplex_router.SNAPSHOT_FRESHNESS_CHECK_ENABLED
                     and current.context_version != cmd.version)
@@ -85,6 +134,10 @@ class DuplexNativeHarness(NativeHarness):
                         "requested_version=%s current_version=%s",
                         cmd.message_id, cmd.version, current.context_version)
         self._duplex_pending = cmd
+        if cmd.progress_round != str(current.round_id):
+            logger.info("duplex progress discarded message_id=%s reason=round_changed", cmd.message_id)
+            cmd.progress_policy = "DISCARD"
+            cmd.progress_draft = ""
         logger.info("duplex interrupt pause_requested message_id=%s", cmd.message_id)
         await super()._on_pause(_CmdPause(ack=asyncio.get_running_loop().create_future()))
         if self.state is HarnessState.PAUSED:
@@ -118,9 +171,15 @@ class DuplexNativeHarness(NativeHarness):
             "and revise the next steps, then proceed.\n\nNew message:\n"
             + cmd.content
         )
+        replan += recovery_note(cmd.progress_policy, cmd.progress_draft)
+        self._duplex_progress.text = ""
+        logger.info("duplex progress recovery message_id=%s policy=%s draft_chars=%d",
+                    cmd.message_id, cmd.progress_policy,
+                    len(cmd.progress_draft) if cmd.progress_policy == "KEEP" else 0)
         # Warm continuation retains history without resubmitting the old
         # query. Replace the supervisor's restart query as well as the plan.
         self._st.paused_query = replan
+        self._duplex_thinking.interrupted()
         await super()._on_send(_CmdSend(
             msg=InboxMessage(0, replan, True), ack=asyncio.get_running_loop().create_future()))
         self._duplex_received.add(cmd.message_id)

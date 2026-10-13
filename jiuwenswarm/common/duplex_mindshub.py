@@ -55,7 +55,8 @@ async def classify_mindshub(
             content = payload["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 raise ValueError("MindsHub response content must be a JSON string")
-            action = validate_decision(json.loads(content))
-            return {"action": action}
+            decision = json.loads(content)
+            validate_decision(decision)
+            return decision
     except httpx.TimeoutException as exc:
         raise TimeoutError("MindsHub request timed out") from exc

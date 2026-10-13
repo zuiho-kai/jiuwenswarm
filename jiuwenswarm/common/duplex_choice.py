@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from jiuwenswarm.common.duplex_decision import action_from_answer, probability
-from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage, env_secret
+from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage, env_secret, PROGRESS_INSTRUCTIONS
 
 DEFAULT_TIMEOUT_SECONDS = 2.0
 DEFAULT_INTERRUPT_THRESHOLD = 0.9
@@ -58,11 +58,27 @@ def choice_request(model: str, state: Any, instructions: str) -> dict[str, Any]:
             "APPEND": "The message does not invalidate the current plan or next action, or evidence is insufficient.",
             "INTERRUPT": "A valid changed goal, hard constraint, or evidence of a mistake invalidates the current plan or next action.",
         },
-    }}}
+    }, "progress_policy": {"type": "choice", "instructions": PROGRESS_INSTRUCTIONS,
+        "criteria": {"KEEP": "The unfinished draft remains useful after the new message; revalidate and reuse it.",
+                     "DISCARD": "The draft is invalid, irrelevant or uncertain; do not carry it into replanning."}}}}
 
 
 def decision_from_body(body: Any, threshold: float, *, provider: str) -> dict[str, str]:
-    return action_from_answer(body["answers"]["action"], threshold, provider=provider)
+    decision = action_from_answer(body["answers"]["action"], threshold, provider=provider)
+    answer = body["answers"].get("progress_policy")
+    if answer is not None:
+        # Reuse strict choice validation with the same confidence requirements.
+        mapped = dict(answer)
+        names = {"KEEP": "INTERRUPT", "DISCARD": "APPEND"}
+        mapped["choice"] = names.get(answer.get("choice"))
+        probabilities = answer.get("probabilities", {})
+        if set(probabilities) != set(names):
+            raise ValueError("invalid progress policy probabilities")
+        mapped["probabilities"] = {names[key]: value for key, value in probabilities.items()}
+        policy = action_from_answer(mapped, threshold, provider=provider)
+        decision["progress_policy"] = ("KEEP" if decision["action"] == "INTERRUPT"
+                                        and policy["action"] == "INTERRUPT" else "DISCARD")
+    return decision
 
 
 def log_decision(body: Any, decision: dict[str, str], threshold: float, *,
@@ -125,6 +141,9 @@ async def classify_choice(
                        provider, request_id, (time.monotonic() - started) * 1000)
         raise TimeoutError(f"{provider} request timed out") from exc
     except httpx.HTTPStatusError as exc:
+        from jiuwenswarm.common.duplex_router import failure_detail
+
+        logger.warning("%s failure request_id=%s %s", provider, request_id, failure_detail(exc))
         logger.warning("%s request failed request_id=%s status_code=%s latency_ms=%.1f",
                        provider, request_id, getattr(exc.response, "status_code", "unknown"),
                        (time.monotonic() - started) * 1000)

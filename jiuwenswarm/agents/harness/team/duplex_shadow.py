@@ -17,7 +17,7 @@ from functools import wraps
 from typing import Any
 
 from jiuwenswarm.common.duplex_router import (
-    ControlSnapshot, InboundMessage, SYSTEM_PROMPT, decision_schema, observe, prompt_for,
+    ControlSnapshot, InboundMessage, SYSTEM_PROMPT, decision_schema, observe, prompt_for, failure_detail,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,9 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
     ]).encode()).hexdigest()[:20]
     return ControlSnapshot(context_version=version, round_id=str(active.round_id),
         checkpoint_id=f"{active.round_id}:{checkpoint.iteration_index}",
-        phase=phase, goal=goal, next_action=next_action, last_action=last_action)
+        phase=phase, goal=goal, next_action=next_action, last_action=last_action,
+        progress_draft=(harness._duplex_progress.for_round(active.round_id)
+                        if getattr(harness, "_duplex_progress", None) is not None else ""))
 
 
 async def classify_input(host, model_name, snapshot, messages):
@@ -125,26 +127,27 @@ def _duplex_context(host: Any, native: Any | None = None) -> tuple[str, str]:
 
 
 def _duplex_error_text(backend: str, phase: str, exc: BaseException | None = None,
-                       status: str | None = None) -> str:
+                       status: str | None = None, error_detail: str = "") -> str:
     backend_label = {"jev": "Jev", "mindshub": "Mindshub", "clef": "Cloudflare Clef",
                      "sdk": "SDK"}.get(str(backend).lower(), str(backend or "未知"))
-    reason = status or type(exc).__name__ if exc is not None else status or "响应失败"
-    if phase == "config":
-        detail = "配置无效"
-    elif reason in {"timeout", "TimeoutError", "asyncio.TimeoutError"}:
-        detail = "请求超时"
-    elif reason in {"error", "ValueError", "JSONDecodeError"}:
-        detail = "连接或响应解析失败"
-    else:
-        detail = "调用失败"
-    return f"A2A 监工异常：{backend_label}{detail}，当前消息已按追加方式继续处理。"
+    if not error_detail:
+        if exc is not None:
+            error_detail = failure_detail(exc)
+        elif status == "timeout":
+            error_detail = failure_detail(TimeoutError())
+        else:
+            error_detail = failure_detail(RuntimeError())
+    return f"A2A 监工异常：{backend_label}。{error_detail}"
 
 
 async def _emit_duplex_error(host: Any, native: Any | None, *, message_id: str,
                              backend: str, phase: str, exc: BaseException | None = None,
-                             status: str | None = None) -> None:
+                             status: str | None = None, error_detail: str = "") -> None:
     """Make supervisor failures visible while keeping the worker's APPEND fallback."""
     session_id, channel_id = _duplex_context(host, native)
+    content = _duplex_error_text(backend, phase, exc, status, error_detail)
+    logger.warning("duplex error backend=%s phase=%s message_id=%s %s",
+                   backend, phase, message_id, content)
     if not session_id:
         logger.warning("duplex error notice skipped: missing session_id message_id=%s phase=%s",
                        message_id, phase)
@@ -164,7 +167,7 @@ async def _emit_duplex_error(host: Any, native: Any | None, *, message_id: str,
                     "source": "duplex_router",
                     "backend": str(backend),
                     "phase": phase,
-                    "content": _duplex_error_text(backend, phase, exc, status),
+                    "content": content,
                     "request_id": request_id,
                     "session_id": session_id,
                 },
@@ -256,7 +259,8 @@ def _schedule_shadow(host, snapshot, message, classify, timeout, backend, native
                     observation.latency_ms, observation.attempts)
         if observation.status in {"timeout", "error"}:
             await _emit_duplex_error(host, native, message_id=message.message_id,
-                                     backend=backend, phase="shadow", status=observation.status)
+                                     backend=backend, phase="shadow", status=observation.status,
+                                     error_detail=observation.error_detail)
 
     task = asyncio.create_task(watch(), name=f"duplex-shadow[{message.message_id}]")
     _SHADOW_TASKS.add(task)
@@ -303,7 +307,7 @@ async def _deliver_shadow(host, content, *, use_steer, original, config, native,
     return await original(host, str(content), use_steer=use_steer)
 
 
-async def deliver_routed(host, content, *, use_steer, original, settings=None):
+async def deliver_routed(host, content, *, use_steer, original, settings=None, _window_batch=False):
     from jiuwenswarm.common.config import get_config
     from .duplex_native import DuplexNativeHarness
 
@@ -349,6 +353,22 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
         logger.info("duplex route bypass backend=%s message_id=%s reason=%s policy=%s",
                     backend, message.message_id, reason, policy)
         return await steer()
+    window = getattr(native, "_duplex_thinking", None)
+    if window is not None and not _window_batch:
+        async def deliver_batch(items):
+            native._require_alive()
+            items = [item for item in items if item.message.message_id not in native._duplex_received]
+            if not items:
+                return
+            merged = RoutedInput("\n\n".join(str(item) for item in items), items[0].message)
+            merged.messages = tuple(item.message for item in items)
+            logger.info("duplex thinking flush message_count=%d window_seconds=%.3f",
+                        len(items), window.seconds)
+            result = await deliver_routed(host, merged, use_steer=use_steer,
+                                         original=original, settings=config, _window_batch=True)
+            native._duplex_received.update(item.message.message_id for item in items)
+            return result
+        return await window.submit(content, deliver_batch)
     model_name = str(config.get("model_name") or "")
     logger.info("duplex route start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
                 backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
@@ -356,7 +376,7 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     try:
         timeout = _decision_timeout(host, config, policy, backend, model_name)
         classify = _classifier(host, config, policy, backend, model_name, timeout)
-        observation = await observe(snapshot, (message,), classify=classify,
+        observation = await observe(snapshot, getattr(content, "messages", (message,)), classify=classify,
             current_snapshot=lambda: snapshot_from_native(native), timeout_seconds=timeout)
     except Exception as exc:
         await _emit_duplex_error(host, native, message_id=message.message_id,
@@ -372,15 +392,23 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
                 observation.latency_ms, observation.attempts)
     if observation.status in {"timeout", "error"}:
         await _emit_duplex_error(host, native, message_id=message.message_id,
-                                 backend=str(backend), phase="route", status=observation.status)
+                                 backend=str(backend), phase="route", status=observation.status,
+                                 error_detail=observation.error_detail)
     if observation.status != "ok" or observation.proposed_action == "APPEND":
         result = await steer()
         logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=%s",
                     backend, message.message_id,
                     observation.status if observation.status != "ok" else "model_append")
         return result
+    progress = {}
+    if getattr(native, "_duplex_progress", None) is not None:
+        progress = {"progress_policy": observation.progress_policy,
+                    "progress_draft": snapshot.progress_draft,
+                    "progress_round": snapshot.round_id}
+    logger.info("duplex progress decision message_id=%s policy=%s draft_chars=%d",
+                message.message_id, observation.progress_policy, len(snapshot.progress_draft))
     effective = await native.interrupt(str(content), version=observation.context_version,
-                                       message_id=message.message_id)
+                                       message_id=message.message_id, **progress)
     if effective == "STALE":
         result = await steer()
         logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=stale_at_commit",

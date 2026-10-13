@@ -143,6 +143,10 @@ async def test_http_failure_is_not_retried(endpoint, monkeypatch, status):
     rendered = fmt % tuple(args)
     assert f"status_code={status}" in rendered
     assert "test-only-secret" not in rendered
+    if status == 429:
+        assert "HTTP 429" in result.error_detail
+        assert "APPEND" in result.error_detail
+        assert "用量与配额" in result.error_detail
 
 
 @pytest.mark.asyncio
