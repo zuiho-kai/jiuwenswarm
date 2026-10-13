@@ -50,19 +50,20 @@ APPEND 直接走这条路径，不额外调用模型。INTERRUPT 先安全暂停
 
 ## 哪些消息经过监工
 
-| 场景 | 方向 | 双工关闭（SDK 原有行为） | 双工开启 |
-|---|---|---|---|
-| 用户文本 | U2A | steer | 经过监工 |
-| 用户语音（task ASR） | U2A | 前端先转成文字，之后同用户文本 | 经过监工 |
-| 实时语音 / 视频（`video_duplex` 扩展） | U2A | 走扩展自己的通路 | 不经过监工 |
-| 队友私信 | A2A | steer | 经过监工 |
-| 群聊 @ 某个 Agent | A2A / U2A | 只有被 @ 的成员收到，SDK 附带最近几条上下文，steer | 按私信处理，经过监工 |
-| 群聊没有 @ | A2A / U2A | 只写入历史，不唤醒 | 同左 |
-| 团队广播 | A2A | 除发送者外的所有成员收到，steer | 经过监工 |
-| 系统提醒（看板巡视、催办、checkpoint） | 系统 | followup | 不经过监工 |
-| 图片、文件、模板消息、人类成员的消息 | — | steer | 不经过监工 |
+原来 SDK 几乎所有消息都直接 steer。开启双工后，下面标"是"的消息先交给监工。监工只判断一件事：要不要打断。
 
-群聊 @ 消息交给监工判断时，只用这条消息本身，不带 SDK 附加的旧群聊记录。执行 Agent 收到的文本和原来一样。
+| 消息 | 经过监工 |
+|---|---|
+| 用户文本、用户语音（前端先转成文字） | 是 |
+| 队友私信 | 是 |
+| 群聊里 @ 某个 Agent | 是，按私信处理 |
+| 团队广播 | 是 |
+| 群聊没有 @ | 否。SDK 本来就只写入历史，不唤醒 |
+| 系统提醒（看板巡视、催办、checkpoint） | 否。SDK 本来就用 followup，不打断 |
+| 实时语音 / 视频（`video_duplex` 扩展） | 否。走扩展自己的通路 |
+| 图片、文件、模板消息、人类成员的消息 | 否。照常 steer |
+
+群聊 @ 消息交给监工时，只用这条消息本身，不带旧群聊记录。执行 Agent 收到的文本不变。
 
 ## 配置
 
@@ -90,7 +91,7 @@ duplex_router:
 
 ## 独立分类包
 
-`packages/choice-classifier` 是可以单独安装的分类包，只负责分类，不决定投递动作。每个问题返回 `choice`、`probabilities` 和 `confidence`。JEV 这类服务用 `TypedChoiceProvider`；支持 logprobs 的 OpenAI 兼容模型用 `LogprobLLMProvider`。详见 [包说明](../packages/choice-classifier/README.md)。
+`packages/choice-classifier` 是可以单独安装的分类包，只负责分类，不决定投递动作。每个问题返回 `choice`、`probabilities` 和 `confidence`。JEV 这类服务用 `TypedChoiceProvider`；支持 logprobs 的 OpenAI 兼容模型用 `LogprobLLMProvider`。用法见 `packages/choice-classifier/README.md`。
 
 ## Leader 全局停工
 
