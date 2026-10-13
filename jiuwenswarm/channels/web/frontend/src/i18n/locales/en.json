@@ -81,16 +81,8 @@
   },
   "settingsPanel": {
     "options": {
-      "duplexRouterSystemone": "systemone",
-      "duplexRouterDecisions": "decisions",
       "duplexRouterModeOff": "Off",
-      "duplexRouterModeActive": "Active supervision",
-      "duplexRouterBackendSdk": "Built-in SDK",
-      "duplexRouterBackendJev": "Jev",
-      "duplexRouterBackendMindshub": "MindsHub",
-      "duplexRouterBackendClef": "Cloudflare Clef",
-      "duplexRouterClef": "clef",
-      "duplexRouterClefFlash": "clef-flash"
+      "duplexRouterModeActive": "Active supervision"
     },
     "title": "Settings",
     "freeModels": {
@@ -333,11 +325,44 @@
     },
     "agent": {
       "a2aClearTitle": "Clear supervisor configuration?",
-      "a2aClearConfirm": "Disable supervision and clear the selected supervisor model, API URL override and shared API key. Cloudflare account ID is also cleared when Clef is selected. Other backend settings remain unchanged.",
-      "a2aDefaultsHint": "SDK uses a configured team model; its API URL and key are managed in model settings. For an external supervisor, choose a backend in Advanced settings. Restart the team after changing the mode.",
+      "a2aClearConfirm": "Turn off the supervisor and clear the shared API key, Cloudflare account ID and selected team model. Other settings stay.",
       "a2aNotConfigured": "Not configured",
       "a2aAdvanced": "Advanced settings",
       "a2aDuplexRouter": "A2A duplex supervisor",
+      "a2aRestartHint": "Restart the team after changes.",
+      "a2aProviders": {
+        "typed_choice": "JEV-style model (server returns the probability)",
+        "logprob_llm": "General LLM (probability from logprobs)"
+      },
+      "a2aPresets": {
+        "jev": "JEV",
+        "clef": "Cloudflare Clef",
+        "team_model": "Team model",
+        "mindshub": "MindsHub",
+        "openai": "OpenAI",
+        "custom": "Custom"
+      },
+      "a2aHints": {
+        "jev": "Enter the full decision endpoint URL.",
+        "clef": "The endpoint is built from the account ID. The token is stored as the shared API key.",
+        "team_model": "Pick one of the team models. Its URL and key are managed in model settings.",
+        "mindshub": "The model must support logprobs.",
+        "openai": "The model must support logprobs.",
+        "custom": "Enter an OpenAI-compatible URL. The model must support logprobs."
+      },
+      "a2aFields": {
+        "mode": "Enable supervisor",
+        "provider": "Model type",
+        "preset": "Preset",
+        "model_name": "Team model",
+        "endpoint": "API URL",
+        "api_base": "API URL",
+        "model": "Model",
+        "api_key": "API key",
+        "token": "API token",
+        "account_id": "Account ID",
+        "timeout_seconds": "Decision timeout (s)"
+      },
       "skills": "Skills",
       "webSearch": "Web search",
       "mediaTools": "Tools",
@@ -431,54 +456,6 @@
       "deleteConfirm": "This clears the saved full-duplex endpoint, model, and API key."
     },
     "fields": {
-      "duplex_router_mode": {
-        "title": "A2A supervision mode",
-        "description": "Disable supervision or let the supervisor choose APPEND or INTERRUPT."
-      },
-      "duplex_router_backend": {
-        "title": "Supervisor backend",
-        "description": "Choose SDK, Jev, MindsHub or Cloudflare Clef."
-      },
-      "duplex_router_model_name": {
-        "title": "Supervisor model name",
-        "description": "SDK team model name, Jev model ID, or MindsHub model ID. Clef uses the separate model selector.",
-        "placeholder": "e.g. jev-1.13.0"
-      },
-      "duplex_router_timeout_seconds": {
-        "title": "Decision timeout (seconds)",
-        "description": "Maximum time allowed for one supervision decision.",
-        "placeholder": "e.g. 8"
-      },
-      "duplex_router_interrupt_threshold": {
-        "title": "Interruption threshold",
-        "description": "Jev and Clef only. Probability greater than 0.5 and at most 1.",
-        "placeholder": "e.g. 0.8"
-      },
-      "duplex_router_api_base": {
-        "title": "Supervisor API URL",
-        "description": "Base URL for the selected external backend. Select the backend before editing.",
-        "placeholder": "https://api.example.com/v1"
-      },
-      "duplex_router_endpoint_path": {
-        "title": "Decision endpoint path",
-        "description": "Decision endpoint path relative to the API URL.",
-        "placeholder": "e.g. decisions"
-      },
-      "duplex_router_api_key": {
-        "title": "Supervisor API key",
-        "description": "API key or Cloudflare token for the selected supervisor. Stored like other API keys.",
-        "placeholder": ""
-      },
-      "duplex_router_account_id": {
-        "title": "Cloudflare account ID",
-        "description": "Required for Clef.",
-        "placeholder": ""
-      },
-      "duplex_router_model": {
-        "title": "Clef model",
-        "description": "Used only by the Cloudflare backend.",
-        "placeholder": ""
-      },
       "preferred_language": {
         "title": "Language",
         "description": "Set the display language for the application interface."
