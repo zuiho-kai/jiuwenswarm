@@ -111,6 +111,117 @@ async def test_real_sdk_failed_delivery_leaves_undelivered_message_unread(monkey
     mm.mark_messages_read.assert_awaited_with([messages[1]], "A2")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender,broadcast,source", [
+    ("user", False, "user_text"),   # user @member DM (UserInbox.direct)
+    ("user", True, "user_text"),    # user broadcast (UserInbox.broadcast)
+    ("A1", False, "dm"),
+    ("A1", True, "broadcast"),
+])
+async def test_mailbox_rows_from_user_are_user_text(sender, broadcast, source):
+    shadow.install_shadow_observer()
+    row = message("m1", broadcast)
+    row.from_member_name = sender
+    handler, host, mm, delivered = make_handler([row])
+    await handler._process_unread_messages("A2")
+    assert delivered[0].source == source
+    assert delivered[0].message.sender == sender
+
+
+def _fresh_sdk(monkeypatch):
+    """Replace every patch target with a stand-in; monkeypatch restores the real ones."""
+    from openjiuwen.agent_teams.agent.coordination.handlers.agent_lifecycle import AgentLifecycleHandler
+    from openjiuwen.agent_teams.agent.coordination.handlers.message import MessageHandler
+    from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+    from openjiuwen.agent_teams.group_chat.message_handler import GroupMessageHandler
+    from openjiuwen.agent_teams.harness import team_harness
+
+    def fmt(self, msg, *, expanded, is_human_agent, now_ms):
+        return "x"
+
+    def group_fmt(self, msg, *, expanded, is_human_agent, now_ms):
+        return "x"
+
+    async def deliver(self, content, *, use_steer=True):
+        return None
+
+    async def on_user_input(self, event):
+        return None
+
+    class BaseNative:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    targets = [(MessageHandler, "_format_message", fmt), (GroupMessageHandler, "_format_message", group_fmt),
+               (TeamAgent, "deliver_input", deliver), (AgentLifecycleHandler, "on_user_input", on_user_input),
+               (team_harness, "NativeHarness", BaseNative)]
+    for owner, name, value in targets:
+        monkeypatch.setattr(owner, name, value)
+    return targets
+
+
+def _patched(targets):
+    return [getattr(owner, name) is not value for owner, name, value in targets]
+
+
+@pytest.mark.parametrize("module,name", [
+    ("openjiuwen.agent_teams.harness.native_harness:NativeHarness", "_on_round_done"),
+    ("openjiuwen.agent_teams.harness.native_harness:NativeHarness", "_rollback_to_snapshot"),
+    ("openjiuwen.core.single_agent.agents.react_agent:ReActAgent", "_handle_context_abort"),
+    ("openjiuwen.agent_teams.harness.team_harness:TeamHarness", "inner_agent"),
+    ("openjiuwen.agent_teams.harness.control", "_CmdPause"),
+])
+def test_missing_sdk_symbol_leaves_all_originals_untouched(monkeypatch, module, name):
+    import importlib
+
+    targets = _fresh_sdk(monkeypatch)
+    path, _, attr = module.partition(":")
+    owner = importlib.import_module(path)
+    owner = getattr(owner, attr) if attr else owner
+    monkeypatch.delattr(owner, name)
+    if not attr:  # a module-level name: force duplex_native to re-import it
+        monkeypatch.delitem(__import__("sys").modules, "jiuwenswarm.agents.harness.team.duplex_native")
+    warn = Mock()
+    monkeypatch.setattr(shadow.logger, "warning", warn)
+    assert shadow.install_shadow_observer() is False
+    assert _patched(targets) == [False] * len(targets)
+    warn.assert_called_once()
+
+
+def test_install_patches_all_targets_together(monkeypatch):
+    targets = _fresh_sdk(monkeypatch)
+    assert shadow.install_shadow_observer() is True
+    assert _patched(targets) == [True] * len(targets)
+
+
+@pytest.mark.parametrize("settings,duplex", [
+    ({"enabled": True, "mode": "active"}, True),
+    ({"mode": "active"}, True),
+    ({"enabled": "on", "mode": "active"}, True),
+    ({"enabled": False, "mode": "active"}, False),
+    ({"enabled": "false", "mode": "active"}, False),
+    ({"enabled": True, "mode": "off"}, False),
+    ({}, False),
+])
+def test_native_factory_needs_enabled_and_active(monkeypatch, settings, duplex):
+    from openjiuwen.agent_teams.harness import team_harness
+    from jiuwenswarm.agents.harness.team import duplex_native
+    from jiuwenswarm.common import config
+
+    targets = _fresh_sdk(monkeypatch)
+    base = targets[-1][2]
+
+    class FakeDuplex:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(duplex_native, "DuplexNativeHarness", FakeDuplex)
+    monkeypatch.setattr(config, "get_config", lambda: {"duplex_router": settings})
+    assert shadow.install_shadow_observer()
+    built = team_harness.NativeHarness("spec", "ctx")
+    assert isinstance(built, FakeDuplex if duplex else base)
+
+
 def test_install_is_idempotent():
     from openjiuwen.agent_teams.agent.coordination.handlers.message import MessageHandler
     from openjiuwen.agent_teams.group_chat.message_handler import GroupMessageHandler
@@ -158,8 +269,8 @@ def make_group_handler(messages, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sender", ["user", "A1"])
-async def test_group_mention_is_routed_with_raw_content_and_sdk_delivery_text(monkeypatch, sender):
+@pytest.mark.parametrize("sender,source", [("user", "user_text"), ("A1", "group_mention")])
+async def test_group_mention_is_routed_with_raw_content_and_sdk_delivery_text(monkeypatch, sender, source):
     messages = [group_message("g1", sender)]
     handler, mm, routed, built = make_group_handler(messages, monkeypatch)
     await handler._process_unread_messages("A2")
@@ -167,7 +278,7 @@ async def test_group_mention_is_routed_with_raw_content_and_sdk_delivery_text(mo
     # Delivery text is exactly the SDK excerpt; the classifier gets only the new message.
     assert str(routed[0]) == "<excerpt>@A2 Customer forbids Kafka</excerpt>"
     assert routed[0].message == InboundMessage("g1", sender, "@A2 Customer forbids Kafka")
-    assert routed[0].source == "group_mention"
+    assert routed[0].source == source  # a user post is user input, never judged
     assert built.call_count == 1
     mm.mark_messages_read.assert_awaited_once_with(messages, "A2")
 

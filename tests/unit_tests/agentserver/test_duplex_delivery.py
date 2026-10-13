@@ -234,10 +234,8 @@ ASKED = Plan(questions=(URGENCY,), action=None)
 @pytest.mark.parametrize("source,plan,decision,action,expected", [
     ("dm", ASKED, _dec(Action.STEER), Action.STEER, dd.RUN_INTERRUPT),
     ("group_mention", ASKED, _dec(Action.STEER), Action.STEER, dd.RUN_INTERRUPT),
-    ("dm", ASKED, _dec(Action.STEER, True), Action.STEER, dd.RUN_STEER),  # abort downgraded
     ("broadcast", ASKED, _dec(Action.STEER), Action.STEER, dd.RUN_STEER),
     ("user_text", Plan((), Action.STEER), _dec(Action.STEER), Action.STEER, dd.RUN_STEER),
-    ("dm", ASKED, _dec(Action.ABORT), Action.ABORT, dd.RUN_INTERRUPT),
     ("dm", ASKED, _dec(Action.FOLLOWUP, True), Action.FOLLOWUP, dd.RUN_FOLLOWUP),
     ("dm", ASKED, _dec(Action.STEER), Action.DELIVER_NOW, dd.RUN_DELIVER),
     ("broadcast", ASKED, _dec(Action.VISIBLE_ONLY), Action.VISIBLE_ONLY, dd.RUN_VISIBLE),
@@ -248,9 +246,9 @@ def test_runtime_action_mapping(source, plan, decision, action, expected):
     assert dd.runtime_action(env, plan, decision, action) == expected
 
 
-def test_envelope_carries_no_mode():
+def test_envelope_from_sdk_signals():
     env = dd.envelope_for(InboundMessage("m", "A1", "x"), source="dm", target="A2")
-    assert env.mode is None and env.sender_can_abort is False
+    assert env == Envelope("dm", "A1", "A2", "x")
 
 
 # ---------------------------------------------------------------- scheduler
@@ -277,7 +275,8 @@ async def test_one_judgment_per_target_batches_later_messages():
     gate.set()
     results = await asyncio.gather(first, *later, other)
     assert calls == [["a"], ["d"], ["b", "c"]]
-    assert results[1] == results[2] == ({"ids": ["b", "c"]}, None)
+    assert results[1].answers == results[2].answers == {"ids": ["b", "c"]}
+    assert results[1].failure is None and results[1].run is None
 
 
 @pytest.mark.asyncio
@@ -287,8 +286,79 @@ async def test_scheduler_returns_failure_to_each_waiter():
     async def ask(questions, messages):
         raise ProviderError("down")
 
-    answers_, failure = await s.judge("A2", (URGENCY,), InboundMessage("a", "A1", "a"), ask)
-    assert answers_ is None and isinstance(failure, ProviderError)
+    verdict = await s.judge("A2", (URGENCY,), InboundMessage("a", "A1", "a"), ask)
+    assert verdict.answers is None and isinstance(verdict.failure, ProviderError)
+
+
+def _batch_world(monkeypatch, native):
+    """Message "a" holds the target's judgment; "b" and "c" queue and form one batch."""
+    gate = asyncio.Event()
+    calls = []
+
+    async def classify(host, config, snapshot, messages, questions):
+        calls.append([m.message_id for m in messages])
+        if not gate.is_set():
+            await gate.wait()
+        return answers(0.99)
+
+    monkeypatch.setattr(shadow, "native_from_runtime", lambda _: native)
+    monkeypatch.setattr(shadow, "SCHEDULER", dd.DeliveryScheduler())
+    monkeypatch.setattr(shadow, "classify", classify)
+    original = AsyncMock(return_value="sent")
+
+    async def send(mid):
+        return await shadow.deliver_routed(
+            NS(harness=native, blueprint=NS(member_name="A2")),
+            shadow.RoutedInput(f"text {mid}", InboundMessage(mid, "A1", mid), "dm"),
+            use_steer=True, original=original, settings=CONFIG)
+
+    async def run():
+        blocker = asyncio.create_task(send("a"))
+        await asyncio.sleep(0.01)
+        batch = [asyncio.create_task(send(m)) for m in ("b", "c")]
+        await asyncio.sleep(0.01)
+        gate.set()
+        return await asyncio.gather(blocker, *batch, return_exceptions=True)
+
+    return run, calls, original
+
+
+@pytest.mark.asyncio
+async def test_batched_interrupt_runs_once_with_all_messages_in_order(route, monkeypatch):
+    """A batch judged INTERRUPT performs ONE interrupt carrying every message; none re-triggers."""
+    native = FakeNative()
+    run, calls, original = _batch_world(monkeypatch, native)
+    results = await run()
+    assert calls == [["a"], ["b", "c"]]
+    assert results == ["INTERRUPT", "INTERRUPT", "INTERRUPT"]
+    # "a" alone, then a single interrupt for the b+c batch, merged in arrival order.
+    assert [c.args[0] for c in native.interrupt.await_args_list] == ["text a", "text b\n\ntext c"]
+    assert native.interrupt.await_args.kwargs["message_id"] == "b"
+    assert {"a", "b", "c"} <= native._duplex_received
+    original.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batched_interrupt_unavailable_steers_merged_text_once(route, monkeypatch):
+    native = FakeNative()
+    native.interrupt = AsyncMock(return_value="UNAVAILABLE")
+    run, _, original = _batch_world(monkeypatch, native)
+    results = await run()
+    assert results == ["sent", "sent", "sent"]
+    assert [c.args[1] for c in original.await_args_list] == ["text a", "text b\n\ntext c"]
+    assert all(c.kwargs["use_steer"] is True for c in original.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_batched_interrupt_failure_reaches_every_joined_message(route, monkeypatch):
+    native = FakeNative()
+    native.interrupt = AsyncMock(side_effect=RuntimeError("supervisor stopped"))
+    run, _, original = _batch_world(monkeypatch, native)
+    results = await run()
+    assert all(isinstance(r, RuntimeError) for r in results)
+    assert native.interrupt.await_count == 2  # "a" alone, then one for the b+c batch
+    assert not {"a", "b", "c"} & native._duplex_received
+    original.assert_not_awaited()
 
 
 # ---------------------------------------------------------------- real SDK drain
