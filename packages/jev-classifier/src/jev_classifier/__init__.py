@@ -1,6 +1,7 @@
 """Context and new messages, plus the configured questions, produce one choice each."""
 
-from .classifier import ClassifierConfig, Decision, DecisionProvider, JevClassifier
+from .answers import ChoiceAnswer, Decision
+from .classifier import ClassifierConfig, DecisionProvider, JevClassifier
 from .errors import (
     InputTooLargeError,
     InsufficientContextError,
@@ -10,13 +11,13 @@ from .errors import (
     JevTimeoutError,
     ProviderError,
 )
-from .http_provider import JevHttpConfig, JevHttpProvider
+from .typed_choice_provider import ChoiceQuestion, TypedChoiceConfig, TypedChoiceProvider
 from .prompts import CRITERIA, INSTRUCTIONS
 
 __all__ = [
-    "CRITERIA", "ClassifierConfig", "Decision", "DecisionProvider", "INSTRUCTIONS",
+    "CRITERIA", "ChoiceAnswer", "ChoiceQuestion", "ClassifierConfig", "Decision", "DecisionProvider", "INSTRUCTIONS",
     "InputTooLargeError", "InsufficientContextError", "InvalidInputError",
-    "InvalidResponseError", "JevClassifier", "JevError", "JevHttpConfig", "JevHttpProvider",
+    "InvalidResponseError", "JevClassifier", "JevError", "TypedChoiceConfig", "TypedChoiceProvider",
     "JevTimeoutError", "ProviderError",
 ]
 

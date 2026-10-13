@@ -4,6 +4,7 @@ import json
 import pytest
 
 from jev_classifier import (
+    ChoiceAnswer,
     ClassifierConfig,
     InputTooLargeError,
     InsufficientContextError,
@@ -15,9 +16,13 @@ from jev_classifier import (
 )
 
 
+def full_answer(label):
+    return ChoiceAnswer(label, {label: 0.75, "OTHER": 0.25}, 0.6)
+
+
 class StubProvider:
     def __init__(self, result=...):
-        self.result = {"action": "APPEND"} if result is ... else result
+        self.result = {"action": full_answer("APPEND")} if result is ... else result
         self.calls = []
 
     async def decide(self, *, context, messages):
@@ -27,10 +32,10 @@ class StubProvider:
 
 @pytest.mark.parametrize("label", ["APPEND", "INTERRUPT", "NOW"])
 def test_classifies_whole_batch_once_without_runtime_metadata(label):
-    provider = StubProvider({"action": label})
+    provider = StubProvider({"action": full_answer(label)})
     classifier = JevClassifier(provider)
     messages = ["Use revised data.", "Keep the agreed report format."]
-    assert asyncio.run(classifier.classify(context="Computing the report.", messages=messages)) == {"action": label}
+    assert asyncio.run(classifier.classify(context="Computing the report.", messages=messages)) == {"action": full_answer(label)}
     assert provider.calls == [("Computing the report.", tuple(messages))]
 
 
@@ -58,7 +63,7 @@ def test_input_limit_counts_utf8_and_json_overhead_without_truncating():
     ).encode("utf-8"))
     provider = StubProvider()
     exact = JevClassifier(provider, ClassifierConfig(max_input_bytes=size))
-    assert asyncio.run(exact.classify(context=context, messages=messages)) == {"action": "APPEND"}
+    assert asyncio.run(exact.classify(context=context, messages=messages)) == {"action": full_answer("APPEND")}
     too_small = JevClassifier(provider, ClassifierConfig(max_input_bytes=size - 1))
     with pytest.raises(InputTooLargeError):
         asyncio.run(too_small.classify(context=context, messages=messages))
@@ -76,6 +81,12 @@ def test_message_count_limit_prevents_provider_call():
 @pytest.mark.parametrize("value", [
     None, {}, "APPEND", {"action": ""}, {"action": None}, {"": "APPEND"},
     {"action": " APPEND"}, {" action": "APPEND"},
+    {"action": "APPEND"},
+    {"action": ChoiceAnswer("APPEND", {"APPEND": 0.2, "INTERRUPT": 0.8}, 0.8)},
+    {"action": ChoiceAnswer("APPEND", {"APPEND": 0.7, "INTERRUPT": 0.4}, 0.7)},
+    {"action": ChoiceAnswer("APPEND", {"APPEND": 1.0}, float("nan"))},
+    {"action": ChoiceAnswer("APPEND", None, 1.0)},
+    {"action": ChoiceAnswer("APPEND", {"APPEND": 1.0, " ": 0.0}, 1.0)},
 ])
 def test_malformed_provider_choices_are_rejected(value):
     with pytest.raises(InvalidResponseError):
@@ -155,14 +166,14 @@ def test_concurrent_requests_keep_their_own_context():
         class Provider:
             async def decide(self, *, context, messages):
                 await asyncio.sleep(0)
-                return {"action": "INTERRUPT"} if context == "affected work" else {"action": "APPEND"}
+                return {"action": full_answer("INTERRUPT")} if context == "affected work" else {"action": full_answer("APPEND")}
 
         classifier = JevClassifier(Provider())
         results = await asyncio.gather(
             classifier.classify(context="affected work", messages=["correction"]),
             classifier.classify(context="unrelated work", messages=["correction"]),
         )
-        assert results == [{"action": "INTERRUPT"}, {"action": "APPEND"}]
+        assert results == [{"action": full_answer("INTERRUPT")}, {"action": full_answer("APPEND")}]
 
     asyncio.run(run())
 

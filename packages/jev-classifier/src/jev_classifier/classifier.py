@@ -3,9 +3,11 @@
 import asyncio
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .answers import ChoiceAnswer, Decision, validate_answer
 from .errors import (
     InputTooLargeError,
     InsufficientContextError,
@@ -16,14 +18,12 @@ from .errors import (
     ProviderError,
 )
 
-Decision = dict[str, str]
-
 
 class DecisionProvider(Protocol):
     """An HTTP, SDK or test adapter. Implementations must honor cancellation."""
 
     async def decide(self, *, context: str, messages: tuple[str, ...]) -> Decision:
-        """Return one choice for each configured question, or raise."""
+        """Return one full answer for each configured question, or raise."""
         ...
 
 
@@ -81,17 +81,17 @@ def _validate_input(
 
 
 def _validate_decision(decision: Any) -> Decision:
-    """Accept the provider's choices. Allowed labels come from each question's criteria."""
+    """Validate full answers from injected providers as well as built-in ones."""
     if not isinstance(decision, dict) or not decision:
-        raise InvalidResponseError("provider must return a choice for each question")
-    choices: Decision = {}
-    for name, choice in decision.items():
+        raise InvalidResponseError("provider must return an answer for each question")
+    answers: Decision = {}
+    for name, answer in decision.items():
         if type(name) is not str or not name.strip() or name != name.strip():
             raise InvalidResponseError("each question name must be nonempty text")
-        if type(choice) is not str or not choice.strip() or choice != choice.strip():
-            raise InvalidResponseError("each question choice must be nonempty text")
-        choices[name] = choice
-    return choices
+        if not isinstance(answer, ChoiceAnswer) or not isinstance(answer.probabilities, Mapping):
+            raise InvalidResponseError("provider must return ChoiceAnswer values")
+        answers[name] = validate_answer(answer, answer.probabilities)
+    return answers
 
 
 class JevClassifier:
@@ -102,7 +102,7 @@ class JevClassifier:
         self.config = config if config is not None else ClassifierConfig()
 
     async def classify(self, *, context: str, messages: list[str] | tuple[str, ...]) -> Decision:
-        """Return one choice per question; failures are exceptions.
+        """Return one full answer per question; failures are exceptions.
 
         Messages are ordered and classified jointly against one recipient's
         context. The caller owns correlation and the applicability of a result.

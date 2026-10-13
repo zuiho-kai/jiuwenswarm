@@ -5,17 +5,17 @@ import os
 
 import httpx
 
-from jev_classifier import JevClassifier, JevError, JevHttpConfig, JevHttpProvider
+from jev_classifier import JevClassifier, JevError, TypedChoiceConfig, TypedChoiceProvider
 
 
 async def main() -> None:
-    config = JevHttpConfig(
+    config = TypedChoiceConfig(
         endpoint=os.environ["JEV_ENDPOINT"],
         model=os.environ["JEV_MODEL"],
         api_key=os.environ["JEV_API_KEY"],
     )
     async with httpx.AsyncClient() as client:
-        classifier = JevClassifier(JevHttpProvider(config, client=client))
+        classifier = JevClassifier(TypedChoiceProvider(config, client=client))
         try:
             choices = await classifier.classify(
                 context="The user requested a revenue report. I am calculating totals from input v1.",

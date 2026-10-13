@@ -6,20 +6,21 @@ import httpx
 import pytest
 
 from jev_classifier import (
+    ChoiceAnswer,
     ClassifierConfig,
     InvalidInputError,
     InvalidResponseError,
     JevClassifier,
-    JevHttpConfig,
-    JevHttpProvider,
+    TypedChoiceConfig,
+    TypedChoiceProvider,
     JevTimeoutError,
     ProviderError,
 )
-from jev_classifier.http_provider import parse_response
+from jev_classifier.typed_choice_provider import parse_response
 from jev_classifier.prompts import CRITERIA, INSTRUCTIONS
 
-CONFIG = JevHttpConfig("https://jev.example/v1/systemone", "test-model", "test-secret")
-BARE = JevHttpConfig.without_questions(CONFIG.endpoint, CONFIG.model, "test-secret")
+CONFIG = TypedChoiceConfig("https://jev.example/v1/systemone", "test-model", "test-secret")
+BARE = TypedChoiceConfig.without_questions(CONFIG.endpoint, CONFIG.model, "test-secret")
 
 
 def answer(choice="INTERRUPT", p_interrupt=0.95):
@@ -31,7 +32,7 @@ def answer(choice="INTERRUPT", p_interrupt=0.95):
 
 async def classify_http(handler, *, config=CONFIG, classifier_config=None):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
-        provider = JevHttpProvider(config, client=client)
+        provider = TypedChoiceProvider(config, client=client)
         try:
             return await JevClassifier(provider, classifier_config).classify(
                 context="Calculate using input v1.", messages=["Use corrected input v2.", "Keep CSV output."],
@@ -47,7 +48,7 @@ def test_http_contract_and_low_confidence_interrupt_is_not_rewritten():
         requests.append(request)
         return httpx.Response(200, json=answer(p_interrupt=0.6))
 
-    assert asyncio.run(classify_http(handler)) == {"action": "INTERRUPT"}
+    assert asyncio.run(classify_http(handler)) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.6, "APPEND": 0.4}, 0.8)}
     assert "test-secret" not in repr(CONFIG)
     request, = requests
     assert request.method == "POST"
@@ -76,7 +77,7 @@ def test_custom_instructions_and_criteria_are_sent_unchanged():
         assert action["criteria"] == {"INTERRUPT": "Stop the current step.", "APPEND": "Keep going."}
         return httpx.Response(200, json=answer())
 
-    assert asyncio.run(classify_http(handler, config=config)) == {"action": "INTERRUPT"}
+    assert asyncio.run(classify_http(handler, config=config)) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8)}
 
 
 def test_constructor_installs_the_original_prompt():
@@ -113,7 +114,10 @@ def test_additional_question_uses_its_own_criteria():
         assert questions["action"]["criteria"] == CRITERIA
         return httpx.Response(200, json=body)
 
-    assert asyncio.run(classify_http(handler, config=config)) == {"action": "INTERRUPT", "urgency": "NOW"}
+    assert asyncio.run(classify_http(handler, config=config)) == {
+        "action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8),
+        "urgency": ChoiceAnswer("NOW", {"NOW": 0.8, "LATER": 0.2}, 0.7),
+    }
     with pytest.raises(InvalidResponseError):
         parse_response(answer(), config.questions)
 
@@ -146,7 +150,7 @@ def test_invalid_question(config, kwargs):
 @pytest.mark.parametrize("kwargs", [{"instructions": None}, {"criteria": None}])
 def test_constructor_requires_both_prompt_parts(kwargs):
     with pytest.raises(ValueError):
-        JevHttpConfig(CONFIG.endpoint, CONFIG.model, "test-secret", **kwargs)
+        TypedChoiceConfig(CONFIG.endpoint, CONFIG.model, "test-secret", **kwargs)
 
 
 def test_blank_instructions_are_rejected():
@@ -156,12 +160,19 @@ def test_blank_instructions_are_rejected():
 
 @pytest.mark.parametrize("choice,probability", [("APPEND", 0.1), ("INTERRUPT", 1), ("APPEND", 0.5)])
 def test_valid_response(choice, probability):
-    assert parse_response(answer(choice, probability), CONFIG.questions) == {"action": choice}
+    assert parse_response(answer(choice, probability), CONFIG.questions) == {"action": ChoiceAnswer(choice, {"INTERRUPT": probability, "APPEND": 1 - probability}, 0.8)}
 
 
 @pytest.mark.parametrize("body", [None, [], {}, {"answers": []}, {"answers": {"action": []}}])
 def test_missing_response_shape(body):
     with pytest.raises(InvalidResponseError):
+        parse_response(body, CONFIG.questions)
+
+
+def test_extra_answer_question_is_rejected():
+    body = answer()
+    body["answers"]["unexpected"] = body["answers"]["action"]
+    with pytest.raises(InvalidResponseError, match="requested questions"):
         parse_response(body, CONFIG.questions)
 
 
@@ -270,9 +281,9 @@ def test_http_caller_cancellation_closes_stream():
 
 def test_owned_client_is_closed(monkeypatch):
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=answer())))
-    monkeypatch.setattr("jev_classifier.http_provider.httpx.AsyncClient", lambda: client)
-    classifier = JevClassifier(JevHttpProvider(CONFIG))
-    assert asyncio.run(classifier.classify(context="working", messages=["update"])) == {"action": "INTERRUPT"}
+    monkeypatch.setattr("jev_classifier.typed_choice_provider.httpx.AsyncClient", lambda: client)
+    classifier = JevClassifier(TypedChoiceProvider(CONFIG))
+    assert asyncio.run(classifier.classify(context="working", messages=["update"])) == {"action": ChoiceAnswer("INTERRUPT", {"INTERRUPT": 0.95, "APPEND": 1 - 0.95}, 0.8)}
     assert client.is_closed
 
 

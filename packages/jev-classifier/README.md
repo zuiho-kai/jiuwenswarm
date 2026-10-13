@@ -4,7 +4,9 @@ An async Python component with one public classification operation:
 
 ```python
 choices = await classifier.classify(context="...", messages=["...", "..."])
-# One choice per configured question, for example {"action": "INTERRUPT"}.
+# One full answer per configured question.
+answer = choices["action"]
+print(answer.choice, answer.probabilities, answer.confidence)
 ```
 
 The package depends on `httpx` and Python 3.11+, with no JiuwenSwarm, agent-core,
@@ -31,17 +33,17 @@ uses caller-owned environment variables and an HTTP client for connection reuse.
 import asyncio
 import os
 import httpx
-from jev_classifier import ClassifierConfig, JevClassifier, JevHttpConfig, JevHttpProvider
+from jev_classifier import ClassifierConfig, JevClassifier, TypedChoiceConfig, TypedChoiceProvider
 
 async def main():
-    config = JevHttpConfig(
+    config = TypedChoiceConfig(
         endpoint=os.environ["JEV_ENDPOINT"],  # Full /v1/systemone or /v1/decisions URL.
         model=os.environ["JEV_MODEL"],
         api_key=os.environ["JEV_API_KEY"],
     )
     async with httpx.AsyncClient() as client:
         classifier = JevClassifier(
-            JevHttpProvider(config, client=client),
+            TypedChoiceProvider(config, client=client),
             ClassifierConfig(timeout_seconds=2.0),
         )
         choices = await classifier.classify(
@@ -63,9 +65,25 @@ call when run with those variables set. No live API call is made during tests.
 | `context` | Nonempty text describing one recipient's relevant task, current activity, requirements and conversation. Callers may serialize structured context into this string. There is no required runtime schema. |
 | `messages` | Nonempty list or tuple of nonempty strings, in caller-supplied order. The sequence is copied before awaiting the provider. |
 
-`JevHttpConfig` installs the module prompt as a question named `action`. Pass `instructions` and `criteria` to replace that prompt. `JevHttpConfig.without_questions()` starts empty, and `add_question()` with no arguments installs the same prompt. Further calls add more named questions. Each question needs at least two criteria, and those labels do not have to be `INTERRUPT` and `APPEND`.
+`TypedChoiceConfig` installs the module prompt as a question named `action`. Pass `instructions` and `criteria` to replace that prompt. `TypedChoiceConfig.without_questions()` starts empty, and `add_question()` with no arguments installs the same prompt. Further calls add more named questions. Each question needs at least two criteria, and those labels do not have to be `INTERRUPT` and `APPEND`.
 
-The output is one choice per question for the **whole batch**. For the original `action` question the labels are:
+The output is `Decision = dict[str, ChoiceAnswer]`, with one answer per question
+for the **whole batch**:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ChoiceAnswer:
+    choice: str
+    probabilities: Mapping[str, float]  # Exactly the question's criterion labels.
+    confidence: float
+```
+
+Both `DecisionProvider.decide()` and `JevClassifier.classify()` return this type.
+This replaces the previous `dict[str, str]` result; use `result[name].choice` for
+just the label. `TypedChoiceConfig` and `TypedChoiceProvider` replace the previous
+`JevHttpConfig` and `JevHttpProvider` names.
+
+For the original `action` question the labels are:
 
 - `INTERRUPT`: the messages require changing ongoing work before it continues.
 - `APPEND`: the messages can be incorporated without interrupting ongoing work.
@@ -107,7 +125,7 @@ and model name. Oversized input is rejected before inference, never truncated.
 `ClassifierConfig` controls deadline, byte limit and message count. The deadline
 includes HTTP connection setup and response streaming. Providers must cooperate
 with async cancellation. The built-in HTTP provider uses a 65,536-byte decoded
-response limit by default, configured through `JevHttpConfig`.
+response limit by default, configured through `TypedChoiceConfig`.
 
 Blank context can be rejected mechanically. Nonempty but misleading or incomplete
 context cannot be reliably detected by this interface; context quality and model
@@ -116,11 +134,11 @@ state to fill in missing information.
 
 ## Provider contract
 
-The built-in provider uses the typed-choice wire format already used by this
+`TypedChoiceProvider` uses the typed-choice wire format already used by this
 repository: `model`, object `state` with `context` and `messages`, and a `questions`
 object with one entry per configured question. Each entry has `type="choice"`,
 `instructions`, and `criteria`. Omitting questions is rejected before the request.
-`JevHttpConfig` sends that prompt by default: `INSTRUCTIONS` and `CRITERIA` on the `action` question. `without_questions()` sends nothing until `add_question()` adds one.
+`TypedChoiceConfig` sends that prompt by default: `INSTRUCTIONS` and `CRITERIA` on the `action` question. `without_questions()` sends nothing until `add_question()` adds one.
 
 Each `answers` entry must match a requested question and contain `type="choice"`,
 a `choice` that is one of that question's criteria, numeric `confidence`, and
@@ -128,45 +146,34 @@ probabilities for exactly those criteria. Probabilities must be in [0, 1], sum t
 one within 1e-5, and agree with the selected choice. Additional provider metadata
 is ignored.
 
-The validated choices are returned directly. There is no probability threshold that
-silently converts one label into another. Confidence is validated but does not
-change the choice. There are no automatic retries or redirects. The module does
+The validated choice, all criterion probabilities, and confidence are returned together. There is no probability threshold that
+silently converts one label into another. Server confidence is preserved and range-validated independently of the winning
+probability; it does not change the choice. There are no automatic retries or redirects. The module does
 not log credentials, input text or raw response bodies. Injected HTTP clients stay
 caller-owned; otherwise a temporary client is created and closed for each call.
 
 An SDK-backed provider can implement `DecisionProvider` without changing callers:
 
 ```python
+from jev_classifier import Decision
+
 class MyProvider:
-    async def decide(self, *, context: str, messages: tuple[str, ...]) -> dict[str, str]:
+    async def decide(self, *, context: str, messages: tuple[str, ...]) -> Decision:
         # Call a configured provider/SDK and validate its response here.
         ...
 ```
 
-Use `JevHttpProvider` through `JevClassifier`, which supplies input validation and
-the total deadline. The release-branch agent-core JEV client identified in the
-handoff remains an optional future adapter; it is not a dependency of this package.
-The current HTTP adapter's live service compatibility has not yet been verified.
+Use `TypedChoiceProvider` through `JevClassifier`, which supplies input
+validation and the total deadline. It supports JEV, Yale, and MCL services that
+share the typed-choice wire contract. Select the service using only endpoint,
+model, and API key.
 
-## Jiuwen integration handoff
+## Jiuwen integration boundary
 
-Jiuwen decides **when** to invoke this module, supplies context, and maps the label
-to its runtime operations. `INTERRUPT` is not automatically an `abort` command;
-`APPEND` does not dictate a particular queue.
-
-| Source | Requested policy for Jiuwen |
-| --- | --- |
-| Private team steer/abort | Invoke JEV, subject to agreed idle precedence. |
-| Private team followup | Bypass JEV. |
-| Idle recipient | Direct delivery; scope/precedence remains to be settled by Jiuwen. |
-| Broadcast | Invoke JEV using each recipient's context. |
-| Chat @mention | Invoke in any state; exact mention eligibility remains to be clarified. |
-| Direct typed-user input | Preserve manual delivery controls; bypass automatic JEV judgment. |
-| Voice interaction and voice-agent/STT | Invoke at the intended delivery boundaries; partial/final transcript policy remains open. |
-
-Jiuwen also owns sender-requested action mapping, successful-steer followup
-clearing, stale-result handling, and error fallback. This package exports no
-send, pause, abort, resume, clear-queue or context-collection operation.
+Jiuwen decides when to invoke the classifier, assembles context, and maps answers
+to runtime operations. Thresholds, routing, queues, logs, scene-specific rules,
+and mindshub/clef migration belong outside this package and this PR.
+`INTERRUPT` does not itself execute an abort, and `APPEND` does not select a queue.
 
 ## Validation
 
@@ -178,10 +185,18 @@ python -m pytest -c packages/jev-classifier/pyproject.toml packages/jev-classifi
 ```
 
 Tests exercise input validation, typed-response validation, batch preservation,
-deadlines, cancellation, HTTP failures, response limits and client ownership using
+concurrent questions, deadlines,
+cancellation, HTTP failures, response limits and client ownership using
 injected providers and mock HTTP transports. They do not measure model accuracy.
 
 `examples/labeled_cases.json` contains proposed semantic cases for a separate live
 evaluation, including the same update under different recipient contexts. Expected
 labels and rationales are evaluation data and must not be included in model input.
+
+On 2026-10-13, six synthetic live checks passed against the configured JEV service
+using `jev-1.13.0`: default construction, no-argument `add_question()`, rewritten
+criteria, custom labels, multiple questions, and an addition explicitly deferred
+until later. Each returned a complete validated `ChoiceAnswer`; the observed
+choices matched the expected labels. This checks API compatibility on those
+examples, not benchmark accuracy.
 

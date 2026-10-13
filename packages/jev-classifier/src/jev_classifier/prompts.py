@@ -18,6 +18,7 @@ If context explicitly says there is no ongoing work, there is nothing to interru
 The decision applies to the whole batch. Judge whether its combined implications
 require changing ongoing work; do not drop or rewrite individual messages.
 These labels do not execute a runtime action, reject delivery, or clear a queue.
+If evidence is insufficient, choose APPEND.
 """
 
 CRITERIA = {
