@@ -146,6 +146,13 @@ probabilities for exactly those criteria. Probabilities must be in [0, 1], sum t
 one within 1e-5, and agree with the selected choice. Additional provider metadata
 is ignored.
 
+Some hosts wrap that body in a vendor envelope, for example a REST response of
+the form `{"success": true, "result": {...}}`. Pass `unwrap=` (a callable that
+receives the decoded JSON and returns the inner body) to `TypedChoiceConfig` or
+`LogprobLLMConfig`. It runs before validation. An exception raised by `unwrap`
+becomes `InvalidResponseError` without chaining the raw body, unless it is
+already a `ClassifierError`. The default `None` uses the body as is.
+
 The validated choice, all criterion probabilities, and confidence are returned together. There is no probability threshold that
 silently converts one label into another. Server confidence is preserved and range-validated independently of the winning
 probability; it does not change the choice. There are no automatic retries or redirects. The module does

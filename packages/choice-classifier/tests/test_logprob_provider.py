@@ -224,3 +224,9 @@ def test_owned_client_closed(monkeypatch):
     result = asyncio.run(ChoiceClassifier(LogprobLLMProvider(CONFIG)).classify(context="working", messages=["update"]))
     assert result["action"].choice == "INTERRUPT"
     assert client.is_closed
+
+
+def test_unwrap_applies_to_logprob_responses():
+    config = replace(CONFIG, unwrap=lambda body: body["result"])
+    result = asyncio.run(classify(lambda request: httpx.Response(200, json={"result": response()}), config))
+    assert result["action"].choice == "INTERRUPT"

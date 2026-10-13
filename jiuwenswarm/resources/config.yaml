@@ -1,24 +1,22 @@
-# Native A2A / U2A 输入路由；修改 mode 后重启团队。模型名来自当前团队模型池。
+# Native A2A / U2A 输入路由；修改 mode 后重启团队。
+# 旧版 backend: sdk/jev/mindshub/clef 配置在启动迁移时自动改写为 provider + preset。
 duplex_router:
   enabled: false  # 是否启用监工；关闭后恢复 Jiuwen 原有 Agent 间交互
   mode: "off"  # off / active
-  backend: sdk  # sdk / jev / mindshub / clef
-  model_name: ""
+  provider: logprob_llm  # typed_choice（服务端直接返回选项概率）/ logprob_llm（普通 LLM 的 token logprobs）
   timeout_seconds: 2.0
-  jev:
-    api_base: https://api.typesafe.ai/v1
-    endpoint_path: systemone
+  typed_choice:
+    preset: jev  # jev / clef
+    endpoint: https://api.typesafe.ai/v1/systemone  # jev：完整决策 URL；clef 按账户 ID 自动拼接
+    model: jev-1.13.0  # clef 时为 clef / clef-flash
     api_key_env: DUPLEX_ROUTER_API_KEY
-    interrupt_threshold: 0.9
-  mindshub:
-    api_base: https://api.mindshub.ai/v1
+    account_id_env: CLOUDFLARE_ACCOUNT_ID  # 仅 clef
+  logprob_llm:
+    preset: team_model  # team_model / mindshub / openai / custom
+    model_name: ""  # team_model：团队模型池中的模型名
+    api_base: https://api.mindshub.ai/v1  # mindshub / openai / custom
+    model: mindshub_air
     api_key_env: DUPLEX_ROUTER_API_KEY
-  clef:
-    model: clef
-    api_base: https://api.cloudflare.com/client/v4
-    account_id_env: CLOUDFLARE_ACCOUNT_ID
-    api_key_env: DUPLEX_ROUTER_API_KEY
-    interrupt_threshold: 0.9
 
 # 配置版本号：与程序版本（jiuwenswarm/common/_build_config.py 的 VERSION）同步。
 # 空串表示未迁移，首次启动迁移后由程序写回实际版本。

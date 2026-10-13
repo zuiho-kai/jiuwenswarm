@@ -16,9 +16,10 @@ import uuid
 from functools import wraps
 from typing import Any
 
-from jiuwenswarm.common.duplex_router import (
-    ControlSnapshot, InboundMessage, SYSTEM_PROMPT, decision_schema, observe, prompt_for,
+from jiuwenswarm.common.duplex_classifier import (
+    DEFAULT_INTERRUPT_THRESHOLD, URGENCY, ClassifierConfigError, classify, provider_label,
 )
+from jiuwenswarm.common.duplex_router import ControlSnapshot, InboundMessage
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +71,6 @@ def snapshot_from_native(harness: Any) -> ControlSnapshot | None:
         phase=phase, goal=goal, next_action=next_action, last_action=last_action)
 
 
-async def classify_input(host, model_name, snapshot, messages):
-    """One isolated fast-model request, with no worker or private state."""
-    from openjiuwen.agent_teams import create_tiny_agent
-
-    async with create_tiny_agent(
-        system_prompt=SYSTEM_PROMPT, model_name=model_name,
-        model_resolver=host.tiny_agent_model_resolver,
-        default_schema=decision_schema(), name=f"duplex-{uuid.uuid4().hex}",
-        language="en", max_iterations=1,
-    ) as agent:
-        return await agent.run(prompt_for(snapshot, messages))
-
-
 def _duplex_context(host: Any, native: Any | None = None) -> tuple[str, str]:
     """Resolve the Web push routing identifiers without exposing provider details."""
     session_id = ""
@@ -117,15 +105,16 @@ def _duplex_context(host: Any, native: Any | None = None) -> tuple[str, str]:
 def _duplex_error_text(backend: str, phase: str, exc: BaseException | None = None,
                        status: str | None = None) -> str:
     backend_label = {"jev": "Jev", "mindshub": "Mindshub", "clef": "Cloudflare Clef",
-                     "sdk": "SDK"}.get(str(backend).lower(), str(backend or "未知"))
+                     "team_model": "团队模型", "openai": "OpenAI", "custom": "自定义模型",
+                     }.get(str(backend).lower(), str(backend or "未知"))
     reason = status or type(exc).__name__ if exc is not None else status or "响应失败"
     if phase == "interrupt":
         return "A2A 监工异常：打断投递失败，当前消息未送达，请重新发送。"
     if phase == "config":
         detail = "配置无效"
-    elif reason in {"timeout", "TimeoutError", "asyncio.TimeoutError"}:
+    elif reason in {"timeout", "TimeoutError", "ClassifierTimeoutError"}:
         detail = "请求超时"
-    elif reason in {"error", "ValueError", "JSONDecodeError"}:
+    elif reason in {"error", "ProviderError", "InvalidResponseError"}:
         detail = "连接或响应解析失败"
     else:
         detail = "调用失败"
@@ -171,50 +160,6 @@ async def _emit_duplex_error(host: Any, native: Any | None, *, message_id: str,
                        backend, phase, message_id, exc_info=True)
 
 
-def _decision_timeout(host, config, backend, model_name):
-    timeout = config.get("timeout_seconds")
-    if timeout is None:
-        if backend == "mindshub":
-            from jiuwenswarm.common.duplex_mindshub import DEFAULT_TIMEOUT_SECONDS
-
-            timeout = DEFAULT_TIMEOUT_SECONDS
-        elif backend == "jev":
-            from jiuwenswarm.common.duplex_jev import DEFAULT_TIMEOUT_SECONDS
-
-            timeout = DEFAULT_TIMEOUT_SECONDS
-        elif backend == "clef":
-            from jiuwenswarm.common.duplex_clef import clef_timeout
-
-            timeout = clef_timeout(config.get("clef"))
-        elif backend == "sdk":
-            timeout = host.tiny_agent_model_resolver(model_name).model_client_config.timeout
-    return float(timeout) if timeout is not None else None
-
-
-def _classifier(host, config, backend, model_name, timeout):
-    async def classify(state, messages):
-        if backend == "mindshub":
-            from jiuwenswarm.common.duplex_mindshub import DEFAULT_MODEL, classify_mindshub
-
-            return await classify_mindshub(state, messages, model_name=model_name or DEFAULT_MODEL,
-                                           settings=config.get("mindshub"), timeout_seconds=timeout)
-        if backend == "jev":
-            from jiuwenswarm.common.duplex_jev import DEFAULT_MODEL, classify_jev
-
-            return await classify_jev(state, messages, model_name=model_name or DEFAULT_MODEL,
-                                      settings=config.get("jev"), timeout_seconds=timeout)
-        if backend == "clef":
-            from jiuwenswarm.common.duplex_clef import classify_clef
-
-            return await classify_clef(state, messages, settings=config.get("clef"),
-                                       timeout_seconds=timeout)
-        if backend != "sdk":
-            raise ValueError("unsupported duplex router backend")
-        return await classify_input(host, model_name, state, messages)
-
-    return classify
-
-
 async def deliver_routed(host, content, *, use_steer, original, settings=None):
     from jiuwenswarm.common.config import get_config
     from .duplex_native import DuplexNativeHarness
@@ -224,7 +169,7 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
         config = get_config().get("duplex_router", {}) or {}
     native = native_from_runtime(host.harness)
     message = content.message
-    backend = config.get("backend", "sdk")
+    backend = provider_label(config)
     configured_enabled = config.get("enabled")
     if isinstance(configured_enabled, str):
         configured_enabled = configured_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -256,35 +201,21 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
         logger.info("duplex route bypass backend=%s message_id=%s reason=%s",
                     backend, message.message_id, reason)
         return await steer()
-    model_name = str(config.get("model_name") or "")
     logger.info("duplex route start backend=%s message_id=%s round_id=%s checkpoint_id=%s phase=%s",
                 backend, message.message_id, snapshot.round_id, snapshot.checkpoint_id, snapshot.phase)
-
-    try:
-        timeout = _decision_timeout(host, config, backend, model_name)
-        classify = _classifier(host, config, backend, model_name, timeout)
-        observation = await observe(snapshot, (message,), classify=classify,
-             timeout_seconds=timeout)
-    except Exception as exc:
-        await _emit_duplex_error(host, native, message_id=message.message_id,
-                                 backend=str(backend), phase="route", exc=exc)
-        logger.warning("duplex route fallback backend=%s message_id=%s reason=classification_exception "
-                       "error_type=%s effective=APPEND", backend, message.message_id, type(exc).__name__)
-        return await steer()
-    logger.info("duplex route observation backend=%s message_id=%s status=%s proposed=%s latency_ms=%.1f attempts=%d",
-                backend, message.message_id, observation.status, observation.proposed_action,
-                observation.latency_ms, observation.attempts)
-    if observation.status in {"timeout", "error"}:
-        await _emit_duplex_error(host, native, message_id=message.message_id,
-                                 backend=str(backend), phase="route", status=observation.status)
-    if observation.status != "ok" or observation.proposed_action == "APPEND":
+    action, failure = await _urgency_action(host, config, snapshot, message)
+    if failure is not None:
+        await _emit_duplex_error(host, native, message_id=message.message_id, backend=backend,
+                                 phase="config" if isinstance(failure, ClassifierConfigError) else "route",
+                                 exc=failure)
+    if action == "APPEND":
         result = await steer()
         logger.info("duplex route effective backend=%s message_id=%s action=APPEND reason=%s",
                     backend, message.message_id,
-                    observation.status if observation.status != "ok" else "model_append")
+                    "model_append" if failure is None else type(failure).__name__)
         return result
     try:
-        effective = await native.interrupt(str(content), version=observation.context_version,
+        effective = await native.interrupt(str(content), version=snapshot.context_version,
                                            message_id=message.message_id)
     except Exception as exc:
         # No steer fallback: it would override a pause/stop or double-deliver a pushed replan.
@@ -303,6 +234,18 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     logger.info("duplex route effective backend=%s message_id=%s action=%s",
                 backend, message.message_id, effective)
     return effective
+
+
+async def _urgency_action(host, config, snapshot, message) -> tuple[str, Exception | None]:
+    """Ask URGENCY once; INTERRUPT needs p(INTERRUPT) >= the threshold, failures APPEND."""
+    try:
+        answers = await classify(host, config, snapshot, (message,), (URGENCY,))
+    except Exception as exc:  # CancelledError is not an Exception and propagates.
+        logger.warning("duplex route fallback message_id=%s error_type=%s effective=APPEND",
+                       message.message_id, type(exc).__name__)
+        return "APPEND", exc
+    interrupt = answers[URGENCY].probabilities["INTERRUPT"]
+    return ("INTERRUPT" if interrupt >= DEFAULT_INTERRUPT_THRESHOLD else "APPEND"), None
 
 
 def _install_group_render() -> None:
