@@ -31,8 +31,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from openjiuwen.core.foundation.llm import ProviderType
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 from jiuwenswarm.agents.harness.common.rails.permissions.auto_config import (
     is_auto_permission_mode,
@@ -345,15 +347,17 @@ CONFIG_KEYS = tuple(CONFIG_SET_ENV_MAP.keys())
 
 # 来自 config.yaml 的配置项（前端 param 名 -> config.yaml 路径）
 CONFIG_YAML_KEYS = frozenset({
-    "duplex_router_model",
-    "duplex_router_mode",
     "duplex_router_enabled",
-    "duplex_router_backend",
-    "duplex_router_model_name",
+    "duplex_router_mode",
+    "duplex_router_provider",
     "duplex_router_timeout_seconds",
-    "duplex_router_interrupt_threshold",
-    "duplex_router_api_base",
-    "duplex_router_endpoint_path",
+    "duplex_router_typed_preset",
+    "duplex_router_typed_endpoint",
+    "duplex_router_typed_model",
+    "duplex_router_llm_preset",
+    "duplex_router_llm_model_name",
+    "duplex_router_llm_api_base",
+    "duplex_router_llm_model",
 
     "context_engine_enabled",
     "kv_cache_affinity_enabled",
@@ -1141,40 +1145,120 @@ def preserve_deleted_team_entities(params: dict[str, Any]) -> None:
         )
 
 
-def _update_duplex_router_setting(param_key: str, value: Any, *, backend: str) -> None:
-    """Persist supervisor settings using the existing config pipeline."""
-    field = param_key.removeprefix("duplex_router_")
-    raw = str(value if value is not None else "").strip()
-    allowed = {"mode": {"off", "active"}, "backend": {"sdk", "jev", "mindshub", "clef"},
-               "model": {"clef", "clef-flash"},
-               "endpoint_path": {"systemone", "decisions"}}
-    if field in allowed and raw not in allowed[field]:
-        raise ConfigPanelBadRequest(f"invalid duplex router {field}")
-    parsed: Any = raw
-    if field == "enabled":
-        parsed = parse_config_switch_bool(value)
-    if field in {"timeout_seconds", "interrupt_threshold"}:
-        try:
-            parsed = float(raw)
-        except ValueError as exc:
-            raise ConfigPanelBadRequest(f"invalid duplex router {field}") from exc
-        valid = math.isfinite(parsed) and (parsed > 0 if field == "timeout_seconds" else 0.5 < parsed <= 1)
-        if not valid:
-            raise ConfigPanelBadRequest(f"invalid duplex router {field}")
-    if field == "api_base":
-        from jiuwenswarm.common.duplex_choice import endpoint_url
-        try:
-            endpoint_url(raw, provider=backend)
-        except (TypeError, ValueError) as exc:
-            raise ConfigPanelBadRequest("invalid supervisor API base") from exc
-    if field in {"endpoint_path", "model"}:
-        update_duplex_router_in_config({"jev" if field == "endpoint_path" else "clef": {field: parsed}})
-    elif field in {"interrupt_threshold", "api_base"}:
-        if backend not in {"jev", "mindshub", "clef"}:
-            raise ConfigPanelBadRequest("select an external supervisor backend first")
-        update_duplex_router_in_config({backend: {field: parsed}})
-    else:
-        update_duplex_router_in_config({field: parsed})
+# Flat Web settings key -> (duplex_router section, field). None section = top level.
+_DUPLEX_SETTING_PATHS: dict[str, tuple[str | None, str]] = {
+    "duplex_router_enabled": (None, "enabled"),
+    "duplex_router_mode": (None, "mode"),
+    "duplex_router_provider": (None, "provider"),
+    "duplex_router_timeout_seconds": (None, "timeout_seconds"),
+    "duplex_router_typed_preset": ("typed_choice", "preset"),
+    "duplex_router_typed_endpoint": ("typed_choice", "endpoint"),
+    "duplex_router_typed_model": ("typed_choice", "model"),
+    "duplex_router_llm_preset": ("logprob_llm", "preset"),
+    "duplex_router_llm_model_name": ("logprob_llm", "model_name"),
+    "duplex_router_llm_api_base": ("logprob_llm", "api_base"),
+    "duplex_router_llm_model": ("logprob_llm", "model"),
+}
+_DUPLEX_CHOICES = {
+    "mode": {"off", "active"},
+    "provider": {"typed_choice", "logprob_llm"},
+    "typed_choice.preset": {"jev", "clef"},
+    "logprob_llm.preset": {"team_model", "mindshub", "openai", "custom"},
+}
+_DUPLEX_CLEF_MODELS = {"clef", "clef-flash"}
+_DUPLEX_DEFAULT_LLM_BASES = {"mindshub": "https://api.mindshub.ai/v1", "openai": "https://api.openai.com/v1"}
+
+
+def _duplex_http_url(raw: str) -> bool:
+    """Accept an empty value (unset) or a plain http(s) URL without credentials/query."""
+    if not raw:
+        return True
+    parsed = urlparse(raw)
+    return (parsed.scheme in {"http", "https"} and bool(parsed.hostname) and not parsed.username
+            and not parsed.password and not parsed.query and not parsed.fragment)
+
+
+def _duplex_router_updates(params: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Validate all duplex supervisor settings in ``params`` and return one nested update.
+
+    Validation runs before any write, so a bad field leaves config.yaml untouched.
+    """
+    updates: dict[str, Any] = {}
+    for param_key, (section, field) in _DUPLEX_SETTING_PATHS.items():
+        if param_key not in params:
+            continue
+        value = params[param_key]
+        raw = str(value if value is not None else "").strip()
+        label = f"{section}.{field}" if section else field
+        parsed: Any = raw
+        if label in _DUPLEX_CHOICES and raw not in _DUPLEX_CHOICES[label]:
+            raise ConfigPanelBadRequest(f"invalid duplex router {label}")
+        if field == "enabled":
+            parsed = parse_config_switch_bool(value)
+        elif field == "timeout_seconds":
+            try:
+                parsed = float(raw)
+            except ValueError as exc:
+                raise ConfigPanelBadRequest("invalid duplex router timeout_seconds") from exc
+            if not (math.isfinite(parsed) and parsed > 0):
+                raise ConfigPanelBadRequest("invalid duplex router timeout_seconds")
+        elif field in {"endpoint", "api_base"} and not _duplex_http_url(raw):
+            raise ConfigPanelBadRequest(f"invalid duplex router {label}")
+        elif field == "mode":
+            # Quote it: YAML 1.1 readers (yaml.safe_load) parse a bare `off` as False.
+            parsed = DoubleQuotedScalarString(raw)
+        (updates.setdefault(section, {}) if section else updates)[field] = parsed
+    typed = updates.get("typed_choice") or {}
+    if "model" in typed:
+        preset = typed.get("preset") or (current.get("typed_choice") or {}).get("preset", "jev")
+        if preset == "clef" and typed["model"] not in _DUPLEX_CLEF_MODELS:
+            raise ConfigPanelBadRequest("invalid duplex router typed_choice.model")
+    if "duplex_router_api_key" in params:
+        for section in ("typed_choice", "logprob_llm"):
+            updates.setdefault(section, {})["api_key_env"] = "DUPLEX_ROUTER_API_KEY"
+    if "duplex_router_account_id" in params:
+        updates.setdefault("typed_choice", {})["account_id_env"] = "CLOUDFLARE_ACCOUNT_ID"
+    return updates
+
+
+def _duplex_router_view(duplex: dict[str, Any]) -> dict[str, str]:
+    """Flat Web settings view of ``duplex_router``; maps the legacy ``backend`` shape too."""
+    typed = dict(duplex.get("typed_choice") or {})
+    llm = dict(duplex.get("logprob_llm") or {})
+    provider = duplex.get("provider")
+    if provider not in {"typed_choice", "logprob_llm"}:
+        backend = str(duplex.get("backend") or "sdk")
+        legacy = duplex.get(backend) or {}
+        model_name = str(duplex.get("model_name") or "")
+        if backend == "jev":
+            provider = "typed_choice"
+            base = str(legacy.get("api_base") or "https://api.typesafe.ai/v1").rstrip("/")
+            typed = {"preset": "jev", "endpoint": f"{base}/{legacy.get('endpoint_path') or 'systemone'}",
+                     "model": model_name or "jev-1.13.0"}
+        elif backend == "clef":
+            provider = "typed_choice"
+            typed = {"preset": "clef", "model": str(legacy.get("model") or "clef")}
+        elif backend == "mindshub":
+            provider = "logprob_llm"
+            llm = {"preset": "mindshub", "api_base": str(legacy.get("api_base") or ""),
+                   "model": model_name or "mindshub_air"}
+        else:
+            provider = "logprob_llm"
+            llm = {"preset": "team_model", "model_name": model_name}
+    llm_preset = str(llm.get("preset") or "team_model")
+    return {
+        "duplex_router_enabled": "true" if duplex.get("enabled", duplex.get("mode", "off") != "off") else "false",
+        "duplex_router_mode": str(duplex.get("mode", "off")),
+        "duplex_router_provider": str(provider),
+        "duplex_router_timeout_seconds": str(duplex.get("timeout_seconds", 2.0)),
+        "duplex_router_typed_preset": str(typed.get("preset") or "jev"),
+        "duplex_router_typed_endpoint": str(typed.get("endpoint") or "https://api.typesafe.ai/v1/systemone"),
+        "duplex_router_typed_model": str(typed.get("model") or ""),
+        "duplex_router_llm_preset": llm_preset,
+        "duplex_router_llm_model_name": str(llm.get("model_name") or ""),
+        "duplex_router_llm_api_base": str(llm.get("api_base") or _DUPLEX_DEFAULT_LLM_BASES.get(llm_preset, "")),
+        "duplex_router_llm_model": str(llm.get("model") or ""),
+    }
 
 
 def apply_config_payload(
@@ -1265,11 +1349,14 @@ def apply_config_payload(
             logger.warning("[config.set] 写回 modes.team 失败: %s", exc)
             raise ConfigPanelInternalError("failed to update modes.team") from exc
 
-    duplex_backend = str(params.get("duplex_router_backend") or (raw.get("duplex_router") or {}).get("backend", "sdk"))
-    if "duplex_router_api_key" in params:
-        update_duplex_router_in_config({name: {"api_key_env": "DUPLEX_ROUTER_API_KEY"}
-                                       for name in ("jev", "mindshub", "clef")})
-        yaml_updated.append("duplex_router_api_key_env")
+    duplex_updates = _duplex_router_updates(params, raw.get("duplex_router") or {})
+    if duplex_updates:
+        try:
+            update_duplex_router_in_config(duplex_updates)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[config.set] 写回 duplex_router 失败: %s", exc)
+            raise ConfigPanelInternalError("failed to update duplex_router") from exc
+        yaml_updated.extend(key for key in _DUPLEX_SETTING_PATHS if key in params)
     external_cli_agents_updated = False
     for param_key in CONFIG_YAML_KEYS:
         if param_key not in params:
@@ -1278,7 +1365,7 @@ def apply_config_payload(
         parsed = parse_config_bool(val)
         try:
             if param_key.startswith("duplex_router_"):
-                _update_duplex_router_setting(param_key, val, backend=duplex_backend)
+                continue  # applied above in one validated write
             elif param_key == "context_engine_enabled":
                 update_context_engine_enabled_in_config(parsed)
             elif param_key == "kv_cache_affinity_enabled":
@@ -1509,29 +1596,7 @@ async def config_get_handler(
     # 合并 config.yaml 中的配置项
     try:
         raw = get_config_raw()
-        duplex = raw.get("duplex_router") or {}
-        jev = duplex.get("jev") or {}
-        backend = str(duplex.get("backend", "sdk"))
-        external = duplex.get(backend) or {}
-        defaults = {"jev": "https://api.typesafe.ai/v1", "mindshub": "https://api.mindshub.ai/v1",
-                    "clef": "https://api.cloudflare.com/client/v4"}
-        payload.update({
-            "duplex_router_backends": {
-                name: {"api_base": str((duplex.get(name) or {}).get("api_base", api_base)),
-                       **({"interrupt_threshold": str((duplex.get(name) or {}).get("interrupt_threshold", 0.9))}
-                          if name in {"jev", "clef"} else {})}
-                for name, api_base in defaults.items()
-            },
-            "duplex_router_enabled": "true" if duplex.get("enabled", duplex.get("mode", "off") != "off") else "false",
-            "duplex_router_mode": str(duplex.get("mode", "off")),
-            "duplex_router_backend": str(duplex.get("backend", "sdk")),
-            "duplex_router_model_name": str(duplex.get("model_name", "")),
-            "duplex_router_timeout_seconds": str(duplex.get("timeout_seconds", 2.0)),
-            "duplex_router_interrupt_threshold": str(external.get("interrupt_threshold", 0.9)),
-            "duplex_router_api_base": str(external.get("api_base", defaults.get(backend, ""))),
-            "duplex_router_endpoint_path": str(jev.get("endpoint_path", "systemone")),
-            "duplex_router_model": str((duplex.get("clef") or {}).get("model", "clef")),
-        })
+        payload.update(_duplex_router_view(raw.get("duplex_router") or {}))
         setup_guide_cfg = raw.get("setup_guide") or {}
         payload["setup_guide_enabled"] = (
             "true" if setup_guide_cfg.get("enabled", True) else "false"
