@@ -305,6 +305,41 @@ async def deliver_routed(host, content, *, use_steer, original, settings=None):
     return effective
 
 
+def _install_group_render() -> None:
+    """Route group-chat @-mentions like direct A2A messages.
+
+    GroupMessageHandler returns the excerpted body for group rows without
+    calling super, so the base patch never sees them. Delivery keeps the SDK
+    text (excerpt included); the classifier gets only the raw new message,
+    because the excerpt repeats older chat turns the snapshot does not need.
+    """
+    try:
+        from openjiuwen.agent_teams.group_chat.handler import group_metadata
+        from openjiuwen.agent_teams.group_chat.message_handler import GroupMessageHandler
+    except ImportError:
+        logger.warning("duplex group-chat routing unavailable: SDK group chat missing")
+        return
+    original = GroupMessageHandler.__dict__.get("_format_message")
+    if original is None or getattr(original, "_duplex_shadow", False):
+        return
+
+    @wraps(original)
+    def render_group(self, msg, *, expanded, is_human_agent, now_ms):
+        text = original(self, msg, expanded=expanded, is_human_agent=is_human_agent, now_ms=now_ms)
+        if isinstance(text, RoutedInput):  # non-group rows went through the patched base
+            return text
+        try:
+            if not is_human_agent and msg.broadcast and group_metadata(msg):
+                text = RoutedInput(text, InboundMessage(str(msg.message_id),
+                                   str(msg.from_member_name), str(msg.content or "")))
+        except Exception:
+            logger.warning("duplex group shadow skipped; delivery unchanged", exc_info=True)
+        return text
+
+    render_group._duplex_shadow = True
+    GroupMessageHandler._format_message = render_group
+
+
 def install_shadow_observer() -> bool:
     """Install the minimal routing shim; unsupported SDKs keep their old behavior.
 
@@ -323,6 +358,7 @@ def install_shadow_observer() -> bool:
         logger.warning("duplex shadow unavailable: SDK hooks missing")
         return False
     if getattr(original, "_duplex_shadow", False):
+        _install_group_render()
         return True
     try:
         inspect.signature(original).bind(None, None, expanded=None,
@@ -344,6 +380,7 @@ def install_shadow_observer() -> bool:
 
     render._duplex_shadow = True
     MessageHandler._format_message = render
+    _install_group_render()
 
     deliver = TeamAgent.deliver_input
 

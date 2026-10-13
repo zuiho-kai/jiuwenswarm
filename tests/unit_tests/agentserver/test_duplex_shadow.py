@@ -152,10 +152,73 @@ async def test_real_sdk_failed_delivery_leaves_undelivered_message_unread(monkey
 
 def test_install_is_idempotent():
     from openjiuwen.agent_teams.agent.coordination.handlers.message import MessageHandler
+    from openjiuwen.agent_teams.group_chat.message_handler import GroupMessageHandler
     shadow.install_shadow_observer()
     installed = MessageHandler._format_message
+    group_installed = GroupMessageHandler.__dict__["_format_message"]
     assert shadow.install_shadow_observer()
     assert MessageHandler._format_message is installed
+    assert GroupMessageHandler.__dict__["_format_message"] is group_installed
+    assert group_installed._duplex_shadow
+
+
+GROUP_META = json.dumps({"type": "group_chat", "client_message_id": "c1"})
+
+
+def group_message(mid, sender="user", meta=GROUP_META):
+    return NS(message_id=mid, from_member_name=sender, to_member_name=None, broadcast=True,
+              protocol="text", content="@A2 Customer forbids Kafka", timestamp=0, meta=meta)
+
+
+def make_group_handler(messages, monkeypatch):
+    from openjiuwen.agent_teams.agent.team_agent import TeamAgent
+    from openjiuwen.agent_teams.group_chat.message_handler import GroupMessageHandler
+    from openjiuwen.agent_teams.schema.team import TeamRole
+
+    shadow.install_shadow_observer()
+    routed = []
+
+    async def deliver_routed(host, content, **kwargs):
+        routed.append(content)
+
+    monkeypatch.setattr(shadow, "deliver_routed", deliver_routed)
+    built = Mock(side_effect=InboundMessage)
+    monkeypatch.setattr(shadow, "InboundMessage", built)
+    host = Host()
+    host.has_pending_interrupt = lambda: False
+    host.deliver_input = lambda content, **kw: TeamAgent.deliver_input(host, content, **kw)
+    mm = NS(mark_messages_read=AsyncMock(), mark_message_read=AsyncMock())
+    handler = GroupMessageHandler(host, NS(role=TeamRole.LEADER, language="en", member_name="A2"),
+                                  NS(message_manager=mm, team_backend=None), NS())
+    handler._read_all_unread = AsyncMock(side_effect=[messages, []])
+    handler._expand = AsyncMock(side_effect=lambda msg: NS(
+        body=f"<excerpt>{msg.content}</excerpt>" if msg.meta else msg.content, is_template=False))
+    return handler, mm, routed, built
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender", ["user", "A1"])
+async def test_group_mention_is_routed_with_raw_content_and_sdk_delivery_text(monkeypatch, sender):
+    messages = [group_message("g1", sender)]
+    handler, mm, routed, built = make_group_handler(messages, monkeypatch)
+    await handler._process_unread_messages("A2")
+    assert len(routed) == 1 and isinstance(routed[0], shadow.RoutedInput)
+    # Delivery text is exactly the SDK excerpt; the classifier gets only the new message.
+    assert str(routed[0]) == "<excerpt>@A2 Customer forbids Kafka</excerpt>"
+    assert routed[0].message == InboundMessage("g1", sender, "@A2 Customer forbids Kafka")
+    assert built.call_count == 1
+    mm.mark_messages_read.assert_awaited_once_with(messages, "A2")
+
+
+@pytest.mark.asyncio
+async def test_non_group_broadcast_through_group_handler_is_wrapped_once(monkeypatch):
+    messages = [group_message("b1", "A1", meta=None)]
+    handler, mm, routed, built = make_group_handler(messages, monkeypatch)
+    await handler._process_unread_messages("A2")
+    assert len(routed) == 1 and isinstance(routed[0], shadow.RoutedInput)
+    assert routed[0].message.message_id == "b1"
+    assert routed[0].message.content == "@A2 Customer forbids Kafka"
+    assert built.call_count == 1
 
 
 def test_prompt_preserves_full_messages_and_tail_constraints():
