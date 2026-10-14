@@ -1,15 +1,15 @@
 import { useCallback, useEffect } from 'react';
 import { AudioWaveform, LoaderCircle, Square } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 
 import type { ApplicationPluginTaskInputActionProps } from '../../../channels/web/frontend/src/applicationPlugins/types';
-import { useTaskFullDuplexEnabled, setTaskFullDuplexEnabled } from '../../../channels/web/frontend/src/features/taskFullDuplex/featureFlag';
+import {
+  useTaskFullDuplexEnabled,
+  setTaskFullDuplexEnabled,
+} from '../../../channels/web/frontend/src/features/taskFullDuplex/featureFlag';
 import { setTaskAsrEnabled } from '../../../channels/web/frontend/src/features/taskAsr/featureFlag';
 import { webRequest } from '../../../channels/web/frontend/src/services/webClient';
-import {
-  startTaskFullDuplex,
-  stopTaskFullDuplex,
-  useTaskFullDuplexRuntime,
-} from './taskFullDuplexRuntimeStore';
+import { startTaskFullDuplex, stopTaskFullDuplex, useTaskFullDuplexRuntime } from './taskFullDuplexRuntimeStore';
 import './TaskFullDuplexAction.css';
 
 function parseEnabled(value: unknown): boolean {
@@ -23,6 +23,7 @@ export function TaskFullDuplexAction({
   ensureSession,
   labels,
 }: ApplicationPluginTaskInputActionProps) {
+  const { t } = useTranslation();
   const enabled = useTaskFullDuplexEnabled();
   const { state, error } = useTaskFullDuplexRuntime();
 
@@ -34,10 +35,7 @@ export function TaskFullDuplexAction({
         .then((config) => {
           if (!cancelled) {
             setTaskFullDuplexEnabled(parseEnabled(config.task_full_duplex_enabled));
-            setTaskAsrEnabled(
-              config.task_asr_enabled !== undefined &&
-                parseEnabled(config.task_asr_enabled),
-            );
+            setTaskAsrEnabled(config.task_asr_enabled !== undefined && parseEnabled(config.task_asr_enabled));
           }
         })
         .catch(() => {
@@ -63,34 +61,45 @@ export function TaskFullDuplexAction({
   }, [ensureSession, state]);
 
   const showAction = enabled && eligible;
-  const title = error || (state === 'starting'
-    ? labels.starting
-    : state === 'active'
-      ? labels.stop
-      : labels.start);
+  const statusText = state === 'starting' ? t('chat.taskFullDuplexConnecting') : t('chat.taskFullDuplexListening');
+  const title = error || (state === 'starting' ? labels.starting : state === 'active' ? labels.stop : labels.start);
 
   return (
     <>
       {showAction ? (
-        <button
-          type="button"
-          onClick={() => void handleClick()}
-          disabled={!sessionId}
-          className={`chat-input-btn chat-input-btn--send task-full-duplex-action is-${state}`}
-          title={title}
-          aria-label={title}
-          aria-pressed={state === 'active'}
-          data-testid="chat-panel-input-full-duplex"
-        >
-          {state === 'starting' ? (
-            <LoaderCircle className="chat-input-btn-icon task-full-duplex-action__spinner" aria-hidden="true" />
-          ) : state === 'active' ? (
-            <Square className="chat-input-btn-icon" fill="currentColor" strokeWidth={1.8} aria-hidden="true" />
-          ) : (
-            <AudioWaveform className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
+        <>
+          {state !== 'idle' && (
+            <span
+              className="task-full-duplex-status"
+              title={statusText}
+              role="status"
+              data-testid="chat-panel-full-duplex-status"
+            >
+              {statusText}
+            </span>
           )}
-        </button>
-      ) : fallback}
+          <button
+            type="button"
+            onClick={() => void handleClick()}
+            disabled={!sessionId}
+            className={`chat-input-btn chat-input-btn--send task-full-duplex-action is-${state}`}
+            title={title}
+            aria-label={title}
+            aria-pressed={state === 'active'}
+            data-testid="chat-panel-input-full-duplex"
+          >
+            {state === 'starting' ? (
+              <LoaderCircle className="chat-input-btn-icon task-full-duplex-action__spinner" aria-hidden="true" />
+            ) : state === 'active' ? (
+              <Square className="chat-input-btn-icon" fill="currentColor" strokeWidth={1.8} aria-hidden="true" />
+            ) : (
+              <AudioWaveform className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
+            )}
+          </button>
+        </>
+      ) : (
+        fallback
+      )}
     </>
   );
 }

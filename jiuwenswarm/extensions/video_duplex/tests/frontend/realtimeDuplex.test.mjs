@@ -6,6 +6,244 @@ import { runInNewContext } from 'node:vm';
 import { RealtimeDuplexSession } from '../../../../channels/web/frontend/node_modules/.cache/realtime-duplex/realtimeDuplex.mjs';
 import { SpeechGate } from '../../../../channels/web/frontend/node_modules/.cache/realtime-duplex/speechGate.mjs';
 
+function mockStartup() {
+  const names = ['window', 'WebSocket', 'Worker', 'AudioContext', 'AudioWorkletNode', 'navigator'];
+  const descriptors = names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+  let socket;
+  let microphoneRequests = 0;
+  let releaseCapture;
+  let captureResuming;
+  let socketCreated;
+  const connected = new Promise((resolve) => {
+    socketCreated = resolve;
+  });
+  const capturing = new Promise((resolve) => {
+    captureResuming = resolve;
+  });
+  const captureResume = new Promise((resolve) => {
+    releaseCapture = resolve;
+  });
+  class StartupSocket {
+    static OPEN = 1;
+    readyState = 0;
+    sent = [];
+    constructor() {
+      socket = this;
+      socketCreated();
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+    close() {
+      this.readyState = 3;
+    }
+  }
+  class FakeContext {
+    constructor({ sampleRate }) {
+      this.sampleRate = sampleRate;
+      this.audioWorklet = { addModule: async () => {} };
+    }
+    createMediaStreamSource() {
+      return { connect() {} };
+    }
+    createGain() {
+      return { gain: { value: 1 }, connect() {} };
+    }
+    resume() {
+      if (this.sampleRate === 16000) {
+        captureResuming();
+        return captureResume;
+      }
+      return Promise.resolve();
+    }
+    close() {
+      return Promise.resolve();
+    }
+  }
+  globalThis.window = globalThis;
+  globalThis.WebSocket = StartupSocket;
+  globalThis.Worker = class {
+    postMessage(data) {
+      queueMicrotask(() =>
+        this.onmessage?.({
+          data:
+            data.type === 'init'
+              ? { type: 'ready' }
+              : { type: 'detections', detections: [], capturedAt: data.capturedAt, generation: data.generation },
+        }),
+      );
+    }
+    terminate() {}
+  };
+  globalThis.AudioContext = FakeContext;
+  globalThis.AudioWorkletNode = class {
+    port = { postMessage() {} };
+    connect(target) {
+      return target;
+    }
+    disconnect() {}
+  };
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      mediaDevices: {
+        async getUserMedia() {
+          microphoneRequests++;
+          return { getTracks: () => [{ stop() {} }] };
+        },
+      },
+    },
+  });
+  const states = [];
+  const session = new RealtimeDuplexSession(
+    { url: 'ws://example.test/realtime' },
+    {
+      getVideoFrame: () => null,
+      onAssistantText() {},
+      onUserText() {},
+      onState: (state) => states.push(state),
+      onError() {},
+    },
+  );
+  return {
+    session,
+    states,
+    connected,
+    capturing,
+    releaseCapture,
+    get socket() {
+      return socket;
+    },
+    get microphoneRequests() {
+      return microphoneRequests;
+    },
+    restore() {
+      for (const [name, descriptor] of descriptors) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else delete globalThis[name];
+      }
+    },
+  };
+}
+
+for (const event of ['session.created', 'session.updated']) {
+  test('microphone capture waits for provider readiness: ' + event, async () => {
+    const mock = mockStartup();
+    const starting = mock.session.start();
+    try {
+      await mock.connected;
+      assert.equal(mock.microphoneRequests, 0);
+      mock.socket.readyState = 1;
+      mock.socket.onopen();
+      await Promise.resolve();
+      assert.equal(mock.microphoneRequests, 0, 'socket open alone must not request the microphone');
+      assert.deepEqual(mock.states, ['connecting']);
+      mock.socket.onmessage({ data: JSON.stringify({ type: event }) });
+      await Promise.race([mock.capturing, starting]);
+      assert.equal(mock.microphoneRequests, 1);
+      assert.deepEqual(mock.states, ['connecting'], 'provider readiness alone must not announce listening');
+      mock.releaseCapture();
+      await starting;
+      assert.deepEqual(mock.states, ['connecting', 'listening']);
+      mock.session.captureNode.port.onmessage({ data: new Int16Array(1600).fill(123).buffer });
+      mock.session.flush();
+      const audio = mock.socket.sent.find((item) => item.type === 'input_audio_buffer.append');
+      assert.equal(Buffer.from(audio.audio, 'base64').readInt16LE(0), 123);
+    } finally {
+      mock.releaseCapture();
+      mock.session.stop();
+      await starting.catch(() => {});
+      mock.restore();
+    }
+  });
+}
+
+test('stopping during connection cancels startup without requesting the microphone', async () => {
+  const mock = mockStartup();
+  const starting = mock.session.start();
+  try {
+    await mock.connected;
+    mock.socket.readyState = 1;
+    mock.socket.onopen();
+    const stopped = assert.rejects(starting, /连接已停止/);
+    mock.session.stop();
+    await stopped;
+    mock.socket.onmessage({ data: JSON.stringify({ type: 'session.created' }) });
+    assert.equal(mock.microphoneRequests, 0);
+    assert.deepEqual(mock.states, ['connecting', 'closed']);
+  } finally {
+    mock.session.stop();
+    mock.restore();
+  }
+});
+
+test('provider startup failure does not request the microphone', async () => {
+  const mock = mockStartup();
+  const starting = mock.session.start();
+  try {
+    await mock.connected;
+    mock.socket.readyState = 1;
+    mock.socket.onopen();
+    const failed = assert.rejects(starting, /access denied/);
+    mock.socket.onmessage({ data: JSON.stringify({ type: 'error', error: { message: 'access denied' } }) });
+    await failed;
+    assert.equal(mock.microphoneRequests, 0);
+    assert.deepEqual(mock.states, ['connecting']);
+  } finally {
+    mock.session.stop();
+    mock.restore();
+  }
+});
+
+test('provider readiness timeout remains armed after the socket opens', async () => {
+  const mock = mockStartup();
+  const timers = new Map();
+  let timerId = 0;
+  globalThis.window = {
+    setTimeout(callback, delay) {
+      const id = ++timerId;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  const starting = mock.session.start();
+  try {
+    await mock.connected;
+    mock.socket.readyState = 1;
+    mock.socket.onopen();
+    const timer = [...timers.values()].find((item) => item.delay === 30000);
+    assert.ok(timer);
+    const failed = assert.rejects(starting, /初始化超时/);
+    timer.callback();
+    await failed;
+    assert.equal(mock.microphoneRequests, 0);
+    assert.equal(timers.size, 0);
+  } finally {
+    mock.session.stop();
+    mock.restore();
+  }
+});
+
+test('live audio remains bounded and an unready socket does not consume queued PCM', () => {
+  const { session, sent } = createSession();
+  for (let i = 1; i <= 30; i++) session.queueAudio(new Int16Array(1600).fill(i));
+  assert.equal(session.pendingSamples, 32000);
+  assert.equal(session.pending[0][0], 11);
+  session.sessionReady = false;
+  session.flush();
+  assert.equal(session.pendingSamples, 32000);
+  session.sessionReady = true;
+  session.socket.readyState = 3;
+  session.flush();
+  assert.equal(session.pendingSamples, 32000);
+  session.socket = null;
+  session.flush();
+  assert.deepEqual(sent, []);
+});
+
 test('accepted delegation returns its ID before completion and never sends two outputs for one call', () => {
   const {session,sent}=createSession();
   session.enqueueOperationResult('create-a',{state:'accepted',job_id:'a'});
@@ -782,6 +1020,7 @@ test('session update includes Gateway-provided tools', async () => {
 
   const opening = session.openSocket();
   socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: 'session.created' }) });
   await opening;
 
   assert.deepEqual(socket.sent[0].session.tools, tools);
@@ -873,10 +1112,11 @@ test('upstream startup error is not overwritten by the relay normal close', asyn
   );
   const opening = session.openSocket();
   socket.onopen();
-  await opening;
+  const failed = assert.rejects(opening, /403/);
   socket.onmessage({ data: JSON.stringify({
     type: 'error', error: { code: 'qwen_gateway_upstream_error', message: 'HTTP 403: Workspace endpoint access denied.' },
   }) });
+  await failed;
   socket.onclose({ code: 1000, reason: '' });
   assert.equal(errors.length, 1);
   assert.match(errors[0], /403/);
@@ -913,6 +1153,7 @@ test('remote disconnect releases media resources and pending receipts without lo
   );
   const opening = session.openSocket();
   socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: 'session.created' }) });
   await opening;
   session.sessionReady = true;
   session.assistantTranscript = '已经收到的回答';
@@ -1000,6 +1241,7 @@ async function createConnectedSocketSession() {
   });
   const opening = session.openSocket();
   socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: 'session.created' }) });
   await opening;
   session.sessionReady = true;
   return { session, socket, errors };

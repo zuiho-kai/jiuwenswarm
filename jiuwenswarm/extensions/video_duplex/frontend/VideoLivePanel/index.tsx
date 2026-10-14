@@ -897,12 +897,12 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
                 searchSessionRef.current = '';
                 setIsRealtimeStarting(false);
               }
-              setIsRecording(state !== 'closed');
+              setIsRecording(state === 'listening' || state === 'speaking');
               setRealtimeStatus(
                 state === 'connecting'
                   ? t('videoLive.status.connecting')
                   : state === 'listening'
-                    ? ''
+                    ? t('videoLive.status.listening')
                     : state === 'speaking'
                       ? t('videoLive.status.speaking')
                       : '',
@@ -1307,7 +1307,11 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
           </div>
 
           {error && <div className="video-live__error" data-testid="video-live-error-message" role="alert">{describeDuplexError(error)}</div>}
-          {realtimeStatus && <div className="video-live__realtime-status">{realtimeStatus}</div>}
+          {realtimeStatus && (
+            <div className="video-live__realtime-status" data-testid="video-live-realtime-status" role="status">
+              {realtimeStatus}
+            </div>
+          )}
           {visibleSearchProgress && (
             <div className={`video-live__search-progress is-${visibleSearchProgress.status}`}>
               <div className="video-live__search-progress-head">

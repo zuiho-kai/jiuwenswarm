@@ -67,10 +67,10 @@
   "videoLive": {
     "modelFallback": "Video model",
     "subtitle": "Real-time multi-screen audio and video Q&A",
-    "status": { "connecting": "Connecting to the Full-duplex model and requesting microphone access…", "speaking": "The model is responding…" },
+    "status": { "connecting": "Preparing Full-duplex… The microphone is not recording yet. Please wait until it is ready.", "listening": "Ready — speak now", "speaking": "The model is responding…" },
     "coreAgent": { "startFailed": "Jiuwen Core Agent could not start the task: {{message}}", "startFailedSummary": "The task could not start. The error is shown in the interface." },
     "errors": { "startFailed": "Failed to start the Full-duplex session.", "joyaiTextNotAccepted": "The text input was not accepted by the JoyAI session.", "qwenTextNotAccepted": "The text input was not accepted by the Qwen Realtime session.", "textSendFailed": "Failed to send the text input." },
-    "empty": { "title": "Open a real-time view", "description": "Use a camera, local video, or add multiple screens", "listening": "Listening continuously", "waiting": "Waiting to start Full-duplex", "hint": "Speak after starting; no need to click for each sentence" },
+    "empty": { "title": "Open a real-time view", "description": "Use a camera, local video, or add multiple screens", "listening": "Listening continuously", "waiting": "Waiting to start Full-duplex", "hint": "Wait for Ready before speaking; no need to click for each sentence" },
     "sources": { "camera": "Camera", "localVideo": "Local video", "addScreen": "Add screen", "shareScreen": "Share screen", "stopCamera": "Stop camera", "stopScreens": "Stop all screens" },
     "actions": { "closeVideo": "Close video", "starting": "Starting Full-duplex session", "stopSession": "End Full-duplex session", "startSession": "Start Full-duplex session" },
     "frameWindow": "Rolling window: {{count}}/{{max}} frames",
@@ -923,7 +923,9 @@
     "placeholderAgentGroupDeleted": "This Expert Team has been deleted",
     "stop": "Stop",
     "taskFullDuplexStart": "Share the entire screen and start a Full-duplex conversation",
-    "taskFullDuplexStarting": "Starting Full-duplex conversation",
+    "taskFullDuplexStarting": "Preparing Full-duplex. The microphone is not recording yet; please wait.",
+    "taskFullDuplexConnecting": "Connecting… wait to speak",
+    "taskFullDuplexListening": "Ready — speak now",
     "taskFullDuplexStop": "Stop Full-duplex conversation and screen sharing",
     "modelSelector": {
       "tooltip": "Switch the model used for chat",

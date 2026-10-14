@@ -67,10 +67,10 @@
   "videoLive": {
     "modelFallback": "视频模型",
     "subtitle": "实时多屏音视频问答",
-    "status": { "connecting": "正在连接 Full-duplex 模型并申请麦克风权限…", "speaking": "模型正在回答…" },
+    "status": { "connecting": "正在准备 Full-duplex… 麦克风尚未录音，请等待就绪后再说话。", "listening": "已就绪，可以说话", "speaking": "模型正在回答…" },
     "coreAgent": { "startFailed": "Jiuwen Core Agent 未能启动任务：{{message}}", "startFailedSummary": "任务未能启动，错误信息已经显示在界面中。" },
     "errors": { "startFailed": "Full-duplex 会话启动失败。", "joyaiTextNotAccepted": "文字输入未进入 JoyAI 会话", "qwenTextNotAccepted": "文字输入未进入千问 Realtime 会话", "textSendFailed": "文字输入发送失败" },
-    "empty": { "title": "打开一个实时画面", "description": "使用摄像头、本地视频，或添加多个屏幕", "listening": "正在持续听取", "waiting": "等待开启 Full-duplex", "hint": "开启后直接说话，无需逐句点击" },
+    "empty": { "title": "打开一个实时画面", "description": "使用摄像头、本地视频，或添加多个屏幕", "listening": "正在持续听取", "waiting": "等待开启 Full-duplex", "hint": "等待就绪后再说话，无需逐句点击" },
     "sources": { "camera": "摄像头", "localVideo": "本地视频", "addScreen": "添加屏幕", "shareScreen": "共享屏幕", "stopCamera": "停止摄像头", "stopScreens": "停止全部屏幕" },
     "actions": { "closeVideo": "关闭视频", "starting": "正在启动 Full-duplex 会话", "stopSession": "结束 Full-duplex 会话", "startSession": "开启 Full-duplex 会话" },
     "frameWindow": "滚动窗口：{{count}}/{{max}} 帧",
@@ -914,7 +914,9 @@
     "placeholderAgentGroupDeleted": "专家团已删除，无法继续对话",
     "stop": "停止",
     "taskFullDuplexStart": "共享整个屏幕并开始全双工对话",
-    "taskFullDuplexStarting": "正在启动全双工对话",
+    "taskFullDuplexStarting": "正在准备全双工，麦克风尚未录音，请稍候。",
+    "taskFullDuplexConnecting": "连接中，请稍候再说话",
+    "taskFullDuplexListening": "已就绪，可以说话",
     "taskFullDuplexStop": "停止全双工对话和屏幕共享",
     "modelSelector": {
       "tooltip": "切换对话使用的模型",

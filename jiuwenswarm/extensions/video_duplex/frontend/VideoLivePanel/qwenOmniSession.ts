@@ -123,6 +123,7 @@ export class RealtimeDuplexSession {
   private pendingSamples = 0;
   private sendTimer: number | null = null;
   private sessionReady = false;
+  private rejectSocketStartup: ((reason: Error) => void) | null = null;
   private responseId: string | null = null;
   private pendingOperations: Array<{ callId: string; output: unknown }> = [];
   private pendingQuestions: Array<{ jobId: string; interaction: unknown }> = [];
@@ -176,6 +177,9 @@ export class RealtimeDuplexSession {
   async start(): Promise<void> {
     const lifecycle = ++this.lifecycle;
     this.callbacks.onState('connecting');
+    this.emitDiagnostic('realtime_websocket_connecting', { url: this.config.url });
+    await this.openSocket();
+    if (lifecycle !== this.lifecycle) return;
     this.emitDiagnostic('qwen_vad_loading', { model: 'silero-v5' });
     const { SileroVad } = await import('../../../../channels/web/frontend/src/utils/speechDetection/sileroVad');
     if (lifecycle !== this.lifecycle) return;
@@ -249,13 +253,9 @@ export class RealtimeDuplexSession {
     const source = this.captureContext.createMediaStreamSource(this.microphone);
     this.captureNode = new AudioWorkletNode(this.captureContext, 'jiuwen-duplex-capture');
     this.captureNode.port.onmessage = ({ data }) => {
+      if (lifecycle !== this.lifecycle) return;
       const pcm = resample(new Int16Array(data), this.captureContext?.sampleRate || INPUT_RATE, INPUT_RATE);
-      this.pending.push(pcm);
-      this.pendingSamples += pcm.length;
-      const maxPending = INPUT_RATE * 2;
-      while (this.pendingSamples > maxPending && this.pending.length > 1) {
-        this.pendingSamples -= this.pending.shift()?.length || 0;
-      }
+      this.queueAudio(pcm);
       this.vad?.push(pcm);
     };
     const silent = this.captureContext.createGain();
@@ -265,16 +265,13 @@ export class RealtimeDuplexSession {
     await this.captureContext.resume();
     if (lifecycle !== this.lifecycle) return;
 
-    this.emitDiagnostic('realtime_websocket_connecting', {
-      url: this.config.url,
-    });
-    await this.openSocket();
-    if (lifecycle !== this.lifecycle) return;
     this.sendTimer = window.setInterval(() => this.flush(), SEND_INTERVAL_MS);
+    this.callbacks.onState('listening');
   }
 
   stop(): void {
     this.lifecycle += 1;
+    this.rejectSocketStartup?.(new Error('Realtime 会话连接已停止'));
     this.vad?.stop();
     this.vad = null;
     if (this.sendTimer !== null) window.clearInterval(this.sendTimer);
@@ -431,26 +428,30 @@ export class RealtimeDuplexSession {
       this.socket = socket;
       let initSent = false;
       let settled = false;
+      let startupResolved = false;
       let reportedStartupError = false;
       let lastServiceError = '';
       const initTimeout = window.setTimeout(() => {
         if (settled) return;
-        settled = true;
+        rejectOnce(new Error('Realtime 会话初始化超时，远端未返回 session.created'));
         socket.close(1000, 'session init timeout');
-        reject(new Error('Realtime 会话初始化超时，远端未返回 session.created'));
       }, 30_000);
       const resolveOnce = () => {
         if (settled) return;
         settled = true;
+        startupResolved = true;
         window.clearTimeout(initTimeout);
+        this.rejectSocketStartup = null;
         resolve();
       };
       const rejectOnce = (error: Error) => {
         if (settled) return;
         settled = true;
         window.clearTimeout(initTimeout);
+        this.rejectSocketStartup = null;
         reject(error);
       };
+      this.rejectSocketStartup = rejectOnce;
       const sendInit = async () => {
         if (initSent) return;
         initSent = true;
@@ -467,9 +468,7 @@ export class RealtimeDuplexSession {
       socket.onopen = () => {
         this.emitDiagnostic('realtime_websocket_open', { url: url.toString() });
         void sendInit();
-        // Match the official client: microphone upload begins as soon as the
-        // native duplex socket is open instead of waiting for session.created.
-        resolveOnce();
+        // Socket transport readiness alone does not mean Qwen can receive microphone audio.
       };
       socket.onmessage = ({ data }) => {
         if (this.socket !== socket) return;
@@ -491,7 +490,7 @@ export class RealtimeDuplexSession {
           if (type === 'session.closed') {
             if (!this.sessionReady) reportedStartupError = true;
             const closeReason = readableError(event.error || event.reason || lastServiceError || '远端已结束会话，未提供具体原因');
-            const startupAlreadyResolved = settled;
+            const startupAlreadyResolved = startupResolved;
             this.emitDiagnostic('realtime_websocket_error', {
               url: url.toString(),
               message: closeReason,
@@ -515,6 +514,7 @@ export class RealtimeDuplexSession {
             rejectOnce(new Error(readableError(event.error || event)));
           }
           this.handleEvent(event, data);
+          if (this.sessionReady) resolveOnce();
         } catch {
           this.callbacks.onError('Realtime 返回了无效事件');
         }
@@ -525,7 +525,7 @@ export class RealtimeDuplexSession {
           url: url.toString(),
         });
         const message = lastServiceError || 'Realtime 网络连接异常，浏览器未提供具体原因，请检查网络或模型服务。';
-        const startupAlreadyResolved = settled;
+        const startupAlreadyResolved = startupResolved;
         rejectOnce(new Error(message));
         if (startupAlreadyResolved) this.callbacks.onError(message);
       };
@@ -538,7 +538,7 @@ export class RealtimeDuplexSession {
         });
         if (!this.sessionReady && !reportedStartupError) {
           const closeReason = lastServiceError || reason || (code === 1000 ? '远端在初始化阶段主动关闭' : `关闭代码 ${code}`);
-          const startupAlreadyResolved = settled;
+          const startupAlreadyResolved = startupResolved;
           rejectOnce(new Error(`Realtime 会话初始化失败：${closeReason}`));
           if (startupAlreadyResolved) this.callbacks.onError(`Realtime 会话初始化失败：${closeReason}`);
         } else if (this.sessionReady) {
@@ -554,8 +554,17 @@ export class RealtimeDuplexSession {
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(event));
   }
 
+  private queueAudio(pcm: Int16Array): void {
+    this.pending.push(pcm);
+    this.pendingSamples += pcm.length;
+    const maxPending = INPUT_RATE * 2;
+    while (this.pendingSamples > maxPending && this.pending.length > 1) {
+      this.pendingSamples -= this.pending.shift()?.length || 0;
+    }
+  }
+
   private flush(): void {
-    if (this.pendingSamples === 0) return;
+    if (this.pendingSamples === 0 || this.socket?.readyState !== WebSocket.OPEN || !this.sessionReady) return;
     const outgoing = new Int16Array(this.pendingSamples);
     let written = 0;
     while (written < outgoing.length && this.pending.length > 0) {
@@ -761,8 +770,6 @@ export class RealtimeDuplexSession {
         arguments: typeof event.arguments === 'string' ? event.arguments.slice(0, 2_000) : event.arguments,
       });
       this.callbacks.onError('千问返回了无效的工具调用');
-    } else if (type === 'session.created') {
-      this.callbacks.onState('listening');
     } else if (type === 'response.created') {
       this.awaitingProviderResponse = false;
       // Some providers start the tool-call response before ending its spoken acknowledgement.
