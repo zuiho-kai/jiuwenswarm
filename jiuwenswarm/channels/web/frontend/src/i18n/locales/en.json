@@ -10,10 +10,11 @@
     "leader": "Leader",
     "record": {
       "ready": "Record message",
-      "recording": "Finish recording",
+      "recording": "Finish recording (or pause to transcribe)",
       "transcribing": "Transcribing…"
     },
     "errors": {
+      "vadUnavailable": "Automatic speech-end detection is unavailable. Use Finish recording to transcribe your message.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
       "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
       "microphoneEnded": "The microphone was disconnected.",

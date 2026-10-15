@@ -97,6 +97,13 @@ export class SileroVad {
     this.dispatch();
   }
 
+  /** Begin a new capture without carrying over speech or in-flight results from the last one. */
+  reset(): void {
+    this.queue = [];
+    this.generation += 1;
+    this.resetPending = true;
+  }
+
   stop(): void {
     this.enabled = false;
     if (this.restartTimer !== null) window.clearTimeout(this.restartTimer);

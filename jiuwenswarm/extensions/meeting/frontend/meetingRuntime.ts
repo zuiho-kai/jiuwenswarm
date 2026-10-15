@@ -1,3 +1,6 @@
+import type { SpeechDetection } from '../../../channels/web/frontend/src/utils/speechDetection/speechGate';
+import { MeetingVad, type MeetingSpeechMonitor, type MeetingSpeechMonitorFactory } from './meetingVad';
+
 export type MeetingMember = { member_name: string; display_name: string };
 export type MeetingContext = { leader: string; members: MeetingMember[] };
 type Payload = Record<string, unknown>;
@@ -64,6 +67,9 @@ export class MeetingSession {
   private seen = new Set<string>();
   private recent = new Map<string, { source: string; time: number }>();
   private transcribing = false;
+  private finishingRecording = false;
+  private speechDetected = false;
+  private vad: MeetingSpeechMonitor | null = null;
   private pendingSpeech = 0;
 
   constructor(
@@ -77,6 +83,7 @@ export class MeetingSession {
       recording: (state: RecordingState) => void;
       ended: () => void;
     },
+    private readonly createVad: MeetingSpeechMonitorFactory = (...args) => new MeetingVad(...args),
   ) {}
 
   async start(): Promise<void> {
@@ -117,10 +124,39 @@ export class MeetingSession {
         }),
       );
     }
+    try {
+      this.vad = this.createVad(
+        media,
+        (detection) => this.detectSpeech(detection),
+        () => this.disableVad(),
+      );
+      await this.vad.start();
+    } catch {
+      if (!this.disposed) this.disableVad();
+    }
+  }
+
+  private disableVad(): void {
+    this.vad?.stop();
+    this.vad = null;
+    if (this.active) this.callbacks.error('vadUnavailable');
+  }
+
+  private detectSpeech(detection: SpeechDetection): void {
+    if (!this.active || this.recorder?.state !== 'recording' || this.finishingRecording) return;
+    if (detection.state === 'started') this.speechDetected = true;
+    if (detection.state === 'ended' && this.speechDetected) this.stopRecording();
   }
 
   startRecording(): void {
-    if (!this.active || !this.media || this.transcribing || this.recorder?.state === 'recording') return;
+    if (
+      !this.active ||
+      !this.media ||
+      this.transcribing ||
+      this.finishingRecording ||
+      this.recorder?.state === 'recording'
+    )
+      return;
     // Recording is an explicit request to take the floor. Automatic speech
     // interruption will be supplied by the later meeting backend.
     this.stopPlayback();
@@ -128,6 +164,8 @@ export class MeetingSession {
       MediaRecorder.isTypeSupported(mime),
     );
     try {
+      this.vad?.reset();
+      this.speechDetected = false;
       const recorder = new MediaRecorder(this.media, mimeType ? { mimeType } : undefined);
       this.recorder = recorder;
       const parts: Blob[] = [];
@@ -149,6 +187,7 @@ export class MeetingSession {
       };
       recorder.onstop = () => {
         this.clearRecordingTimer();
+        this.finishingRecording = false;
         if (!this.active || rejected) {
           if (this.active) this.callbacks.recording('ready');
           return;
@@ -161,7 +200,11 @@ export class MeetingSession {
       };
       recorder.start(250);
       this.callbacks.recording('recording');
-      this.recordingTimer = setTimeout(() => this.stopRecording(), 30000);
+      this.recordingTimer = setTimeout(() => {
+        // Do not send a full recording of silence/noise to ASR. Manual finish remains available.
+        if (this.vad && !this.speechDetected) rejected = true;
+        this.stopRecording();
+      }, 30000);
     } catch {
       this.callbacks.error('recordingFailed');
     }
@@ -169,7 +212,10 @@ export class MeetingSession {
 
   stopRecording(): void {
     this.clearRecordingTimer();
-    if (this.recorder?.state === 'recording') this.recorder.stop();
+    if (this.recorder?.state === 'recording') {
+      this.finishingRecording = true;
+      this.recorder.stop();
+    }
   }
 
   private clearRecordingTimer(): void {
@@ -297,6 +343,8 @@ export class MeetingSession {
     this.disposed = true;
     this.active = false;
     this.stopPlayback();
+    this.vad?.stop();
+    this.vad = null;
     this.clearRecordingTimer();
     this.off.splice(0).forEach((off) => off());
     if (this.recorder) {

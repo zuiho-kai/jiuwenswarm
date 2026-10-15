@@ -21,11 +21,13 @@ await require('esbuild').build({
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', packages: 'external',
   outfile: output, loader: { '.css': 'empty' },
   plugins: [{ name: 'meeting-action-test-host', setup(build) {
+    build.onResolve({filter:/\/meetingVad$/},()=>({path:'vad',namespace:'meeting-test'}));
     build.onResolve({filter:/react-i18next$/},()=>({path:'i18n',namespace:'meeting-test'}));
     build.onResolve({filter:/stores\/sessionStore$/},()=>({path:'sessions',namespace:'meeting-test'}));
     build.onResolve({filter:/services\/webClient$|^meeting-test-transport$/},()=>({path:'transport',namespace:'meeting-test'}));
     build.onResolve({filter:/Toast\/toastStore$/},()=>({path:'toast',namespace:'meeting-test'}));
     build.onLoad({filter:/.*/,namespace:'meeting-test'},({path})=>({loader:'js',contents: {
+      vad: `export class MeetingVad {async start(){}reset(){}stop(){}}`,
       i18n: `export const useTranslation=()=>({t:key=>key,i18n:{language:'en'}});`,
       sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
       transport: `export const requests=[];export const webClient={getState:()=> 'ready',on:()=>()=>{},onStateChange:()=>()=>{},request:async(name,params)=>{requests.push({name,params});return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:{};}};`,

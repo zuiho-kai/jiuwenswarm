@@ -10,10 +10,11 @@
     "leader": "主持人",
     "record": {
       "ready": "录制消息",
-      "recording": "完成录音",
+      "recording": "结束录音（停顿后自动转写）",
       "transcribing": "正在转写…"
     },
     "errors": {
+      "vadUnavailable": "自动语音结束检测不可用，请点击结束录音来转写消息。",
       "unsupported": "语音录制需要支持的浏览器和安全连接。",
       "microphoneFailed": "无法访问麦克风，请检查浏览器权限后重试。",
       "microphoneEnded": "麦克风已断开。",
