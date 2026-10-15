@@ -1,4 +1,32 @@
 {
+  "meeting": {
+    "task": {
+      "start": "开始团队会议",
+      "starting": "取消启动会议",
+      "stop": "结束团队会议"
+    },
+    "title": "团队会议",
+    "stopPlayback": "停止语音",
+    "leader": "主持人",
+    "record": {
+      "ready": "录制消息",
+      "recording": "完成录音",
+      "transcribing": "正在转写…"
+    },
+    "errors": {
+      "unsupported": "语音录制需要支持的浏览器和安全连接。",
+      "microphoneFailed": "无法访问麦克风，请检查浏览器权限后重试。",
+      "microphoneEnded": "麦克风已断开。",
+      "disconnected": "连接已断开，请在重连后重新开始会议。",
+      "recordingTooLarge": "录音过大，请录制更短的消息。",
+      "recordingFailed": "无法录制音频，请重试。",
+      "transcriptionFailed": "无法转写录音，请重试。",
+      "emptyTranscript": "未检测到清晰语音，请重新录制。",
+      "deliveryFailed": "消息投递失败，请重试。",
+      "playbackFailed": "无法播放智能体回复，完整文字仍然可用。",
+      "playbackOverloaded": "待播放语音过多，请在会议记录中阅读完整回复。"
+    }
+  },
   "common": {
     "searchName": "搜索名称",
     "noData": "暂无数据",
@@ -506,6 +534,10 @@
       "deleteConfirm": "删除后将清除已保存的全双工模型地址、模型和密钥。"
     },
     "fields": {
+      "team_meeting_enabled": {
+        "title": "团队会议",
+        "description": "在团队任务会话中显示会议控件，录音转写到消息输入框，并使用已配置的默认音色播放回复。"
+      },
       "preferred_language": {
         "title": "Language",
         "description": "设置应用程序界面的显示语言。"

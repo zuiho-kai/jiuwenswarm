@@ -1,0 +1,22 @@
+.task-meeting-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.task-meeting-action.is-active {
+  color: var(--color-text-link);
+  background: var(--color-surface-highlight);
+}
+.task-meeting-spinner {
+  animation: task-meeting-spin 1s linear infinite;
+}
+@keyframes task-meeting-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-meeting-spinner {
+    animation: none;
+  }
+}

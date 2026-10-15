@@ -1066,6 +1066,15 @@ def update_task_full_duplex_in_config(enabled: bool) -> None:
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
+def update_team_meeting_in_config(enabled: bool) -> None:
+    """Persist the Team meeting control switch in Experimental settings."""
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    if "experimental" not in data or data["experimental"] is None:
+        data["experimental"] = {}
+    data["experimental"]["team_meeting_enabled"] = bool(enabled)
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
 def update_task_asr_in_config(enabled: bool) -> None:
     """Update the task-chat speech transcription switch in config.yaml."""
     data = load_yaml_round_trip(CONFIG_YAML_PATH)

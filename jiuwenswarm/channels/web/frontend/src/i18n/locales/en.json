@@ -1,4 +1,32 @@
 {
+  "meeting": {
+    "task": {
+      "start": "Start Team meeting",
+      "starting": "Cancel meeting startup",
+      "stop": "End Team meeting"
+    },
+    "title": "Team meetings",
+    "stopPlayback": "Stop audio",
+    "leader": "Leader",
+    "record": {
+      "ready": "Record message",
+      "recording": "Finish recording",
+      "transcribing": "Transcribing…"
+    },
+    "errors": {
+      "unsupported": "Voice recording requires a supported browser and a secure connection.",
+      "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
+      "microphoneEnded": "The microphone was disconnected.",
+      "disconnected": "Connection lost. Start a new meeting after reconnecting.",
+      "recordingTooLarge": "The recording is too large. Please record a shorter message.",
+      "recordingFailed": "Could not record audio. Please try again.",
+      "transcriptionFailed": "Could not transcribe the recording. Please try again.",
+      "emptyTranscript": "No clear speech was detected. Please record again.",
+      "deliveryFailed": "Your message could not be delivered. Please try again.",
+      "playbackFailed": "Could not play the agent reply. The full text is still available.",
+      "playbackOverloaded": "Too much speech is queued. Read the full reply in the transcript."
+    }
+  },
   "common": {
     "searchName": "Search names",
     "noData": "No data",
@@ -513,6 +541,10 @@
       "deleteConfirm": "This clears the saved full-duplex endpoint, model, and API key."
     },
     "fields": {
+      "team_meeting_enabled": {
+        "title": "Team meetings",
+        "description": "Show meeting controls in Team task conversations. Record into the message editor and hear replies using the configured default voice."
+      },
       "preferred_language": {
         "title": "Language",
         "description": "Set the display language for the application interface."

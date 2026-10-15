@@ -989,6 +989,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const isPaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.isPaused ?? false);
   const queuePaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.queuePaused ?? false);
   const isLoadingHistory = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.isLoadingHistory ?? false);
+  const [applicationMicrophoneActive, setApplicationMicrophoneActive] = useState(false);
   const inputValue = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.inputValue ?? '');
   const evolutionStatus = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.evolutionStatus ?? null);
   const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
@@ -4796,11 +4797,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 {taskAsrEnabled && <button
                   type="button"
                   onClick={toggleRecording}
-                  disabled={composerDisabled || isTranscribing || !taskAsrSupported}
+                  disabled={composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive}
                   className={cx(
                     'chat-input-btn chat-input-btn--microphone',
                     isListening && 'chat-input-btn--recording',
-                    (composerDisabled || isTranscribing || !taskAsrSupported) && 'chat-input-btn--disabled',
+                    (composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive) && 'chat-input-btn--disabled',
                   )}
                   aria-label={isListening ? t('chat.stopRecording') : t('chat.startRecording')}
                   aria-pressed={isListening}
@@ -4830,6 +4831,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
                 <ApplicationPluginTaskInputActions
                   eligible={fullDuplexActionEligible && !isTeamMode}
+                  teamEligible={isTeamMode}
+                  onSelectTeamMode={
+                    activeSessionId === NEW_CONVERSATION_ID && isAgentMode
+                      ? () => useSessionStore.getState().setMode(NEW_CONVERSATION_ID, 'team')
+                      : undefined
+                  }
+                  disabled={composerDisabled || isLoadingHistory}
+                  onTranscript={appendTaskAsrTranscript}
+                  onMicrophoneActiveChange={setApplicationMicrophoneActive}
+                  microphoneBusy={isListening || isTranscribing}
                   sessionId={activeSessionId}
                   ensureSession={onEnsureSession}
                   labels={{

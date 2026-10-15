@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { setTeamOrganizationUiEnabled } from '../../teamOrganization/featureConfig';
 import { buildConfigSavePayload } from './settingsContract';
+import { setTeamMeetingEnabled } from '../../teamMeeting/featureFlag';
 import { useSettingsServices } from './SettingsServicesProvider';
 
 export function useSettingsConfig() {
@@ -22,6 +23,7 @@ export function useSettingsConfig() {
       if (id === requestId.current) {
         setConfig(next ?? {});
         setTeamOrganizationUiEnabled(next?.team_organization_ui_enabled);
+        setTeamMeetingEnabled(next?.team_meeting_enabled);
       }
     } catch (loadError) {
       if (id === requestId.current) setError(loadError instanceof Error ? loadError.message : String(loadError));
@@ -41,6 +43,7 @@ export function useSettingsConfig() {
       const result = await saveQueue.enqueue(operation, () =>
         request('config.save_all', payload, { timeoutMs: 600_000 }),
       );
+      if ('team_meeting_enabled' in payload.config) setTeamMeetingEnabled(payload.config.team_meeting_enabled);
       if ('team_organization_ui_enabled' in payload.config) {
         setTeamOrganizationUiEnabled(payload.config.team_organization_ui_enabled);
       }

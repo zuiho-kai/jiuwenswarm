@@ -32,6 +32,12 @@ export interface ApplicationPluginSettingsProps {
 export interface ApplicationPluginTaskInputActionProps {
   fallback: ReactNode;
   eligible: boolean;
+  teamEligible?: boolean;
+  onSelectTeamMode?: () => void;
+  onTranscript?: (text: string) => void;
+  onMicrophoneActiveChange?: (active: boolean) => void;
+  microphoneBusy?: boolean;
+  disabled?: boolean;
   sessionId: string | null;
   ensureSession: (initialTitle?: string) => Promise<string | null>;
   labels: {

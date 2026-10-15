@@ -28,6 +28,11 @@ export const experimentalModule: SettingsModuleDefinition = {
       items: [{ id: 'task-full-duplex-enabled', component: 'custom', render: TaskFullDuplexSetting }],
     },
     {
+      id: 'team-meeting',
+      titleKey: 'meeting.title',
+      items: [{ id: 'team-meeting-enabled', component: 'switch', key: 'team_meeting_enabled' }],
+    },
+    {
       id: 'external-cli-agents',
       titleKey: 'settingsPanel.experimental.externalCliAgents',
       items: [{ id: 'external-cli-agents', component: 'custom', render: ExternalCliSettingsItem }],
