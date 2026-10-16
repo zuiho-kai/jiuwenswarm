@@ -10,6 +10,8 @@ const results = {};
 const call = `Promise.race([navigator.mediaDevices.getDisplayMedia({video:{displaySurface:'monitor'},audio:false}).then(s=>{const t=s.getVideoTracks()[0];const st=t.getSettings();const r='GRANTED label='+t.label+' state='+t.readyState+' size='+st.width+'x'+st.height;s.getTracks().forEach(x=>x.stop());return r},e=>'REJECT '+e.name+': '+e.message), new Promise(r=>setTimeout(()=>r('HUNG 20s'),20000))])`;
 async function page(handler) {
   const w = new BrowserWindow({ show: true, width: 400, height: 300 });
+  w.webContents.on('did-fail-load', (_e, code, desc, url) => console.log('E2E_FAIL_LOAD', code, desc, url));
+  w.webContents.on('console-message', (_e, _l, msg) => console.log('E2E_CONSOLE', msg));
   if (handler) registerDisplayMediaHandler({ session: w.webContents.session, desktopCapturer, BrowserWindow, getParentWindow: () => w });
   await w.loadURL(baseUrl);
   return w;
@@ -29,6 +31,9 @@ function onPicker(action) {
     });
   });
 }
+app.disableHardwareAcceleration();
+app.on('render-process-gone', (_e, _w, d) => console.log('E2E_RENDER_GONE ' + JSON.stringify(d)));
+app.on('child-process-gone', (_e, d) => console.log('E2E_CHILD_GONE ' + JSON.stringify(d)));
 process.on('unhandledRejection', e => { console.log('E2E_ERROR ' + (e && e.stack || e)); app.exit(2); });
 app.whenReady().then(async () => {
   const server = http.createServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end('<p>x</p>'); });
