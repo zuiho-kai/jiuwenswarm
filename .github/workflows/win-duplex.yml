@@ -12,7 +12,10 @@ jobs:
         with: { node-version: '22' }
       - name: install electron
         working-directory: jiuwenswarm/channels/desktop/electron
-        run: npm ci --no-audit --no-fund
+        run: |
+          npm ci --no-audit --no-fund
+          if (-not (Test-Path node_modules\electron\dist\electron.exe)) { node node_modules\electron\install.js }
+        shell: pwsh
       - name: run e2e
         shell: pwsh
         run: |
