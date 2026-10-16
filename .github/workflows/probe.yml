@@ -1,0 +1,37 @@
+name: webview2-displaymedia
+on:
+  push:
+    branches: [ci/webview2-displaymedia]
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: install
+        run: pip install pywebview
+      - name: versions
+        shell: pwsh
+        run: |
+          python -c "import webview,importlib.metadata as m;print('pywebview', m.version('pywebview'))"
+          foreach ($k in 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}','HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}','HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}') { if (Test-Path $k) { "WebView2 runtime ($k): " + (Get-ItemProperty $k).pv } }
+          [System.Environment]::OSVersion.VersionString
+      - name: probes
+        shell: pwsh
+        run: |
+          $cases = [ordered]@{
+            'a_default' = '';
+            'b1_autoselect' = '--auto-select-desktop-capture-source="Entire screen"';
+            'b2_fakeui' = '--use-fake-ui-for-media-stream';
+            'b3_both' = '--use-fake-ui-for-media-stream --auto-select-desktop-capture-source="Entire screen"';
+            'b4_autoselect_screen1' = '--auto-select-desktop-capture-source="Screen 1"'
+          }
+          foreach ($c in $cases.Keys) {
+            if ($cases[$c]) { $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $cases[$c] } else { Remove-Item Env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -ErrorAction SilentlyContinue }
+            $p = Start-Process python -ArgumentList 'probe\probe.py',$c -NoNewWindow -PassThru -RedirectStandardOutput "out_$c.txt" -RedirectStandardError "err_$c.txt"
+            if (-not $p.WaitForExit(40000)) { "[$c] process hung >40s, killing"; $p | Stop-Process -Force }
+            Get-Content "out_$c.txt"; Get-Content "err_$c.txt" | Select-Object -Last 15
+            Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force
+          }

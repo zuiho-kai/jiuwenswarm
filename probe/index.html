@@ -1,0 +1,15 @@
+<!doctype html><html><body><h1>probe</h1><script>
+function out(o){ try{ window.pywebview.api.report(JSON.stringify(o)); }catch(e){ console.log(JSON.stringify(o)); } }
+async function run(){
+  const info={ua:navigator.userAgent, secure:window.isSecureContext, href:location.href,
+    hasMD:!!navigator.mediaDevices, hasGDM:!!(navigator.mediaDevices&&navigator.mediaDevices.getDisplayMedia)};
+  out({stage:'info', ...info});
+  try{
+    const s=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});
+    const t=s.getVideoTracks()[0];
+    out({stage:'result', ok:true, label:t&&t.label, settings:t&&t.getSettings()});
+    s.getTracks().forEach(x=>x.stop());
+  }catch(err){ out({stage:'result', ok:false, name:err&&err.name, message:err&&err.message, str:String(err)}); }
+}
+window.addEventListener('pywebviewready', run);
+</script></body></html>
