@@ -29,6 +29,29 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: e2e-out, path: e2e-out }
+  inspect-release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: install 0.2.8.beta1 release exe and list
+        shell: pwsh
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release download v0.2.8.beta1 -R openJiuwen-ai/jiuwenswarm -p '*windows.exe' -D rel
+          $exe = Get-ChildItem rel\*.exe | Select-Object -First 1
+          Start-Process $exe.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\ws' -Wait
+          Get-ChildItem C:\ws | Select Name, Length
+          Write-Host "electron main.cjs present: $(Test-Path C:\ws\resources\app\main.cjs)"
+          Write-Host "pywebview present: $((Get-ChildItem C:\ws -Recurse -Directory -Filter webview -ErrorAction SilentlyContinue | Select -First 1).FullName)"
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: probe WebView2 media permissions via pywebview (real mic absent; fake device, real permission UI)
+        shell: pwsh
+        run: |
+          pip install pywebview==6.2.1 pythonnet | Out-Null
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--use-fake-device-for-media-stream'
+          python ci\webview2_probe.py
   build-exe:
     runs-on: windows-latest
     timeout-minutes: 120
