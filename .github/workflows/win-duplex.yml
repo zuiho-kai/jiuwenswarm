@@ -49,9 +49,13 @@ jobs:
       - name: probe WebView2 media permissions via pywebview (real mic absent; fake device, real permission UI)
         shell: pwsh
         run: |
-          pip install pywebview==6.2.1 pythonnet | Out-Null
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--use-fake-device-for-media-stream'
+          pip install pywebview==6.2.1 pythonnet pillow | Out-Null
+          $f = python -c "import webview.platforms.edgechromium as m; print(m.__file__)"
+          (Get-Content $f) -replace "'--disable-features=ElasticOverscroll'", "'--disable-features=ElasticOverscroll --use-fake-device-for-media-stream'" | Set-Content $f
           python ci\webview2_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: probe-out, path: probe-out }
   build-exe:
     runs-on: windows-latest
     timeout-minutes: 120

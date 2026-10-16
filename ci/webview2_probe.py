@@ -1,6 +1,12 @@
 """Probe getUserMedia / getDisplayMedia inside pywebview (WebView2) like the pywebview desktop app."""
 import json, sys, threading, http.server, socketserver
-import webview
+import webview, time, os
+from PIL import ImageGrab
+
+def shots():
+    for i in range(6):
+        time.sleep(4)
+        ImageGrab.grab().save(os.path.join('probe-out', f'shot-{i}.png'))
 
 PAGE = b"""<!doctype html><meta charset=utf-8><body><p id=s>probe</p><script>
 async function run(){
@@ -29,4 +35,6 @@ class Api:
 
 win = webview.create_window('probe', f'http://127.0.0.1:{port}/', js_api=Api())
 threading.Timer(60, lambda: (print('PROBE_TIMEOUT', flush=True), win.destroy())).start()
+os.makedirs('probe-out', exist_ok=True)
+threading.Thread(target=shots, daemon=True).start()
 webview.start(gui='edgechromium')
