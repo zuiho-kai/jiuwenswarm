@@ -3,94 +3,47 @@ on:
   push:
     branches: [ci/win-duplex-check]
 jobs:
-  e2e:
+  frozen-duplex:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '22' }
-      - name: install electron
-        working-directory: jiuwenswarm/channels/desktop/electron
-        run: |
-          npm ci --no-audit --no-fund
-          if (-not (Test-Path node_modules\electron\dist\electron.exe)) { node node_modules\electron\install.js }
-        shell: pwsh
-      - name: run e2e
-        shell: pwsh
-        run: |
-          $env:PICKER = "$PWD\jiuwenswarm\channels\desktop\electron\display_media_picker.cjs"
-          $env:OUT_DIR = "$PWD\e2e-out"; New-Item -ItemType Directory -Force $env:OUT_DIR | Out-Null
-          Copy-Item ci\win_display_media_e2e.cjs $env:OUT_DIR\
-          $electron = "$PWD\jiuwenswarm\channels\desktop\electron\node_modules\electron\dist\electron.exe"
-          & $electron --version
-          & $electron "$env:OUT_DIR\win_display_media_e2e.cjs" 2>&1 | Tee-Object e2e-out\log.txt
-          if (-not (Select-String -Path e2e-out\log.txt -Pattern 'E2E_PASS' -Quiet)) { exit 1 }
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with: { name: e2e-out, path: e2e-out }
-  inspect-release:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: install 0.2.8.beta1 release exe and list
-        shell: pwsh
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          gh release download v0.2.8.beta1 -R openJiuwen-ai/jiuwenswarm -p '*windows.exe' -D rel
-          $exe = Get-ChildItem rel\*.exe | Select-Object -First 1
-          Start-Process $exe.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\ws' -Wait
-          Get-ChildItem C:\ws | Select Name, Length
-          Write-Host "electron main.cjs present: $(Test-Path C:\ws\resources\app\main.cjs)"
-          Write-Host "pywebview present: $((Get-ChildItem C:\ws -Recurse -Directory -Filter webview -ErrorAction SilentlyContinue | Select -First 1).FullName)"
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - name: probe WebView2 media permissions via pywebview (real mic absent; fake device, real permission UI)
-        shell: pwsh
-        run: |
-          pip install pywebview==6.2.1 pythonnet pillow | Out-Null
-          $f = python -c "import webview.platforms.edgechromium as m; print(m.__file__)"
-          (Get-Content $f) -replace "'--disable-features=ElasticOverscroll'", "'--disable-features=ElasticOverscroll --use-fake-device-for-media-stream'" | Set-Content $f
-          python ci\webview2_probe.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with: { name: probe-out, path: probe-out }
-  build-exe:
-    runs-on: windows-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '22' }
-      - uses: astral-sh/setup-uv@v5
-      - name: build electron exe
-        shell: pwsh
-        run: .\scripts\build-electron-exe.ps1 -NoSign -Test
-      - name: verify packaged picker and launch
-        shell: pwsh
-        run: |
-          $app = Get-ChildItem dist -Directory | Where-Object Name -like '*-Electron' | Select-Object -First 1
-          Write-Host "app dir: $($app.FullName)"
-          Get-ChildItem "$($app.FullName)\resources\app" -Filter *.cjs | Select Name
-          if (-not (Test-Path "$($app.FullName)\resources\app\display_media_picker.cjs")) { throw 'picker missing in package' }
-          $exe = Get-ChildItem $app.FullName -Filter *.exe | Select-Object -First 1
-          $log = "$PWD\launch-log.txt"
-          $p = Start-Process $exe.FullName -PassThru -RedirectStandardOutput $log -RedirectStandardError "$PWD\launch-err.txt"
-          Start-Sleep 120
-          $alive = -not $p.HasExited
-          Get-Content $log, "$PWD\launch-err.txt" -ErrorAction SilentlyContinue | Select-Object -Last 80
-          if (Select-String -Path $log, "$PWD\launch-err.txt" -Pattern 'Cannot find module|display_media_picker' -Quiet) { Write-Host 'MODULE PROBLEM'; Select-String -Path $log, "$PWD\launch-err.txt" -Pattern 'Cannot find module' }
-          Write-Host "alive after 120s: $alive"
-          Get-ChildItem dist -Recurse -Filter *.exe -Depth 1 | Select FullName, Length
-          if (-not $alive) { throw 'packaged app exited' }
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: actions/download-artifact@v4
         with:
           name: workswarm-electron-installer
-          path: |
-            dist/*.exe
-            launch-log.txt
-            launch-err.txt
-          if-no-files-found: warn
+          run-id: 38848465867
+          github-token: ${{ github.token }}
+          path: inst
+      - name: install and start frozen backend like the desktop shell
+        shell: pwsh
+        run: |
+          Get-ChildItem inst -Recurse -Filter *.exe | Select FullName, Length
+          $setup = Get-ChildItem inst -Recurse -Filter *.exe | Sort-Object Length -Descending | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\ws' -Wait
+          Start-Sleep 5
+          Get-Process | Where-Object { $_.Path -like 'C:\ws\*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          $be = Get-ChildItem C:\ws\resources\backend -Filter workswarm*.exe | Select-Object -First 1
+          Write-Host "backend: $($be.FullName)"
+          & $be.FullName init | Select-Object -Last 3
+          $cfg = "$env:USERPROFILE\.jiuwenswarm\config\config.yaml"
+          (Get-Content $cfg) -replace 'task_full_duplex_enabled: false','task_full_duplex_enabled: true' | Set-Content $cfg -Encoding utf8
+          Add-Content "$env:USERPROFILE\.jiuwenswarm\config\.env" "`nQWEN_OMNI_REALTIME_URL=`"wss://dashscope.aliyuncs.com/api-ws/v1/realtime`"`nQWEN_OMNI_API_KEY=`"sk-invalid-for-test`"`nQWEN_OMNI_MODEL_NAME=`"qwen3-omni-flash-realtime`"`n"
+          $env:JIUWENSWARM_DESKTOP='1'; $env:JIUWENSWARM_ELECTRON='1'; $env:JIUWENSWARM_RUNTIME_WORKSPACE_READY='1'
+          $env:WEB_HOST='127.0.0.1'; $env:WEB_PORT='29000'; $env:GATEWAY_PORT='29001'; $env:AGENT_SERVER_PORT='28092'; $env:AGENT_PORT='28092'; $env:FRONTEND_PORT='25173'
+          New-Item -ItemType Directory -Force frozen-out | Out-Null
+          Start-Process $be.FullName -ArgumentList '--desktop-run-agent' -RedirectStandardOutput frozen-out\agent.log -RedirectStandardError frozen-out\agent.err
+          Start-Process $be.FullName -ArgumentList '--desktop-run-gateway' -RedirectStandardOutput frozen-out\gateway.log -RedirectStandardError frozen-out\gateway.err
+          Start-Process $be.FullName -ArgumentList '--desktop-run-web','--host','127.0.0.1','--port','25173','--proxy-target','http://127.0.0.1:29000' -RedirectStandardOutput frozen-out\web.log -RedirectStandardError frozen-out\web.err
+          for ($i=0; $i -lt 60; $i++) { try { Invoke-WebRequest http://127.0.0.1:25173/ -UseBasicParsing -TimeoutSec 3 | Out-Null; break } catch { Start-Sleep 3 } }
+          Start-Sleep 20
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: click full-duplex in Chrome (fake mic)
+        shell: pwsh
+        run: |
+          pip install playwright | Out-Null
+          python ci\drive_win.py http://127.0.0.1:25173/
+          Select-String -Path "$env:USERPROFILE\.jiuwenswarm\agent\.logs\*.log", frozen-out\*.log, frozen-out\*.err -Pattern 'qwen|video\.|duplex|Traceback|ERROR' -ErrorAction SilentlyContinue | Select-Object -Last 40 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(300, $_.Line.Length)) }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: frozen-out, path: frozen-out }
