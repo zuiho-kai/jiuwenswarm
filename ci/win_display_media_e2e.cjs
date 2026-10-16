@@ -1,6 +1,8 @@
 // Windows e2e: run with `electron win_display_media_e2e.cjs`
 const { app, BrowserWindow, desktopCapturer } = require('electron');
 const fs = require('fs');
+const http = require('http');
+let baseUrl = '';
 const path = require('path');
 const { registerDisplayMediaHandler } = require(path.resolve(process.env.PICKER));
 const OUT = process.env.OUT_DIR || '.';
@@ -9,7 +11,7 @@ const call = `Promise.race([navigator.mediaDevices.getDisplayMedia({video:{displ
 async function page(handler) {
   const w = new BrowserWindow({ show: true, width: 400, height: 300 });
   if (handler) registerDisplayMediaHandler({ session: w.webContents.session, desktopCapturer, BrowserWindow, getParentWindow: () => w });
-  await w.loadFile(path.join(__dirname, 'blank.html'));
+  await w.loadURL(baseUrl);
   return w;
 }
 function onPicker(action) {
@@ -27,8 +29,11 @@ function onPicker(action) {
     });
   });
 }
+process.on('unhandledRejection', e => { console.log('E2E_ERROR ' + (e && e.stack || e)); app.exit(2); });
 app.whenReady().then(async () => {
-  fs.writeFileSync(path.join(__dirname, 'blank.html'), '<p>x</p>');
+  const server = http.createServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end('<p>x</p>'); });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  baseUrl = 'http://127.0.0.1:' + server.address().port + '/';
   let w = await page(false);
   results.no_handler = await w.webContents.executeJavaScript(call, true); w.destroy();
   w = await page(true); onPicker('select');

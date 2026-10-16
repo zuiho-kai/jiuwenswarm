@@ -25,7 +25,7 @@ jobs:
           $electron = "$PWD\jiuwenswarm\channels\desktop\electron\node_modules\electron\dist\electron.exe"
           & $electron --version
           & $electron "$env:OUT_DIR\win_display_media_e2e.cjs" 2>&1 | Tee-Object e2e-out\log.txt
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Select-String -Path e2e-out\log.txt -Pattern 'E2E_PASS' -Quiet)) { exit 1 }
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: e2e-out, path: e2e-out }
