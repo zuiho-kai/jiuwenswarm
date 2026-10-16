@@ -14,7 +14,9 @@ jobs:
           run-id: 38848465867
           github-token: ${{ github.token }}
           path: inst
-      - name: install and start frozen backend like the desktop shell
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: install, start frozen backend, click full-duplex
         shell: pwsh
         run: |
           Get-ChildItem inst -Recurse -Filter *.exe | Select FullName, Length
@@ -36,11 +38,6 @@ jobs:
           Start-Process $be.FullName -ArgumentList '--desktop-run-web','--host','127.0.0.1','--port','25173','--proxy-target','http://127.0.0.1:29000' -RedirectStandardOutput frozen-out\web.log -RedirectStandardError frozen-out\web.err
           for ($i=0; $i -lt 60; $i++) { try { Invoke-WebRequest http://127.0.0.1:25173/ -UseBasicParsing -TimeoutSec 3 | Out-Null; break } catch { Start-Sleep 3 } }
           Start-Sleep 20
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - name: click full-duplex in Chrome (fake mic)
-        shell: pwsh
-        run: |
           pip install playwright | Out-Null
           python ci\drive_win.py http://127.0.0.1:25173/
           Select-String -Path "$env:USERPROFILE\.jiuwenswarm\agent\.logs\*.log", frozen-out\*.log, frozen-out\*.err -Pattern 'qwen|video\.|duplex|Traceback|ERROR' -ErrorAction SilentlyContinue | Select-Object -Last 40 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(300, $_.Line.Length)) }
