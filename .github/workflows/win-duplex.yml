@@ -43,4 +43,5 @@ jobs:
           Select-String -Path "$env:USERPROFILE\.jiuwenswarm\agent\.logs\*.log", frozen-out\*.log, frozen-out\*.err -Pattern 'qwen|video\.|duplex|Traceback|ERROR' -ErrorAction SilentlyContinue | Select-Object -Last 40 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(300, $_.Line.Length)) }
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: frozen-out, path: frozen-out }
+        # 用户 2026-10-18 原话「留1天最多了」
+        with: { name: frozen-out, path: frozen-out, retention-days: 1 }
