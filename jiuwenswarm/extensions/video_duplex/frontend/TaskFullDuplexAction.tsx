@@ -45,14 +45,11 @@ export function TaskFullDuplexAction({
   hasTextDraft = false,
 }: ApplicationPluginTaskInputActionProps) {
   const { t } = useTranslation();
-  const [orbHost, setOrbHost] = useState<Element | null>(null);
   const [shareDialog, setShareDialog] = useState(false);
   const [shareSource, setShareSource] = useState<'screen' | 'camera'>('screen');
-  const bindAnchor = useCallback((node: HTMLSpanElement | null) => {
-    setOrbHost(node?.closest('.chat-input-frame') || null);
-  }, []);
   const enabled = useTaskFullDuplexEnabled();
-  const { state, error, microphoneMuted, speakerMuted, screenSharing } = useTaskFullDuplexRuntime();
+  const { state: runtimeState, sessionId: runtimeSessionId, error } = useTaskFullDuplexRuntime();
+  const state = runtimeSessionId === sessionId ? runtimeState : 'idle';
 
   useEffect(() => {
     let cancelled = false;
@@ -98,7 +95,6 @@ export function TaskFullDuplexAction({
   }, [beginSession, state]);
 
   const showAction = enabled && eligible;
-  const running = enabled && state !== 'idle';
   const title = error || (state === 'starting' ? labels.starting : state === 'active' ? labels.stop : labels.start);
 
   return (
@@ -136,6 +132,46 @@ export function TaskFullDuplexAction({
           </div>
         </FormDialog>
       ) : null}
+      {showAction && !hasTextDraft ? (
+        <button
+          type="button"
+          onClick={() => void handleClick()}
+          disabled={!sessionId}
+          className={`chat-input-btn chat-input-btn--send task-full-duplex-action is-${state}`}
+          title={title}
+          aria-label={title}
+          aria-pressed={state === 'active'}
+          data-testid="chat-panel-input-full-duplex"
+        >
+          {state === 'starting' ? (
+            <LoaderCircle className="chat-input-btn-icon task-full-duplex-action__spinner" aria-hidden />
+          ) : state === 'active' ? (
+            <X className="chat-input-btn-icon" aria-hidden />
+          ) : (
+            <svg className="chat-input-btn-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path
+                d="M10 2.5v15M13.75 6.25v7.5M6.25 6.25v7.5M17.5 8.75v2.5M2.5 8.75v2.5"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+              />
+            </svg>
+          )}
+        </button>
+      ) : (
+        fallback
+      )}
+    </>
+  );
+}
+
+// Mounted with the app runtime, independently of any conversation composer.
+export function TaskFullDuplexControls() {
+  const { t } = useTranslation();
+  const { state, microphoneMuted, speakerMuted, screenSharing } = useTaskFullDuplexRuntime();
+  const running = state !== 'idle';
+  return (
+    <>
       {running && screenSharing
         ? createPortal(
             <div className="task-full-duplex-sharing" role="status" data-testid="chat-panel-duplex-sharing-indicator">
@@ -148,13 +184,7 @@ export function TaskFullDuplexAction({
             document.body,
           )
         : null}
-      <span
-        ref={bindAnchor}
-        className="task-full-duplex-anchor"
-        aria-hidden="true"
-        data-testid="chat-panel-duplex-anchor"
-      />
-      {running && orbHost
+      {running
         ? createPortal(
             <div className="task-full-duplex-orb" data-testid="chat-panel-duplex-controls" data-variant={state}>
               <div
@@ -210,38 +240,9 @@ export function TaskFullDuplexAction({
                 ) : null}
               </div>
             </div>,
-            orbHost,
+            document.body,
           )
         : null}
-      {showAction && !hasTextDraft ? (
-        <button
-          type="button"
-          onClick={() => void handleClick()}
-          disabled={!sessionId}
-          className={`chat-input-btn chat-input-btn--send task-full-duplex-action is-${state}`}
-          title={title}
-          aria-label={title}
-          aria-pressed={state === 'active'}
-          data-testid="chat-panel-input-full-duplex"
-        >
-          {state === 'starting' ? (
-            <LoaderCircle className="chat-input-btn-icon task-full-duplex-action__spinner" aria-hidden />
-          ) : state === 'active' ? (
-            <X className="chat-input-btn-icon" aria-hidden />
-          ) : (
-            <svg className="chat-input-btn-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-              <path
-                d="M10 2.5v15M13.75 6.25v7.5M6.25 6.25v7.5M17.5 8.75v2.5M2.5 8.75v2.5"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-            </svg>
-          )}
-        </button>
-      ) : (
-        fallback
-      )}
     </>
   );
 }
