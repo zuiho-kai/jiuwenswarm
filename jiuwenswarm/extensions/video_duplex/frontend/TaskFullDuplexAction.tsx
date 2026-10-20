@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 import {
   Camera,
   Monitor,
@@ -170,25 +171,76 @@ export function TaskFullDuplexControls() {
   const { t } = useTranslation();
   const { state, microphoneMuted, speakerMuted, screenSharing } = useTaskFullDuplexRuntime();
   const running = state !== 'idle';
+  const controlsRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ id: number; x: number; y: number; left: number; top: number } | null>(null);
+  const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const constrainPosition = useCallback((left: number, top: number) => {
+    const bounds = controlsRef.current?.getBoundingClientRect();
+    return {
+      left: Math.max(8, Math.min(left, window.innerWidth - (bounds?.width ?? 80) - 8)),
+      top: Math.max(8, Math.min(top, window.innerHeight - (bounds?.height ?? 116) - 8)),
+    };
+  }, []);
+
+  useEffect(() => {
+    const keepVisible = () => setPosition((current) => current
+      ? constrainPosition(current.left, current.top) : current);
+    keepVisible();
+    window.addEventListener('resize', keepVisible);
+    return () => window.removeEventListener('resize', keepVisible);
+  }, [running, screenSharing, constrainPosition]);
+
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || !event.isPrimary) return;
+    const bounds = controlsRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = { id: event.pointerId, x: event.clientX, y: event.clientY, left: bounds.left, top: bounds.top };
+    setPosition(constrainPosition(bounds.left, bounds.top));
+    setDragging(true);
+  };
+
+  const moveDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.id !== event.pointerId) return;
+    setPosition(constrainPosition(drag.left + event.clientX - drag.x, drag.top + event.clientY - drag.y));
+  };
+
+  const endDrag = () => {
+    dragRef.current = null;
+    setDragging(false);
+  };
+
   return (
     <>
-      {running && screenSharing
-        ? createPortal(
-            <div className="task-full-duplex-sharing" role="status" data-testid="chat-panel-duplex-sharing-indicator">
-              <span className="task-full-duplex-sharing__dot" aria-hidden="true" />
-              <span>{t('chat.duplexControls.sharingVideo')}</span>
-              <button type="button" onClick={stopTaskDuplexScreenSharing} data-testid="chat-panel-duplex-close-sharing">
-                {t('common.close')}
-              </button>
-            </div>,
-            document.body,
-          )
-        : null}
       {running
         ? createPortal(
-            <div className="task-full-duplex-orb" data-testid="chat-panel-duplex-controls" data-variant={state}>
+            <div
+              ref={controlsRef}
+              className={`task-full-duplex-orb${dragging ? ' is-dragging' : ''}`}
+              style={position ? { ...position, bottom: 'auto', transform: 'none' } : undefined}
+              data-testid="chat-panel-duplex-controls"
+              data-variant={state}
+            >
+              {screenSharing ? (
+                <div className="task-full-duplex-sharing" role="status" data-testid="chat-panel-duplex-sharing-indicator">
+                  <span className="task-full-duplex-sharing__dot" aria-hidden="true" />
+                  <span>{t('chat.duplexControls.sharingVideo')}</span>
+                  <button type="button" onClick={stopTaskDuplexScreenSharing} data-testid="chat-panel-duplex-close-sharing">
+                    {t('common.close')}
+                  </button>
+                </div>
+              ) : null}
               <div
                 className="task-full-duplex-orb__sphere"
+                onPointerDown={startDrag}
+                onPointerMove={moveDrag}
+                onPointerUp={endDrag}
+                onPointerCancel={endDrag}
+                onLostPointerCapture={endDrag}
                 role="status"
                 aria-label={t(
                   state === 'starting' ? 'chat.duplexControls.connecting' : 'chat.duplexControls.listening',
