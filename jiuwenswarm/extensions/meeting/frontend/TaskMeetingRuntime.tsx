@@ -16,11 +16,20 @@ import {
   useMeetingSnapshot,
 } from './taskMeetingStore';
 
+type ServerMeeting = {
+  state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed';
+  meeting_id?: string;
+};
+
 export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimeProps) {
   const { t, i18n } = useTranslation();
   const enabled = useTeamMeetingEnabled();
   const snapshot = useMeetingSnapshot();
-  const current = useRef<{ sessionId: string; meeting: MeetingSession } | null>(null);
+  const current = useRef<{
+    sessionId: string;
+    meeting: MeetingSession;
+    meetingId: string | null;
+  } | null>(null);
   const mounted = useRef(true);
   const roster = useSessionStore((state) => state.runtimes[sessionId || '']);
 
@@ -44,7 +53,10 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
                 member.status.toLowerCase() !== 'shutdown' &&
                 !member.workflow_run_id,
             )
-            .map((member) => ({ member_name: member.member_id, display_name: member.name || member.member_id })),
+            .map((member) => ({
+              member_name: member.member_id,
+              display_name: member.name || member.member_id,
+            })),
         ],
       };
     },
@@ -59,33 +71,83 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
     }
   }, []);
 
+  const endServer = useCallback((id: string, meetingId: string | null, startupId: string) => {
+    const method = meetingId ? 'meeting.end' : 'meeting.release';
+    void webClient
+      .request(method, {
+        session_id: id,
+        meeting_id: meetingId || '',
+        startup_id: startupId,
+      })
+      .catch(() => {});
+  }, []);
+
   const start = useCallback(
     async (id: string) => {
       if (!enabled || current.current) return;
       const mode = useSessionStore.getState().getRuntime(id)?.mode;
       if (!mode || !isTeamAgentMode(mode)) return;
       if (webClient.getState() !== 'ready') throw new Error('disconnected');
+      const startupId = crypto.randomUUID();
       const meeting: MeetingSession = new MeetingSession(webClient, id, context(id), {
         line: () => {}, // Task handlers already own the conversation timeline.
         draft: (text) => {
           if (mounted.current && current.current?.meeting === meeting) deliverMeetingTranscript(id, text);
         },
         error: (code) => {
-          if (mounted.current) toast.open({ content: t(`meeting.errors.${code}`), variant: 'error' });
+          if (mounted.current)
+            toast.open({
+              content: t(`meeting.errors.${code}`),
+              variant: 'error',
+            });
         },
         recording: (recording) => {
           if (mounted.current && current.current?.meeting === meeting) publishMeeting({ recording });
         },
         ended: () => {
-          if (current.current?.meeting !== meeting) return;
+          const active = current.current;
+          if (active?.meeting !== meeting) return;
           current.current = null;
-          publishMeeting({ state: 'idle', sessionId: null, recording: 'ready' });
+          endServer(active.sessionId, active.meetingId, startupId);
+          publishMeeting({
+            state: 'idle',
+            sessionId: null,
+            recording: 'ready',
+          });
         },
       });
-      current.current = { sessionId: id, meeting };
+      current.current = { sessionId: id, meeting, meetingId: null };
       publishMeeting({ state: 'starting', sessionId: id, recording: 'ready' });
       try {
-        await meeting.start();
+        let server = await webClient.request<ServerMeeting>('meeting.start', {
+          session_id: id,
+          startup_id: startupId,
+        });
+        if (current.current?.meeting !== meeting) {
+          endServer(id, server.meeting_id || null, startupId);
+          return;
+        }
+        while (server.state === 'starting') {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          if (current.current?.meeting !== meeting) return;
+          server = await webClient.request<ServerMeeting>('meeting.status', {
+            session_id: id,
+            startup_id: startupId,
+          });
+          if (current.current?.meeting !== meeting) {
+            // Release only this startup; a newer attempt may now own the session.
+            endServer(id, null, startupId);
+            return;
+          }
+        }
+        if (server.state !== 'active' || !server.meeting_id) throw new Error('meetingStartFailed');
+        current.current.meetingId = server.meeting_id;
+        try {
+          await meeting.start();
+        } catch (error) {
+          if (error instanceof Error && ['unsupported', 'disconnected'].includes(error.message)) throw error;
+          throw new Error('microphoneFailed');
+        }
         if (mounted.current && current.current?.meeting === meeting) {
           publishMeeting({ state: 'active' });
           meeting.startRecording();
@@ -95,7 +157,7 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         throw error;
       }
     },
-    [context, enabled, t],
+    [context, enabled, endServer, t],
   );
 
   useEffect(

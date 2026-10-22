@@ -5079,6 +5079,117 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("openai_account.auth.logout", _openai_account_auth_logout)
     channel.register_method("openai_account.models.list", _openai_account_models_list)
 
+    async def _meeting_control(ws, req_id, params, session_id, user_id, method):
+        """Forward meeting control to the AgentServer that owns the Team."""
+        from secrets import token_hex
+
+        from jiuwenswarm.common.protocol_ids import is_valid_session_id
+        from jiuwenswarm.common.schema.message import ReqMethod
+        from jiuwenswarm.gateway.routing.e2a_proxy import proxy_unary_request
+
+        params = params if isinstance(params, dict) else {}
+        target_session = str(params.get("session_id") or session_id or "").strip()
+        if not is_valid_session_id(target_session) or target_session == "new":
+            await channel.send_response(
+                ws, req_id, ok=False, error="Meeting session is required", code="BAD_REQUEST"
+            )
+            return
+        owner_id = getattr(ws, "_meeting_owner_id", None)
+        if method != ReqMethod.MEETING_STATUS and owner_id is None:
+            owner_id = token_hex(16)
+            setattr(ws, "_meeting_owner_id", owner_id)
+
+        startup_id = str(params.get("startup_id") or "")
+        owned = getattr(ws, "_meeting_owned_sessions", None)
+        if owned is None:
+            owned = {}
+            setattr(ws, "_meeting_owned_sessions", owned)
+        ownership_key = (target_session, startup_id)
+        if method == ReqMethod.MEETING_START:
+            # Track before dispatch: a lost response must not skip disconnect cleanup.
+            owned[ownership_key] = user_id
+
+        async def _on_done(ok, _payload):
+            if method == ReqMethod.MEETING_STATUS:
+                return
+            if method == ReqMethod.MEETING_START:
+                if not ok:
+                    owned.pop(ownership_key, None)
+                elif getattr(ws, "_meeting_disconnected", False):
+                    await _release_meeting(ws, target_session, user_id, startup_id)
+            elif ok:
+                owned.pop(ownership_key, None)
+
+        await proxy_unary_request(
+            channel=channel,
+            agent_client=_resolve(agent_client),
+            ws=ws,
+            req_id=req_id,
+            params=params,
+            session_id=target_session,
+            user_id=user_id,
+            req_method=method,
+            label=method.value,
+            drop_params=("_meeting_owner_id",),
+            extra_params={"_meeting_owner_id": owner_id} if owner_id else None,
+            on_done=_on_done,
+        )
+
+    async def _release_meeting(ws, session_id, user_id, startup_id):
+        from jiuwenswarm.common.schema.message import ReqMethod
+        from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
+
+        owner_id = getattr(ws, "_meeting_owner_id", None)
+        if not owner_id:
+            return
+        await fetch_agent_unary(
+            agent_client=_resolve(agent_client),
+            req_method=ReqMethod.MEETING_RELEASE,
+            params={"_meeting_owner_id": owner_id, "startup_id": startup_id},
+            session_id=session_id,
+            user_id=user_id,
+            channel_id=channel.channel_id,
+            label="meeting.disconnect",
+            timeout_seconds=5,
+        )
+
+    async def _release_meetings_on_disconnect(ws, _session_ids):
+        setattr(ws, "_meeting_disconnected", True)
+        owned = getattr(ws, "_meeting_owned_sessions", {})
+        for (owned_session, startup_id), user_id in list(owned.items()):
+            try:
+                await _release_meeting(ws, owned_session, user_id, startup_id)
+            except Exception:
+                logger.exception("Meeting disconnect cleanup failed: session_id=%s", owned_session)
+        owned.clear()
+
+    if callable(register_disconnect):
+        register_disconnect(_release_meetings_on_disconnect)
+
+    async def _meeting_start(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_START)
+
+    async def _meeting_status(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_STATUS)
+
+    async def _meeting_end(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_END)
+
+    async def _meeting_release(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_RELEASE)
+
+    channel.register_method("meeting.start", _meeting_start)
+    channel.register_method("meeting.status", _meeting_status)
+    channel.register_method("meeting.end", _meeting_end)
+    channel.register_method("meeting.release", _meeting_release)
     channel.register_method("session.list", _session_list)
     channel.register_method("session.create", _session_create)
     channel.register_method("session.get_metadata", _session_get_metadata)

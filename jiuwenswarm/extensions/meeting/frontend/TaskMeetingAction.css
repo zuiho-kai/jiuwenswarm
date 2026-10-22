@@ -10,6 +10,10 @@
 .task-meeting-spinner {
   animation: task-meeting-spin 1s linear infinite;
 }
+.task-meeting-waiting {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
 @keyframes task-meeting-spin {
   to {
     transform: rotate(360deg);

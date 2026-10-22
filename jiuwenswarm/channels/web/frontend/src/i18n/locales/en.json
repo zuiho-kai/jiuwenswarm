@@ -2,7 +2,8 @@
   "meeting": {
     "task": {
       "start": "Start Team meeting",
-      "starting": "Cancel meeting startup",
+      "starting": "Starting meeting…",
+      "waiting": "Send a Team message to prepare the meeting. It will start when the Team is ready.",
       "stop": "End Team meeting"
     },
     "title": "Team meetings",
@@ -17,6 +18,8 @@
       "vadUnavailable": "Automatic speech-end detection is unavailable. Use Finish recording to transcribe your message.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
       "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
+      "meetingStartFailed": "Could not start the Team meeting. Please try again.",
+      "meetingBusy": "This Team meeting is already open in another tab.",
       "microphoneEnded": "The microphone was disconnected.",
       "disconnected": "Connection lost. Start a new meeting after reconnecting.",
       "recordingTooLarge": "The recording is too large. Please record a shorter message.",

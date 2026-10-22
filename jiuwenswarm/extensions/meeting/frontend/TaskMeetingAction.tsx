@@ -95,13 +95,17 @@ export function TaskMeetingAction({
       const readyId = await ensureSession('');
       if (id !== attempt.current || !mounted.current || !enabled) return;
       if (!readyId || (current.current.sessionId !== origin && current.current.sessionId !== readyId)) return;
+      setCreating(false);
       await startMeeting(readyId);
     } catch (error) {
       if (id !== attempt.current || !mounted.current) return;
       const code =
-        error instanceof Error && ['unsupported', 'disconnected'].includes(error.message)
-          ? error.message
-          : 'microphoneFailed';
+        error instanceof Error && error.message.includes('Another connection owns this meeting')
+          ? 'meetingBusy'
+          : error instanceof Error &&
+              ['unsupported', 'disconnected', 'microphoneFailed', 'meetingStartFailed'].includes(error.message)
+            ? error.message
+            : 'meetingStartFailed';
       toast.open({ content: t(`meeting.errors.${code}`), variant: 'error' });
     } finally {
       if (id === attempt.current && mounted.current) setCreating(false);
@@ -123,12 +127,12 @@ export function TaskMeetingAction({
             title={title}
             aria-label={title}
             aria-pressed={status === 'active'}
-            disabled={status === 'idle' && (microphoneBusy || disabled)}
+            disabled={status === 'starting' || (status === 'idle' && (microphoneBusy || disabled))}
             data-testid="chat-panel-input-meeting"
             data-variant={status}
             onClick={() => {
-              if (status !== 'idle') stop();
-              else void start();
+              if (status === 'active') stop();
+              else if (status === 'idle') void start();
             }}
           >
             {status === 'starting' ? (
@@ -137,6 +141,11 @@ export function TaskMeetingAction({
               <UsersRound className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
             )}
           </button>
+          {status === 'starting' && !creating && (
+            <span className="task-meeting-waiting" data-testid="chat-panel-meeting-waiting">
+              {t('meeting.task.waiting')}
+            </span>
+          )}
           {status === 'active' && (
             <>
               <button

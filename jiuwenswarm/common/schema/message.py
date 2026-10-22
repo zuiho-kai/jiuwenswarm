@@ -91,6 +91,10 @@ class ReqMethod(Enum):
     TEAM_BINDING_GENERATE = "team.binding.generate"
     TEAM_SESSION_BIND = "team.session.bind"
     TEAM_DELETE = "team.delete"
+    MEETING_START = "meeting.start"
+    MEETING_STATUS = "meeting.status"
+    MEETING_END = "meeting.end"
+    MEETING_RELEASE = "meeting.release"
 
     PATH_GET = "path.get"
     PATH_SET = "path.set"

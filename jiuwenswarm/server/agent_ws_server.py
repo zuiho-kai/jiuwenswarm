@@ -1982,6 +1982,11 @@ class AgentWebSocketServer:
             await self._server.wait_closed()
             self._server = None
 
+        # Meetings are optional; do not import their SDK dependency just to stop
+        # a server that never loaded the extension.
+        meeting_module = sys.modules.get("jiuwenswarm.extensions.meeting.meeting_manager")
+        if meeting_module is not None:
+            await meeting_module.close_server_meeting_manager()
         closing_runtime = self._runtime
         runtime_close_completed = False
         runtime_close_error: BaseException | None = None
@@ -2532,6 +2537,12 @@ class AgentWebSocketServer:
                 return
             if request.req_method == ReqMethod.TEAM_SESSION_BIND:
                 await self._handle_team_session_bind(ws, request, send_lock)
+                return
+            if request.req_method in {
+                ReqMethod.MEETING_START, ReqMethod.MEETING_STATUS, ReqMethod.MEETING_END,
+                ReqMethod.MEETING_RELEASE,
+            }:
+                await self._handle_meeting_lifecycle(ws, request, send_lock)
                 return
             if request.req_method == ReqMethod.TEAM_DELETE:
                 await self._handle_team_delete(ws, request, send_lock)
@@ -5328,6 +5339,48 @@ class AgentWebSocketServer:
                 metadata=request.metadata,
             )
 
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await send_wire_payload(ws, wire)
+
+    async def _handle_meeting_lifecycle(
+        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+    ) -> None:
+        """Run meeting controls in the AgentServer that owns the Team runtime."""
+        from jiuwenswarm.common.protocol_ids import is_valid_session_id
+        from jiuwenswarm.extensions.meeting.meeting_manager import get_server_meeting_manager
+
+        params = request.params if isinstance(request.params, dict) else {}
+        session_id = str(request.session_id or "").strip()
+        owner_id = str(params.get("_meeting_owner_id") or "").strip()
+        startup_id = str(params.get("startup_id") or "").strip() or None
+        try:
+            if not is_valid_session_id(session_id) or session_id == "new" or not (get_agent_sessions_dir() / session_id).is_dir():
+                raise ValueError("Meeting session not found")
+            if not is_team_mode(get_session_metadata(session_id).get("mode")):
+                raise ValueError("Meeting requires a Team session")
+            manager = get_server_meeting_manager()
+            if request.req_method == ReqMethod.MEETING_START:
+                await manager.request_start(session_id, owner_id, startup_id)
+            elif request.req_method == ReqMethod.MEETING_RELEASE:
+                if not await manager.release(session_id, owner_id, startup_id):
+                    raise ValueError("Meeting is not owned by this connection")
+            elif request.req_method == ReqMethod.MEETING_END:
+                meeting_id = str(params.get("meeting_id") or "").strip()
+                ended = await manager.end(session_id, meeting_id, owner_id=owner_id)
+                if not ended:
+                    raise ValueError("Meeting is not owned by this connection or no longer active")
+            payload = await manager.lifecycle_status(session_id, startup_id)
+            resp = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=True, payload=payload, metadata=request.metadata,
+            )
+        except (ValueError, RuntimeError) as exc:
+            resp = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=False, payload={"error": str(exc), "code": "BAD_REQUEST"},
+                metadata=request.metadata,
+            )
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
         async with send_lock:
             await send_wire_payload(ws, wire)

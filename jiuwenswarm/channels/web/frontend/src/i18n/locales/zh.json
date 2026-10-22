@@ -2,7 +2,8 @@
   "meeting": {
     "task": {
       "start": "开始团队会议",
-      "starting": "取消启动会议",
+      "starting": "正在启动会议…",
+      "waiting": "发送一条团队消息以准备会议。团队就绪后会议将开始。",
       "stop": "结束团队会议"
     },
     "title": "团队会议",
@@ -17,6 +18,8 @@
       "vadUnavailable": "自动语音结束检测不可用，请点击结束录音来转写消息。",
       "unsupported": "语音录制需要支持的浏览器和安全连接。",
       "microphoneFailed": "无法访问麦克风，请检查浏览器权限后重试。",
+      "meetingStartFailed": "无法启动团队会议，请重试。",
+      "meetingBusy": "此团队会议已在另一个标签页中打开。",
       "microphoneEnded": "麦克风已断开。",
       "disconnected": "连接已断开，请在重连后重新开始会议。",
       "recordingTooLarge": "录音过大，请录制更短的消息。",

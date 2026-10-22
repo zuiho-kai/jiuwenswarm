@@ -16,7 +16,7 @@ await require('esbuild').build({
     export {TaskMeetingAction} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingAction.tsx', import.meta.url)))};
     export {TaskMeetingRuntime} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingRuntime.tsx', import.meta.url)))};
     export {setTeamMeetingEnabled} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/featureFlag.ts'))};
-    export {requests} from 'meeting-test-transport';
+    export {requests,meetingServer} from 'meeting-test-transport';
   `, resolveDir: frontend },
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', packages: 'external',
   outfile: output, loader: { '.css': 'empty' },
@@ -30,12 +30,12 @@ await require('esbuild').build({
       vad: `export class MeetingVad {async start(){}reset(){}stop(){}}`,
       i18n: `export const useTranslation=()=>({t:key=>key,i18n:{language:'en'}});`,
       sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
-      transport: `export const requests=[];export const webClient={getState:()=> 'ready',on:()=>()=>{},onStateChange:()=>()=>{},request:async(name,params)=>{requests.push({name,params});return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:{};}};`,
+      transport: `export const requests=[];export const meetingServer={state:'active'};export const webClient={getState:()=> 'ready',on:()=>()=>{},onStateChange:()=>()=>{},request:async(name,params)=>{requests.push({name,params});return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'?{state:'idle'}:{};}};`,
       toast: `export const toast={open:()=>{}};`,
     }[path]}));
   }}],
 });
-const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests}=require(output);
+const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer}=require(output);
 
 async function mount(extra={}) {
   const dom=new JSDOM('<div id="root"></div>',{url:'http://localhost'});
@@ -47,7 +47,7 @@ async function mount(extra={}) {
     start(){this.state='recording';}stop(){this.state='inactive';this.ondataavailable?.({data:new Blob(['audio'])});this.onstop?.();}
   };
   globalThis.FileReader=class {readAsDataURL(){this.result='data:audio/webm;base64,YQ==';this.onload();}};
-  setTeamMeetingEnabled(false);requests.length=0;
+  setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';
   const drafts=[],capture=[];
   const root=createRoot(document.getElementById('root'));
   const props={fallback:React.createElement('button',{'data-testid':'normal-send'},'Send'),eligible:false,teamEligible:true,sessionId:'s',ensureSession:async()=> 's',onTranscript:text=>drafts.push(text),onMicrophoneActiveChange:value=>capture.push(value),labels:{start:'',starting:'',stop:''},...extra};
@@ -75,6 +75,7 @@ test('meeting capture fills the normal editor and preserves its Send button',asy
     assert.ok(!requests.some(request=>request.name==='chat.send'));
     await h.click('chat-panel-input-meeting');
     assert.ok(h.track.stopped);assert.equal(h.capture.at(-1),false);
+    assert.ok(requests.some(request=>request.name==='meeting.end'&&request.params.meeting_id==='meeting-one'));
   } finally {await h.close();}
 });
 
@@ -88,16 +89,68 @@ test('turning the Experimental switch off stops an active meeting',async()=>{
   } finally {await h.close();}
 });
 
-test('cancelling pending session creation never starts microphone capture',async()=>{
+test('session creation disables End until the meeting becomes active',async()=>{
   let ready;
   const h=await mount({ensureSession:()=>new Promise(resolve=>{ready=resolve;})});
   try {
     await h.click('chat-panel-input-meeting');
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
+    assert.equal(h.find('chat-panel-input-meeting').disabled,true);
     await h.click('chat-panel-input-meeting');
     await act(async()=>ready('s'));
+    assert.equal(h.microphoneCalls(),1);
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'active');
+    assert.equal(h.find('chat-panel-input-meeting').disabled,false);
+  } finally {await h.close();}
+});
+
+test('pending Team readiness disables End and handles the server returning idle',async()=>{
+  const h=await mount();
+  try {
+    meetingServer.state='starting';
+    await h.click('chat-panel-input-meeting');
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
+    assert.ok(h.find('chat-panel-meeting-waiting'));
     assert.equal(h.microphoneCalls(),0);
+    assert.equal(h.find('chat-panel-input-meeting').disabled,true);
+    await h.click('chat-panel-input-meeting');
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
+    assert.ok(!requests.some(request=>request.name==='meeting.end'));
+    await act(async()=>{
+      meetingServer.state='idle';
+      await new Promise(resolve=>setTimeout(resolve,1100));
+    });
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+    assert.ok(!requests.some(request=>request.name==='meeting.end'));
+    assert.equal(h.microphoneCalls(),0);
+  } finally {await h.close();}
+});
+
+test('leaving during startup releases only that startup without calling End',async()=>{
+  const h=await mount();
+  meetingServer.state='starting';
+  await h.click('chat-panel-input-meeting');
+  const start=requests.find(request=>request.name==='meeting.start');
+  assert.ok(start.params.startup_id);
+  await h.close();
+  const release=requests.find(request=>request.name==='meeting.release');
+  assert.equal(release.params.startup_id,start.params.startup_id);
+  assert.ok(!requests.some(request=>request.name==='meeting.end'));
+  assert.equal(h.microphoneCalls(),0);
+});
+
+test('meeting capture starts when the normal Team runtime becomes ready',async()=>{
+  const h=await mount();
+  try {
+    meetingServer.state='starting';
+    await h.click('chat-panel-input-meeting');
+    assert.equal(h.microphoneCalls(),0);
+    await act(async()=>{
+      meetingServer.state='active';
+      await new Promise(resolve=>setTimeout(resolve,1100));
+    });
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'active');
+    assert.equal(h.microphoneCalls(),1);
   } finally {await h.close();}
 });
 
