@@ -1292,6 +1292,54 @@ class TestStartServicesFallback:
     """
 
     @staticmethod
+    def test_default_launch_rejects_existing_instance_before_port_fallback(monkeypatch):
+        from jiuwenswarm import start_services
+
+        monkeypatch.setattr(
+            start_services.InstanceCommand,
+            "validate_and_load",
+            lambda self: setattr(
+                self, "config", SimpleNamespace(workspace=Path("."), ports={})
+            ),
+        )
+        monkeypatch.setattr(
+            "jiuwenswarm.instance_manager.lock.GatewayLock.find_holder",
+            lambda workspace: {"pid": 123},
+        )
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("existing instance must not trigger port fallback")
+
+        monkeypatch.setattr(start_services.InstanceCommand, "check_ports_conflicts", unexpected)
+        monkeypatch.setattr(start_services, "_resolve_ports_with_fallback", unexpected)
+        monkeypatch.setattr(start_services, "_sync_default_env_ports", unexpected)
+        monkeypatch.setattr(start_services, "_run_processes", unexpected)
+
+        assert start_services._run("all") == 1
+
+    @staticmethod
+    def test_default_launch_keeps_port_fallback_for_unrelated_listener(monkeypatch):
+        from jiuwenswarm import start_services
+
+        monkeypatch.setattr(
+            start_services.InstanceCommand,
+            "validate_and_load",
+            lambda self: setattr(
+                self, "config", SimpleNamespace(workspace=Path("."), ports={})
+            ),
+        )
+        monkeypatch.setattr(
+            "jiuwenswarm.instance_manager.lock.GatewayLock.find_holder",
+            lambda workspace: None,
+        )
+        monkeypatch.setattr(start_services.InstanceCommand, "check_ports_conflicts", lambda self: [("gateway", 19001)])
+        monkeypatch.setattr(start_services, "_resolve_ports_with_fallback", lambda cmd: None)
+        monkeypatch.setattr(start_services, "_build_commands", lambda mode: [("app", ["python"], None)])
+        monkeypatch.setattr(start_services, "_run_processes", lambda commands, ports: 0)
+
+        assert start_services._run("app") == 0
+
+    @staticmethod
     def test_named_instance_fallback_persists(tmp_path, monkeypatch):
         """Named instance: index-1 conflict → fallback to index-2, persisted."""
         import yaml

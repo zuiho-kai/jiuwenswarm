@@ -840,6 +840,18 @@ def _run(mode: str) -> int:
     if cmd.validate_and_load():
         return 1
 
+    # A busy port alone may belong to another app and should still allow the
+    # normal fallback. A live Gateway lock identifies this workspace's own
+    # running instance, for which fallback would corrupt the shared .env.
+    from jiuwenswarm.instance_manager.lock import GatewayLock
+
+    if GatewayLock.find_holder(cmd.config.workspace):
+        logging.info(
+            "[start_services] Default instance is already running; "
+            "stop it before starting another."
+        )
+        return 1
+
     if cmd.check_ports_conflicts():
         if _resolve_ports_with_fallback(cmd) is not None:
             return 1
