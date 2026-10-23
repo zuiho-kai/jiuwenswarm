@@ -19,6 +19,7 @@ from jiuwenswarm.common.config import get_config
 
 if TYPE_CHECKING:
     from jiuwenswarm.agents.harness.team.team_manager import TeamManager
+    from .participants import MeetingPublicationSession
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class _Meeting:
     task: asyncio.Task | None = None
     initializing: asyncio.Task | None = None
     startup_id: str | None = None
+    publication: MeetingPublicationSession | None = None
 
 
 def _meeting_enabled() -> bool:
@@ -60,6 +62,57 @@ class MeetingManager:
         self._tasks: set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
         self._stopping = False
+
+    def publication_for_session(self, session_id: str, team_name: str) -> MeetingPublicationSession | None:
+        """Resolve only the current native scope; ordinary sessions allocate nothing."""
+        meeting = self._sessions.get(session_id)
+        if meeting is None or meeting.publication is None:
+            return None
+        if (
+            meeting.phase != "active" or not self._enabled()
+            or not self._runtime_matches(session_id, meeting)
+        ):
+            meeting.publication.close()
+            return None
+        if meeting.state is None or meeting.state.scope.team_name != team_name:
+            return None
+        return meeting.publication if not meeting.publication.closed else None
+
+    async def enable_publication(
+        self, session_id: str, meeting_id: str, *, on_queued: Callable[[], None],
+    ) -> MeetingPublicationSession:
+        """Internal host entry, not a browser RPC or a new mode setting.
+
+        Startup intentionally does not call this until the host grant/playback
+        driver is implemented. Tests can supply a controlled consumer wake-up.
+        """
+        from .participants import MeetingPublicationSession
+
+        if not callable(on_queued):
+            raise ValueError("A meeting publication consumer wake-up callback is required")
+        async with self._lock:
+            meeting = self._sessions.get(session_id)
+            if (
+                meeting is None or meeting.phase != "active" or meeting.state is None
+                or meeting.state.scope.meeting_id != meeting_id or not self._enabled()
+                or not self._runtime_matches(session_id, meeting)
+            ):
+                raise ValueError("A matching active meeting is required for publication")
+            if meeting.publication is not None:
+                if meeting.publication.on_queued != on_queued or meeting.publication.closed:
+                    raise ValueError("Meeting publication already has a consumer")
+                return meeting.publication
+            team_agent = self._team_manager.get_team_agent(session_id)
+            if getattr(getattr(team_agent, "spec", None), "spawn_mode", "inprocess") != "inprocess":
+                raise ValueError("Coordinated publication supports native in-process members only")
+            if getattr(getattr(team_agent, "spec", None), "enable_team_plan", False):
+                raise ValueError("Finish Team plan mode before enabling coordinated publication")
+            members = await meeting.backend.db.member.get_team_members(meeting.state.scope.team_name)
+            if any(member.role not in {"leader", "teammate"} for member in members):
+                raise ValueError("Coordinated publication supports native in-process members only")
+            assert meeting.coordinator is not None
+            meeting.publication = MeetingPublicationSession(meeting.coordinator, on_queued)
+            return meeting.publication
 
     def _spawn(self, coroutine) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
@@ -243,6 +296,8 @@ class MeetingManager:
         if self._sessions.get(session_id) is not meeting:
             return None
         meeting.phase = "closing"
+        if meeting.publication is not None:
+            meeting.publication.close()
         if meeting.coordinator is None:
             self._sessions.pop(session_id)
             return None
@@ -348,6 +403,8 @@ class MeetingManager:
             if meeting.phase != "active":
                 return {"state": meeting.phase}
             if state is None or state.closed:
+                if meeting.publication is not None:
+                    meeting.publication.close()
                 self._sessions.pop(session_id)
                 return {"state": "idle"}
             meeting.state = state
@@ -384,6 +441,13 @@ class MeetingManager:
 
 
 _server_manager: MeetingManager | None = None
+
+
+def get_active_publication(session_id: str, team_name: str) -> MeetingPublicationSession | None:
+    return (
+        _server_manager.publication_for_session(session_id, team_name)
+        if _server_manager is not None else None
+    )
 
 
 def get_server_meeting_manager() -> MeetingManager:

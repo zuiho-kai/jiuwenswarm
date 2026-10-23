@@ -79,7 +79,30 @@ MODEL_ANOMALY_DETECTION = "swarm.model_anomaly_detection"
 PLUGIN_RAILS = "swarm.plugin_rails"
 SKILL_RETRIEVAL_PROMPT = "swarm.skill_retrieval_prompt"
 SYMPHONY_ORCHESTRATION_PROMPT = "swarm.symphony_orchestration_prompt"
+MEETING_PARTICIPANT = "swarm.meeting_participant"
 HEARTBEAT = "swarm.heartbeat"
+
+
+@harness_element(
+    kind=ElementKind.RAIL,
+    name=MEETING_PARTICIPANT,
+    description="Native group-chat meeting guidance and publication, gated by the active host consumer.",
+)
+def build_meeting_participant(params: dict[str, Any], context: SwarmBuildContext) -> Any:
+    del params
+    backend = get_team_backend(context)
+    if (
+        getattr(context, "role", "") not in {"leader", "teammate"}
+        or getattr(backend, "conversation_mode", "team") != "group_chat"
+        or not context.session_id or not context.member_name
+    ):
+        return None
+    from jiuwenswarm.extensions.meeting.participants import MeetingParticipantRail
+
+    return MeetingParticipantRail(
+        context.session_id, backend.team_name, context.member_name,
+        language=context.language or "en",
+    )
 
 
 @harness_element(
