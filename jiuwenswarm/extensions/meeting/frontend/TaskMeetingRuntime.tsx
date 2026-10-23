@@ -5,23 +5,19 @@ import { isTeamAgentMode } from '../../../channels/web/frontend/src/features/pla
 import { resolveTeamLeaderDisplayName } from '../../../channels/web/frontend/src/features/teamLeaderIdentity';
 import { useTeamMeetingEnabled } from '../../../channels/web/frontend/src/features/teamMeeting/featureFlag';
 import { webClient } from '../../../channels/web/frontend/src/services/webClient';
+import { rememberGroupChatInput } from '../../../channels/web/frontend/src/features/groupChatInput';
 import { useSessionStore } from '../../../channels/web/frontend/src/stores/sessionStore';
 import { toast } from '../../../channels/web/frontend/src/components/ui/Toast/toastStore';
 import { MeetingSession, type MeetingContext } from './meetingRuntime';
-import {
-  clearMeetingTranscripts,
-  deliverMeetingTranscript,
-  publishMeeting,
-  registerMeetingController,
-  useMeetingSnapshot,
-} from './taskMeetingStore';
+import { sendMeetingInput } from './meetingInput';
+import { publishMeeting, registerMeetingController, useMeetingSnapshot } from './taskMeetingStore';
 
 type ServerMeeting = {
   state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed';
   meeting_id?: string;
 };
 
-export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimeProps) {
+export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPluginTaskRuntimeProps) {
   const { t, i18n } = useTranslation();
   const enabled = useTeamMeetingEnabled();
   const snapshot = useMeetingSnapshot();
@@ -29,7 +25,11 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
     sessionId: string;
     meeting: MeetingSession;
     meetingId: string | null;
+    input: AbortController;
   } | null>(null);
+  const sender = useRef(onSendMessage);
+  sender.current = onSendMessage;
+  const initialization = useRef(new Map<string, { id: string; text: string }>());
   const mounted = useRef(true);
   const roster = useSessionStore((state) => state.runtimes[sessionId || '']);
 
@@ -66,8 +66,8 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
   const stop = useCallback(() => {
     const active = current.current;
     if (active) {
+      active.input.abort();
       active.meeting.stop();
-      clearMeetingTranscripts(active.sessionId);
     }
   }, []);
 
@@ -88,11 +88,29 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
       const mode = useSessionStore.getState().getRuntime(id)?.mode;
       if (!mode || !isTeamAgentMode(mode)) return;
       if (webClient.getState() !== 'ready') throw new Error('disconnected');
+      const send = sender.current;
+      if (!send) throw new Error('disconnected');
       const startupId = crypto.randomUUID();
+      const input = new AbortController();
       const meeting: MeetingSession = new MeetingSession(webClient, id, context(id), {
         line: () => {}, // Task handlers already own the conversation timeline.
         draft: (text) => {
-          if (mounted.current && current.current?.meeting === meeting) deliverMeetingTranscript(id, text);
+          if (!mounted.current || current.current?.meeting !== meeting) return;
+          void sendMeetingInput(
+            webClient,
+            send,
+            id,
+            text,
+            crypto.randomUUID(),
+            [context(id).leader],
+            input.signal,
+          ).catch(() => {
+            if (mounted.current && current.current?.meeting === meeting)
+              toast.open({
+                content: t('meeting.errors.deliveryFailed'),
+                variant: 'error',
+              });
+          });
         },
         error: (code) => {
           if (mounted.current)
@@ -107,6 +125,7 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         ended: () => {
           const active = current.current;
           if (active?.meeting !== meeting) return;
+          active.input.abort();
           current.current = null;
           endServer(active.sessionId, active.meetingId, startupId);
           publishMeeting({
@@ -116,9 +135,20 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
           });
         },
       });
-      current.current = { sessionId: id, meeting, meetingId: null };
+      current.current = { sessionId: id, meeting, meetingId: null, input };
       publishMeeting({ state: 'starting', sessionId: id, recording: 'ready' });
       try {
+        let initial = initialization.current.get(id);
+        if (!initial) {
+          initial = {
+            id: `meeting-start-${startupId}`,
+            text: t('meeting.startMessage'),
+          };
+          initialization.current.set(id, initial);
+        }
+        await sendMeetingInput(webClient, send, id, initial.text, initial.id, [], input.signal);
+        rememberGroupChatInput(id);
+        if (current.current?.meeting !== meeting) return;
         let server = await webClient.request<ServerMeeting>('meeting.start', {
           session_id: id,
           startup_id: startupId,
@@ -149,6 +179,7 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
           throw new Error('microphoneFailed');
         }
         if (mounted.current && current.current?.meeting === meeting) {
+          initialization.current.delete(id);
           publishMeeting({ state: 'active' });
           meeting.startRecording();
         }

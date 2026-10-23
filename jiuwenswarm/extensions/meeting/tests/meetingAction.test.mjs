@@ -16,7 +16,8 @@ await require('esbuild').build({
     export {TaskMeetingAction} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingAction.tsx', import.meta.url)))};
     export {TaskMeetingRuntime} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingRuntime.tsx', import.meta.url)))};
     export {setTeamMeetingEnabled} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/featureFlag.ts'))};
-    export {requests,meetingServer} from 'meeting-test-transport';
+    export {requests,meetingServer,webClient,emit} from 'meeting-test-transport';
+    export {rememberGroupChatInput,defaultGroupChatInput} from ${JSON.stringify(path.join(frontend, 'src/features/groupChatInput.ts'))};
   `, resolveDir: frontend },
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', packages: 'external',
   outfile: output, loader: { '.css': 'empty' },
@@ -30,12 +31,29 @@ await require('esbuild').build({
       vad: `export class MeetingVad {async start(){}reset(){}stop(){}}`,
       i18n: `export const useTranslation=()=>({t:key=>key,i18n:{language:'en'}});`,
       sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
-      transport: `export const requests=[];export const meetingServer={state:'active'};export const webClient={getState:()=> 'ready',on:()=>()=>{},onStateChange:()=>()=>{},request:async(name,params)=>{requests.push({name,params});return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'?{state:'idle'}:{};}};`,
+      transport: `
+        export const requests=[];
+        export const meetingServer={state:'active',acceptInputs:true,failInput:false};
+        const handlers=new Map();
+        export function emit(name,payload){for(const fn of handlers.get(name)||[])fn({payload});}
+        export const webClient={
+          getState:()=> 'ready',
+          on:(name,fn)=>{if(!handlers.has(name))handlers.set(name,new Set());handlers.get(name).add(fn);return()=>handlers.get(name).delete(fn);},
+          onStateChange:()=>()=>{},
+          request:async(name,params)=>{
+            requests.push({name,params});
+            if(name==='chat.send'&&meetingServer.acceptInputs)queueMicrotask(()=>{
+              if(meetingServer.failInput)emit('chat.error',{session_id:params.session_id,request_id:params.request_id,error:'delivery failed'});
+              else emit('team.group_message.accepted',{session_id:params.session_id,client_message_id:params.client_message_id});
+            });
+            return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'?{state:'idle'}:{};
+          },
+        };`,
       toast: `export const toast={open:()=>{}};`,
     }[path]}));
   }}],
 });
-const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer}=require(output);
+const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput}=require(output);
 
 async function mount(extra={}) {
   const dom=new JSDOM('<div id="root"></div>',{url:'http://localhost'});
@@ -47,13 +65,20 @@ async function mount(extra={}) {
     start(){this.state='recording';}stop(){this.state='inactive';this.ondataavailable?.({data:new Blob(['audio'])});this.onstop?.();}
   };
   globalThis.FileReader=class {readAsDataURL(){this.result='data:audio/webm;base64,YQ==';this.onload();}};
-  setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';
-  const drafts=[],capture=[];
+  setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';meetingServer.acceptInputs=true;meetingServer.failInput=false;
+  const drafts=[],capture=[],messages=[];
+  const onSendMessage=async(text,options)=>{
+    messages.push(text);
+    const requestId=`chat-${messages.length}`;
+    options.groupChat.onRequestId?.(requestId);
+    await webClient.request('chat.send',{session_id:'s',content:text,type:'group_chat',body:text,client_message_id:options.groupChat.clientMessageId,mentions:options.groupChat.mentions,request_id:requestId});
+    return true;
+  };
   const root=createRoot(document.getElementById('root'));
   const props={fallback:React.createElement('button',{'data-testid':'normal-send'},'Send'),eligible:false,teamEligible:true,sessionId:'s',ensureSession:async()=> 's',onTranscript:text=>drafts.push(text),onMicrophoneActiveChange:value=>capture.push(value),labels:{start:'',starting:'',stop:''},...extra};
-  const render=(key)=>root.render(React.createElement(React.Fragment,null,React.createElement(TaskMeetingRuntime,{sessionId:'s',key:'runtime'}),React.createElement(TaskMeetingAction,{...props,key})));
+  const render=(key)=>root.render(React.createElement(React.Fragment,null,React.createElement(TaskMeetingRuntime,{sessionId:'s',key:'runtime',onSendMessage}),React.createElement(TaskMeetingAction,{...props,key})));
   await act(async()=>render('welcome')); 
-  return {dom,track,drafts,capture,root,microphoneCalls:()=>microphoneCalls,
+  return {dom,track,drafts,capture,messages,root,microphoneCalls:()=>microphoneCalls,
     rerenderComposer:async()=>{await act(async()=>render('conversation'));},
     updateProps:async(update)=>{Object.assign(props,update);await act(async()=>render('welcome'));},
     find:id=>document.querySelector(`[data-testid="${id}"]`),
@@ -62,7 +87,7 @@ async function mount(extra={}) {
   };
 }
 
-test('meeting capture fills the normal editor and preserves its Send button',async()=>{
+test('meeting initializes visibly and sends speech automatically through the normal sender',async()=>{
   const h=await mount();
   try {
     const send=h.find('normal-send');
@@ -70,9 +95,13 @@ test('meeting capture fills the normal editor and preserves its Send button',asy
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('aria-pressed'),'true');
     assert.equal(h.find('chat-panel-input-meeting-record').getAttribute('data-variant'),'recording');
     await h.click('chat-panel-input-meeting-record');
-    assert.deepEqual(h.drafts,['Please review the layout.']);
+    assert.deepEqual(h.drafts,[]);
+    assert.deepEqual(h.messages,['meeting.startMessage','Please review the layout.']);
     assert.equal(h.find('normal-send'),send);
-    assert.ok(!requests.some(request=>request.name==='chat.send'));
+    const inputs=requests.filter(request=>request.name==='chat.send');
+    assert.equal(inputs.length,2);
+    assert.deepEqual(inputs[0].params.mentions,[]);
+    assert.deepEqual(inputs[1].params.mentions,['leader']);
     await h.click('chat-panel-input-meeting');
     assert.ok(h.track.stopped);assert.equal(h.capture.at(-1),false);
     assert.ok(requests.some(request=>request.name==='meeting.end'&&request.params.meeting_id==='meeting-one'));
@@ -162,7 +191,8 @@ test('meeting capture starts when the normal Team runtime becomes ready',async()
     assert.equal(h.track.stopped,false);
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('aria-pressed'),'true');
     await h.click('chat-panel-input-meeting-record');
-    assert.deepEqual(h.drafts,['Please review the layout.']);
+    assert.deepEqual(h.drafts,[]);
+    assert.deepEqual(h.messages,['meeting.startMessage','Please review the layout.']);
   } finally {await h.close();}
 });
 
@@ -191,5 +221,95 @@ test('existing Agent conversations do not offer Team meetings',async()=>{
   try {
     assert.equal(h.find('chat-panel-input-meeting'),null);
     assert.ok(h.find('normal-send'));assert.equal(h.microphoneCalls(),0);
+  } finally {await h.close();}
+});
+
+
+test('runtime readiness alone does not enable recording before public initialization is accepted',async()=>{
+  const h=await mount();
+  try {
+    meetingServer.acceptInputs=false;
+    await h.click('chat-panel-input-meeting');
+    const initial=requests.find(request=>request.name==='chat.send');
+    assert.ok(initial.params.client_message_id);
+    assert.equal(h.microphoneCalls(),0);
+    assert.ok(!requests.some(request=>request.name==='meeting.start'));
+    await act(async()=>{
+      emit('team.runtime_ready',{session_id:'s'});
+      emit('team.group_message.accepted',{session_id:'other',client_message_id:initial.params.client_message_id});
+      emit('team.group_message.accepted',{session_id:'s',client_message_id:'other'});
+    });
+    assert.equal(h.microphoneCalls(),0);
+    await act(async()=>emit('team.group_message.accepted',{
+      session_id:'s',message:{client_message_id:initial.params.client_message_id},
+    }));
+    assert.equal(h.microphoneCalls(),1);
+    assert.ok(requests.findIndex(request=>request.name==='chat.send')<requests.findIndex(request=>request.name==='meeting.start'));
+  } finally {await h.close();}
+});
+
+test('initialization errors prevent recording and retries reuse the public message identity',async()=>{
+  const h=await mount();
+  try {
+    meetingServer.failInput=true;
+    await h.click('chat-panel-input-meeting');
+    assert.equal(h.microphoneCalls(),0);
+    assert.ok(!requests.some(request=>request.name==='meeting.start'));
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+    const first=requests.find(request=>request.name==='chat.send');
+    meetingServer.failInput=false;
+    await h.click('chat-panel-input-meeting');
+    const inputs=requests.filter(request=>request.name==='chat.send');
+    assert.equal(inputs[1].params.client_message_id,first.params.client_message_id);
+    assert.equal(h.microphoneCalls(),1);
+  } finally {await h.close();}
+});
+
+test('leaving while initialization is unaccepted ignores late acceptance and never opens the microphone',async()=>{
+  const h=await mount();
+  meetingServer.acceptInputs=false;
+  await h.click('chat-panel-input-meeting');
+  const initial=requests.find(request=>request.name==='chat.send');
+  await h.close();
+  emit('team.group_message.accepted',{session_id:'s',client_message_id:initial.params.client_message_id});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.microphoneCalls(),0);
+  assert.ok(!requests.some(request=>request.name==='meeting.start'));
+});
+
+
+test('only accepted group conversations get default routing and each utterance gets its own identity',()=>{
+  const dom=new JSDOM('',{url:'http://localhost'});
+  const previous=globalThis.window;
+  globalThis.window=dom.window;
+  try {
+    const id=`group-${crypto.randomUUID()}`;
+    assert.equal(defaultGroupChatInput(id,'leader'),undefined);
+    rememberGroupChatInput(id);
+    assert.equal(window.sessionStorage.getItem(`group-chat-input:${id}`),'1');
+    const first=defaultGroupChatInput(id,'captain');
+    const next=defaultGroupChatInput(id,'new-leader');
+    assert.equal(first.sessionId,id);
+    assert.deepEqual(first.mentions,['captain']);
+    assert.deepEqual(next.mentions,['new-leader']);
+    assert.notEqual(first.clientMessageId,next.clientMessageId);
+    assert.equal(defaultGroupChatInput(`${id}-ordinary`,'leader'),undefined);
+  } finally {dom.window.close();globalThis.window=previous;}
+});
+
+test('an unrelated request error cannot end startup but a matching mode conflict fails before recording',async()=>{
+  const h=await mount();
+  try {
+    meetingServer.acceptInputs=false;
+    await h.click('chat-panel-input-meeting');
+    const initial=requests.find(request=>request.name==='chat.send');
+    await act(async()=>emit('chat.error',{session_id:'s',request_id:'unrelated',error:'error'}));
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
+    await act(async()=>emit('chat.error',{
+      session_id:'s',request_id:initial.params.request_id,error:'Team conversation mode cannot change within a session',
+    }));
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+    assert.equal(h.microphoneCalls(),0);
+    assert.ok(!requests.some(request=>request.name==='meeting.start'));
   } finally {await h.close();}
 });

@@ -1,9 +1,10 @@
 {
   "meeting": {
+    "startMessage": "Start meeting",
     "task": {
       "start": "Start Team meeting",
       "starting": "Starting meeting…",
-      "waiting": "Send a Team message to prepare the meeting. It will start when the Team is ready.",
+      "waiting": "Preparing the Team and meeting…",
       "stop": "End Team meeting"
     },
     "title": "Team meetings",
@@ -11,14 +12,15 @@
     "leader": "Leader",
     "record": {
       "ready": "Record message",
-      "recording": "Finish recording (or pause to transcribe)",
+      "recording": "Finish and send (or pause to send)",
       "transcribing": "Transcribing…"
     },
     "errors": {
-      "vadUnavailable": "Automatic speech-end detection is unavailable. Use Finish recording to transcribe your message.",
+      "vadUnavailable": "Automatic speech-end detection is unavailable. Use Finish recording to send your message.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
       "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
       "meetingStartFailed": "Could not start the Team meeting. Please try again.",
+      "meetingRequiresNewConversation": "Start a meeting in a new Team conversation. This conversation already uses ordinary Team mode.",
       "meetingBusy": "This Team meeting is already open in another tab.",
       "microphoneEnded": "The microphone was disconnected.",
       "disconnected": "Connection lost. Start a new meeting after reconnecting.",

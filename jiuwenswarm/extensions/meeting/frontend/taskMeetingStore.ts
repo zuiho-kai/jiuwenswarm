@@ -15,8 +15,6 @@ type Controller = {
 let controller: Controller | null = null;
 let snapshot: MeetingSnapshot = { state: 'idle', sessionId: null, recording: 'ready' };
 const listeners = new Set<() => void>();
-const composers = new Map<string, (text: string) => void>();
-const pending = new Map<string, string[]>();
 
 export function registerMeetingController(next: Controller): () => void {
   controller = next;
@@ -37,22 +35,6 @@ export function useMeetingSnapshot(): MeetingSnapshot {
     () => snapshot,
     () => snapshot,
   );
-}
-export function registerMeetingComposer(sessionId: string, append: (text: string) => void): () => void {
-  composers.set(sessionId, append);
-  for (const text of pending.get(sessionId) || []) append(text);
-  pending.delete(sessionId);
-  return () => {
-    if (composers.get(sessionId) === append) composers.delete(sessionId);
-  };
-}
-export function deliverMeetingTranscript(sessionId: string, text: string): void {
-  const append = composers.get(sessionId);
-  if (append) append(text);
-  else pending.set(sessionId, [...(pending.get(sessionId) || []).slice(-3), text]);
-}
-export function clearMeetingTranscripts(sessionId: string): void {
-  pending.delete(sessionId);
 }
 export async function startMeeting(sessionId: string): Promise<void> {
   if (!controller) throw new Error('disconnected');

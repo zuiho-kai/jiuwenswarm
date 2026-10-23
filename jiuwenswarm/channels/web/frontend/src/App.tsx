@@ -2938,6 +2938,10 @@ function AppContent({
   const handleSendMessage = useCallback(async (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions) => {
     const currentSessionId = sessionIdRef.current;
     if (!currentSessionId) return;
+    if (options?.groupChat) {
+      if (options.groupChat.sessionId !== currentSessionId) return false;
+      return sendMessage(content, currentSessionId, mediaItems, options);
+    }
     if (options?.queuedTaskId) {
       await sendMessage(content, currentSessionId, mediaItems, options);
       return;

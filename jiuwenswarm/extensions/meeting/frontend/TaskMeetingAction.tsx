@@ -8,14 +8,7 @@ import {
 } from '../../../channels/web/frontend/src/features/teamMeeting/featureFlag';
 import { webClient } from '../../../channels/web/frontend/src/services/webClient';
 import { toast } from '../../../channels/web/frontend/src/components/ui/Toast/toastStore';
-import {
-  recordMeeting,
-  registerMeetingComposer,
-  startMeeting,
-  stopMeeting,
-  stopMeetingAudio,
-  useMeetingSnapshot,
-} from './taskMeetingStore';
+import { recordMeeting, startMeeting, stopMeeting, stopMeetingAudio, useMeetingSnapshot } from './taskMeetingStore';
 import './TaskMeetingAction.css';
 
 export function TaskMeetingAction({
@@ -24,7 +17,6 @@ export function TaskMeetingAction({
   onSelectTeamMode,
   sessionId,
   ensureSession,
-  onTranscript,
   onMicrophoneActiveChange,
   microphoneBusy = false,
   disabled = false,
@@ -71,9 +63,6 @@ export function TaskMeetingAction({
     };
   }, [cancelPending]);
   useEffect(() => {
-    if (sessionId && onTranscript) return registerMeetingComposer(sessionId, onTranscript);
-  }, [sessionId, onTranscript]);
-  useEffect(() => {
     onMicrophoneActiveChange?.(status !== 'idle');
     return () => onMicrophoneActiveChange?.(false);
   }, [status, onMicrophoneActiveChange]);
@@ -103,7 +92,14 @@ export function TaskMeetingAction({
         error instanceof Error && error.message.includes('Another connection owns this meeting')
           ? 'meetingBusy'
           : error instanceof Error &&
-              ['unsupported', 'disconnected', 'microphoneFailed', 'meetingStartFailed'].includes(error.message)
+              [
+                'unsupported',
+                'disconnected',
+                'microphoneFailed',
+                'meetingStartFailed',
+                'deliveryFailed',
+                'meetingRequiresNewConversation',
+              ].includes(error.message)
             ? error.message
             : 'meetingStartFailed';
       toast.open({ content: t(`meeting.errors.${code}`), variant: 'error' });

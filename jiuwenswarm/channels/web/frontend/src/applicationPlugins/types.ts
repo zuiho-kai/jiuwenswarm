@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import type { FileDownloadItem, ToolCall, ToolResult } from '../types';
+import type { ChatSendOptions, FileDownloadItem, ToolCall, ToolResult } from '../types';
 
 export type ApplicationPluginNavKey = `app:${string}`;
 
@@ -49,6 +49,7 @@ export interface ApplicationPluginTaskInputActionProps {
 
 export interface ApplicationPluginTaskRuntimeProps {
   sessionId: string | null;
+  onSendMessage?: (text: string, options?: ChatSendOptions) => void | Promise<boolean | void>;
   onConversationItem: (
     sessionId: string,
     role: 'user' | 'assistant',

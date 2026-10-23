@@ -102,7 +102,7 @@ export interface ChatHistoryPagerProps {
 }
 
 interface ChatPanelProps {
-  onSendMessage: (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions) => void;
+  onSendMessage: (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions) => void | Promise<boolean | void>;
   onEnsureSession: (initialTitle?: string) => Promise<string | null>;
   onForkSession: (
     sourceSessionId: string,
@@ -1807,6 +1807,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     >
       <ApplicationPluginTaskRuntimes
         sessionId={activeSessionId}
+        onSendMessage={(text, options) => onSendMessage(text, [], options)}
         onConversationItem={handlePluginConversationItem}
         onAssistantStream={handlePluginAssistantStream}
         onReasoning={handlePluginReasoning}
