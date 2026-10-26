@@ -56,7 +56,8 @@ detection of server-only closure while the connection stays open is not provided
 Replies stay in the existing Task conversation. Human-directed member replies
 and Leader final replies play in order using the configured **default voice**.
 The video-duplex plugin and its ASR/TTS providers must be configured. The frontend
-reuses `video.transcribe` and `tts.synthesize`; backend voice matching is deferred.
+reuses `video.transcribe` and `tts.synthesize`; per-member matching is not wired
+into that browser path yet.
 There is no standalone meeting sidebar destination or second conversation editor.
 
 Local speech-end detection reuses the full-duplex extension's Silero v5 worker,
@@ -75,7 +76,7 @@ Stopping or leaving the meeting releases the VAD worker, audio graph, and microp
 
 Still pending for the full RFC PR1: server-side Silero VAD and microphone
 streaming, supervisor recipient selection, JEV interruption filtering, per-agent
-voice configuration/matching, and a recorded real meeting demonstration. Speaking
+voice UI/browser integration, and a recorded real meeting demonstration. Speaking
 locks, spoken summaries, and A2A/broadcast narration remain PR2/PR3 work.
 
 Agent-side publication wiring is now implemented behind an internal host-consumer
@@ -92,11 +93,30 @@ completion releases the lease. Publication retry preserves the original token
 and message identity. Delivery/playback failures hold the turn. Meeting cleanup
 drains the worker and confirms consumer stop before closing the SDK coordinator.
 
-Browser startup does not enable that gate yet: TTS, browser transport, and actual
-playback acknowledgements remain deferred. Current browser narration therefore
+Browser startup does not enable that gate yet: coordinated TTS delivery, browser
+transport, and actual playback acknowledgements remain deferred. Browser narration
 retains the behavior described above. This increment supports native in-process
 members; process runtimes, Team plan mode, and unsupported rosters reject
 coordinated activation. No active-meeting polling was added.
+
+Host-enabled publication and grant scheduling now accept an optional
+`MemberVoiceRegistry` from `jiuwenswarm.common.voice_matching`. The host supplies
+the exact Qwen Omni model and a registry scoped to the native Team/session; no
+Gateway credentials are read by the meeting runtime. Existing roster bindings
+are initialized with the Leader first. The common member rail attaches an
+immutable `VoiceAssignment` for later native members and refreshes existing
+members before their next model call.
+
+Matching uses explicit preference, then an unused compatible voice, then the
+least-used voice with catalog order breaking ties. The packaged catalog is a
+curated Mandarin/English subset in `resources/voices/qwen_omni.yaml`. Reuse the
+same registry for the same native runtime to retain assignments across meetings;
+create a new one when that runtime is replaced. Catalog updates affect future
+assignments while retained bindings keep queued speech reproducible.
+`publication.voice_for_speech(request).provider_voice_id` supplies the voice
+argument for the Gateway TTS component. Lookup does not release the speaking
+lease or start audio. Browser playback wiring and process-restart restoration
+remain deferred; no registry means existing behavior is unchanged.
 
 Validation (from `jiuwenswarm/channels/web/frontend`):
 

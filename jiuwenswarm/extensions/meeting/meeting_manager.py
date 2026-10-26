@@ -18,6 +18,7 @@ from openjiuwen.agent_teams.meeting import (
 from jiuwenswarm.common.config import get_config
 
 if TYPE_CHECKING:
+    from jiuwenswarm.common.voice_matching import MemberVoiceRegistry
     from jiuwenswarm.agents.harness.team.team_manager import TeamManager
     from .grant_driver import MeetingGrantDriver, MeetingPlaybackConsumer
     from .participants import MeetingPublicationSession
@@ -85,6 +86,7 @@ class MeetingManager:
 
     async def enable_publication(
         self, session_id: str, meeting_id: str, *, on_queued: Callable[[], None],
+        voices: MemberVoiceRegistry | None = None,
     ) -> MeetingPublicationSession:
         """Internal host entry, not a browser RPC or a new mode setting.
 
@@ -95,7 +97,7 @@ class MeetingManager:
             raise ValueError("A meeting publication consumer wake-up callback is required")
         async with self._lock:
             meeting = self._require_publication_locked(session_id, meeting_id)
-            return await self._enable_publication_locked(session_id, meeting, on_queued)
+            return await self._enable_publication_locked(session_id, meeting, on_queued, voices)
 
     def _require_publication_locked(self, session_id: str, meeting_id: str) -> _Meeting:
         meeting = self._sessions.get(session_id)
@@ -109,12 +111,19 @@ class MeetingManager:
 
     async def _enable_publication_locked(
         self, session_id: str, meeting: _Meeting, on_queued: Callable[[], None],
+        voices: MemberVoiceRegistry | None = None,
     ) -> MeetingPublicationSession:
         from .participants import MeetingPublicationSession
 
+        if voices is not None and (
+            voices.session_id != session_id or voices.team_name != meeting.state.scope.team_name
+        ):
+            raise ValueError("Voice registry belongs to a different Team/session")
         if meeting.publication is not None:
             if meeting.publication.on_queued != on_queued or meeting.publication.closed:
                 raise ValueError("Meeting publication already has a consumer")
+            if voices is not None and meeting.publication.voices is not voices:
+                raise ValueError("Meeting publication already has a different voice registry")
             return meeting.publication
         team_agent = self._team_manager.get_team_agent(session_id)
         if getattr(getattr(team_agent, "spec", None), "spawn_mode", "inprocess") != "inprocess":
@@ -125,11 +134,17 @@ class MeetingManager:
         if any(member.role not in {"leader", "teammate"} for member in members):
             raise ValueError("Coordinated publication supports native in-process members only")
         assert meeting.coordinator is not None
-        meeting.publication = MeetingPublicationSession(meeting.coordinator, on_queued)
+        if voices is not None:
+            voices.assign_roster(
+                (member.member_name for member in members),
+                leader_id=meeting.state.leader_member_name,
+            )
+        meeting.publication = MeetingPublicationSession(meeting.coordinator, on_queued, voices=voices)
         return meeting.publication
 
     async def enable_grant_driver(
         self, session_id: str, meeting_id: str, *, consumer: MeetingPlaybackConsumer,
+        voices: MemberVoiceRegistry | None = None,
     ) -> MeetingGrantDriver:
         """Internal host attachment; browser startup stays unchanged until transport exists."""
         from .grant_driver import MeetingGrantDriver
@@ -139,6 +154,8 @@ class MeetingManager:
             if meeting.driver is not None:
                 if meeting.driver.consumer is not consumer or meeting.driver.state.phase in {"closing", "closed"}:
                     raise ValueError("Meeting grant driver already has a consumer")
+                if voices is not None and meeting.publication.voices is not voices:
+                    raise ValueError("Meeting grant driver already has a different voice registry")
                 return meeting.driver
             assert meeting.coordinator is not None
             state = await meeting.coordinator.get_state()
@@ -148,7 +165,7 @@ class MeetingManager:
                 meeting.coordinator, consumer,
                 is_current=lambda: self._driver_is_current(session_id, meeting),
             )
-            await self._enable_publication_locked(session_id, meeting, driver.wake)
+            await self._enable_publication_locked(session_id, meeting, driver.wake, voices)
             meeting.driver = driver
             driver.start()
             return driver

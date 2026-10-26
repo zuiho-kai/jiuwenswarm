@@ -1,0 +1,37 @@
+# Curated Mandarin/English subset, verified against the official Omni catalog.
+# This is not the separate Qwen TTS or JoyAI voice catalog.
+version: qwen-omni-2026-10-26
+source: https://www.alibabacloud.com/help/en/model-studio/omni-voice-list
+voices:
+  - id: tina
+    provider_voice_id: Tina
+    models: &modern
+      - qwen3.8-omni-flash-realtime
+      - qwen3.5-omni-flash-realtime
+      - qwen3.5-omni-plus-realtime
+    languages: &bilingual [en, zh-CN]
+    description: Warm, clear female voice.
+  - id: serena
+    provider_voice_id: Serena
+    models: *modern
+    languages: *bilingual
+    description: Gentle female voice.
+  - id: ryan
+    provider_voice_id: Ryan
+    models: &shared
+      - qwen3.8-omni-flash-realtime
+      - qwen3.5-omni-flash-realtime
+      - qwen3.5-omni-plus-realtime
+      - qwen3-omni-flash-realtime-2025-09-15
+    languages: *bilingual
+    description: Energetic male voice.
+  - id: katerina
+    provider_voice_id: Katerina
+    models: *shared
+    languages: *bilingual
+    description: Mature female voice.
+  - id: jennifer
+    provider_voice_id: Jennifer
+    models: *shared
+    languages: *bilingual
+    description: American female voice.

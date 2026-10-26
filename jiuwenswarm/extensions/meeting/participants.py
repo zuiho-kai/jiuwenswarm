@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -14,6 +14,9 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 
 from .publication import MeetingPublicationRail, create_meeting_publication_rail
 
+if TYPE_CHECKING:
+    from openjiuwen.agent_teams.schema.meeting import SpeechRequest
+    from jiuwenswarm.common.voice_matching import MemberVoiceRegistry, VoiceAssignment
 
 _POLICY = "_meeting_member_publication_policy"
 logger = logging.getLogger(__name__)
@@ -22,17 +25,37 @@ logger = logging.getLogger(__name__)
 class MeetingPublicationSession:
     """A host-enabled scope, created only after a consumer can wake on admission."""
 
-    def __init__(self, coordinator: MeetingCoordinator, on_queued: Callable[[], None]) -> None:
+    def __init__(
+        self, coordinator: MeetingCoordinator, on_queued: Callable[[], None], *,
+        voices: MemberVoiceRegistry | None = None,
+    ) -> None:
         if not callable(on_queued):
             raise ValueError("A meeting publication consumer wake-up callback is required")
+        if voices is not None and (
+            voices.session_id != coordinator.scope.session_id or voices.team_name != coordinator.scope.team_name
+        ):
+            raise ValueError("Voice registry belongs to a different Team/session")
         self.coordinator = coordinator
         self.on_queued = on_queued
+        self.voices = voices
         self.closed = False
         self._members: set[MeetingPublicationRail] = set()
+
+    def voice_for_speech(self, request: SpeechRequest) -> VoiceAssignment:
+        """Resolve a granted request's canonical speaker to its immutable voice.
+
+        A transport consumer passes provider_voice_id to TTS on Gateway. This
+        lookup performs no synthesis and never changes queue/lease ownership.
+        """
+        if self.closed or request.scope != self.coordinator.scope or self.voices is None:
+            raise ValueError("Speech voice requires the matching active publication scope")
+        return self.voices.get_voice(request.member_name)
 
     async def attach(self, agent: Any, member_name: str, language: str) -> MeetingPublicationRail:
         if self.closed:
             raise ValueError("Meeting publication scope has ended")
+        if self.voices is not None:
+            self.voices.assign_voice(member_name, language=language)
         policy = await create_meeting_publication_rail(
             self.coordinator, member_name, language=language, on_queued=self.on_queued,
         )
@@ -83,9 +106,13 @@ class MeetingParticipantRail(DeepAgentRail):
         self._agent: Any = None
         self._session: MeetingPublicationSession | None = None
         self._policy: MeetingPublicationRail | None = None
+        self.voice_assignment: VoiceAssignment | None = None
 
     def init(self, agent: Any) -> None:
         self._agent = agent
+        session = self._resolve(self._session_id, self._team_name)
+        if session is not None and session.voices is not None:
+            self.voice_assignment = session.voices.assign_voice(self._member_name, language=self._language)
 
     def uninit(self, agent: Any) -> None:
         if self._session is not None and self._policy is not None:
@@ -93,6 +120,7 @@ class MeetingParticipantRail(DeepAgentRail):
         self._session = None
         self._policy = None
         self._agent = None
+        self.voice_assignment = None
 
     @staticmethod
     def _stop(ctx: AgentCallbackContext) -> None:
@@ -114,6 +142,8 @@ class MeetingParticipantRail(DeepAgentRail):
         if session is None:
             return
         try:
+            if session.voices is not None:
+                self.voice_assignment = session.voices.assign_voice(self._member_name, language=self._language)
             if self._policy is None:
                 self._policy = await session.attach(self._agent, self._member_name, self._language)
                 if isinstance(ctx.inputs, ModelCallInputs) and not ctx.extra.get("_finalizing_max_iterations"):
