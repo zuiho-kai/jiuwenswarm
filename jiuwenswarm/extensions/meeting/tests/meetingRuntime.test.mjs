@@ -71,14 +71,11 @@ test('ending a meeting discards late synthesis and releases microphone',async()=
   await tick();assert.equal(played,0);assert.ok(h.track.stopped);assert.equal(h.handlers.size,0);
 });
 
-test('starting meeting capture never sends a chat message',async()=>{
+test('recording uses existing ASR and returns the transcript without sending chat',async()=>{
   const h=harness();await h.meeting.start();h.meeting.startRecording();
-  assert.ok(!h.requests.some(r=>r.name==='chat.send'));h.meeting.stop();
-});
-
-test('recording uses existing ASR and leaves transcript for review',async()=>{
-  const h=harness();await h.meeting.start();h.meeting.startRecording();
-  assert.equal(h.states.at(-1),'recording');h.meeting.stopRecording();await tick();
+  assert.equal(h.states.at(-1),'recording');
+  assert.ok(!h.requests.some(r=>r.name==='chat.send'));
+  h.meeting.stopRecording();await tick();
   assert.equal(h.states.at(-1),'transcribing');
   assert.ok(h.requests.find(r=>r.name==='video.transcribe').params.audio_data_url.startsWith('data:audio/webm'));
   h.resolvers['video.transcribe']({transcript:'Review this'});await tick();

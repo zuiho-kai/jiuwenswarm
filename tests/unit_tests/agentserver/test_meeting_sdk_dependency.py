@@ -5,24 +5,6 @@ import sys
 import textwrap
 
 
-def test_installed_sdk_exposes_meeting_api_without_pythonpath():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            "from openjiuwen.agent_teams.meeting import "
-            "MeetingCoordinator, MeetingScope, MeetingState",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=90,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
-
-
 def test_installed_sdk_initial_message_prepares_leader_only_meeting_without_a_model_turn():
     result = subprocess.run(
         [sys.executable, "-I", "-X", "utf8", "-c", textwrap.dedent(r'''
@@ -34,7 +16,7 @@ def test_installed_sdk_initial_message_prepares_leader_only_meeting_without_a_mo
             from unittest.mock import AsyncMock
 
             from openjiuwen.agent_teams import DeepAgentSpec, StorageSpec, TeamAgentSpec
-            from openjiuwen.agent_teams.meeting import MeetingCoordinator, MeetingScope
+            from openjiuwen.agent_teams.meeting import MeetingCoordinator, MeetingScope, MeetingState
             from openjiuwen.agent_teams.paths import set_task_openjiuwen_home, reset_task_openjiuwen_home
             from openjiuwen.core.runner import Runner
             from openjiuwen.core.runner.runner import GLOBAL_RUNNER
@@ -95,6 +77,7 @@ def test_installed_sdk_initial_message_prepares_leader_only_meeting_without_a_mo
                         conversation=conversation,
                     )
                     state = await coordinator.start()
+                    assert isinstance(state, MeetingState)
                     assert state.leader_member_name == spec.leader.member_name and not state.closed
                     await coordinator.close()
                 finally:

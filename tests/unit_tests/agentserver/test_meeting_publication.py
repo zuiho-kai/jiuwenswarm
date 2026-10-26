@@ -31,11 +31,14 @@ from jiuwenswarm.extensions.meeting.publication import create_meeting_publicatio
 
 
 @pytest.fixture
-async def meeting(tmp_path):
+async def meeting(tmp_path, request):
     workspace = Path(f"\\\\?\\{tmp_path}") if sys.platform == "win32" else tmp_path
     home_token = set_task_openjiuwen_home(workspace)
     session_token = set_session_id("publication-session")
-    database = TeamDatabase(DatabaseConfig(connection_string=":memory:"))
+    # Cancellation can invalidate the in-memory SQLite connection. Driver
+    # teardown tests use the same durable file-backed backend as the app.
+    connection = str(tmp_path / "meeting.db") if getattr(request, "param", None) == "file" else ":memory:"
+    database = TeamDatabase(DatabaseConfig(connection_string=connection))
     await database.initialize()
     try:
         await database.team.create_team("publication-team", "Publication Team", "leader")
@@ -129,85 +132,71 @@ async def _cleanup(native):
     native.agent.ability_manager.teardown_tools()
 
 
+@pytest.fixture
+async def native_factory(meeting, monkeypatch):
+    natives = []
+
+    async def create(member="leader", **kwargs):
+        native = await _native(meeting, monkeypatch, member, **kwargs)
+        natives.append(native)
+        return native
+
+    yield create
+    for native in reversed(natives):
+        await _cleanup(native)
+
+
 @pytest.mark.asyncio
-async def test_real_native_corrects_plain_final_and_only_grant_publishes(meeting, monkeypatch):
-    native = await _native(meeting, monkeypatch)
+async def test_real_native_corrects_plain_final_and_only_grant_publishes(meeting, native_factory):
+    native = await native_factory()
     native.model.invoke.side_effect = [
         AssistantMessage(content="Ungated draft must not become public"),
         _post_call(), AssistantMessage(content="Complete explanation"),
     ]
-    try:
-        result = await native.agent.invoke({"query": "Review the proposal"}, session=native.session, _streaming=True)
-        assert result == {"output": "", "result_type": "answer", "meeting_queued": True}
-        native.model.stream.assert_not_called()
-        assert native.model.invoke.await_count == 3
-        assert all(call.args[0].type not in {"llm_output", "llm_reasoning"} for call in native.session.write_stream.await_args_list)
-        for call in native.model.invoke.await_args_list:
-            assert not {tool.name for tool in call.kwargs["tools"]} & native.ordinary.keys()
-            assert any("meeting_post_message" in str(message.content) for message in call.kwargs["messages"])
-        assert len(await meeting.coordinator.list_pending()) == 1
-        assert await meeting.db.message.get_team_messages("publication-team") == []
-        assert await meeting.db.message.get_broadcast_messages("publication-team", "analyst") == []
-        assert not meeting.conversation.history_path.exists()
-        meeting.manager.messager.publish.assert_not_awaited()
-        grant = await meeting.coordinator.grant_next()
-        assert grant.content == "Complete explanation" and grant.speech_text == "Short spoken result"
-        assert grant.delivery_error is None
-        assert len(await meeting.db.message.get_team_messages("publication-team")) == 1
-        history = meeting.conversation.history_path.read_text(encoding="utf-8")
-        assert "Complete explanation" in history and "Ungated draft" not in history
-        assert await meeting.coordinator.grant_next() is None
-        assert await meeting.coordinator.complete_playback(grant.lease_token)
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Review the proposal"}, session=native.session, _streaming=True)
+    assert result == {"output": "", "result_type": "answer", "meeting_queued": True}
+    native.model.stream.assert_not_called()
+    assert native.model.invoke.await_count == 3
+    assert all(call.args[0].type not in {"llm_output", "llm_reasoning"} for call in native.session.write_stream.await_args_list)
+    for call in native.model.invoke.await_args_list:
+        assert not {tool.name for tool in call.kwargs["tools"]} & native.ordinary.keys()
+        assert any("meeting_post_message" in str(message.content) for message in call.kwargs["messages"])
+    assert len(await meeting.coordinator.list_pending()) == 1
+    assert await meeting.db.message.get_team_messages("publication-team") == []
+    assert await meeting.db.message.get_broadcast_messages("publication-team", "analyst") == []
+    assert not meeting.conversation.history_path.exists()
+    meeting.manager.messager.publish.assert_not_awaited()
+    grant = await meeting.coordinator.grant_next()
+    assert grant.content == "Complete explanation" and grant.speech_text == "Short spoken result"
+    assert grant.delivery_error is None
+    assert len(await meeting.db.message.get_team_messages("publication-team")) == 1
+    history = meeting.conversation.history_path.read_text(encoding="utf-8")
+    assert "Complete explanation" in history and "Ungated draft" not in history
+    assert await meeting.coordinator.grant_next() is None
+    assert await meeting.coordinator.complete_playback(grant.lease_token)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", ["send_message", "group_send_message", "ask_user_question"])
-async def test_cached_unrestricted_tool_call_is_rejected_before_execution(meeting, monkeypatch, name):
-    native = await _native(meeting, monkeypatch)
-    native.model.invoke.side_effect = [
-        AssistantMessage(content="", tool_calls=[ToolCall(type="function", id="bypass", name=name, arguments="{}")]),
-        _post_call(), AssistantMessage(content=""),
-    ]
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["meeting_queued"]
-        assert native.ordinary[name].sent == []
-        assert len(await meeting.coordinator.list_pending()) == 1
-        assert await meeting.db.message.get_team_messages("publication-team") == []
-        assert any("meeting_post_message" in str(message.content) for message in native.messages)
-    finally:
-        await _cleanup(native)
-
-
-@pytest.mark.asyncio
-async def test_missing_summary_can_be_corrected_without_admitting_bad_message(meeting, monkeypatch):
-    native = await _native(meeting, monkeypatch)
+async def test_missing_summary_can_be_corrected_without_admitting_bad_message(meeting, native_factory):
+    native = await native_factory()
     native.model.invoke.side_effect = [
         _post_call(speech_text="  "), _post_call(), AssistantMessage(content=""),
     ]
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session)
-        assert result["meeting_queued"]
-        assert len(await meeting.coordinator.list_pending()) == 1
-        assert any("nonblank" in str(message.content) for message in native.messages)
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session)
+    assert result["meeting_queued"]
+    assert len(await meeting.coordinator.list_pending()) == 1
+    assert any("nonblank" in str(message.content) for message in native.messages)
 
 
 @pytest.mark.asyncio
-async def test_repeated_plain_answers_fail_with_bounded_correction(meeting, monkeypatch):
-    native = await _native(meeting, monkeypatch)
+async def test_repeated_plain_answers_fail_with_bounded_correction(meeting, native_factory):
+    native = await native_factory()
     native.model.invoke.side_effect = [AssistantMessage(content="Not submitted") for _ in range(3)]
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["result_type"] == "error" and result["meeting_error"] == "missing_meeting_post"
-        assert native.model.invoke.await_count == 3
-        assert await meeting.coordinator.list_pending() == ()
-        assert not meeting.conversation.history_path.exists()
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["result_type"] == "error" and result["meeting_error"] == "missing_meeting_post"
+    assert native.model.invoke.await_count == 3
+    assert await meeting.coordinator.list_pending() == ()
+    assert not meeting.conversation.history_path.exists()
 
 
 @pytest.mark.asyncio
@@ -236,22 +225,6 @@ async def test_removal_restores_normal_streaming_and_rejects_retained_tool(meeti
 
 
 @pytest.mark.asyncio
-async def test_member_added_after_start_gets_bound_identity_and_no_interrupt_tool(meeting, monkeypatch):
-    await meeting.db.member.create_member("new-member", "publication-team", "New", "{}", "ready", role="teammate")
-    native = await _native(meeting, monkeypatch, "new-member")
-    native.model.invoke.side_effect = [_post_call(mentions=["leader"]), AssistantMessage(content="")]
-    try:
-        await native.agent.invoke({"query": "Report"}, session=native.session)
-        queued, = await meeting.coordinator.list_pending()
-        assert queued.member_name == "new-member" and queued.mentions == ("leader",)
-        names = {tool.name for tool in await native.agent.ability_manager.list_tool_info()}
-        assert "meeting_interrupt_speech" not in names
-        assert "Host the discussion" not in native.agent.system_prompt_builder.build()
-    finally:
-        await _cleanup(native)
-
-
-@pytest.mark.asyncio
 async def test_ended_coordinator_rejects_tools_and_factory(meeting):
     rail = await create_meeting_publication_rail(meeting.coordinator, "leader")
     assert "meeting_interrupt_speech" not in rail._tools
@@ -269,54 +242,45 @@ async def test_factory_rejects_unregistered_identity(meeting):
 
 
 @pytest.mark.asyncio
-async def test_new_conclusion_after_an_earlier_post_is_corrected_not_discarded(meeting, monkeypatch):
-    native = await _native(meeting, monkeypatch)
+async def test_new_conclusion_after_an_earlier_post_is_corrected_not_discarded(meeting, native_factory):
+    native = await native_factory()
     native.model.invoke.side_effect = [
         _post_call(), AssistantMessage(content="A new conclusion"),
         _post_call(content="A new conclusion", speech_text="New spoken conclusion"), AssistantMessage(content=""),
     ]
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["meeting_queued"]
-        assert {request.content for request in await meeting.coordinator.list_pending()} == {
-            "Complete explanation", "A new conclusion",
-        }
-        assert not meeting.conversation.history_path.exists()
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["meeting_queued"]
+    assert {request.content for request in await meeting.coordinator.list_pending()} == {
+        "Complete explanation", "A new conclusion",
+    }
+    assert not meeting.conversation.history_path.exists()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("unavailable", ["closed", "storage_failure"])
-async def test_unavailable_meeting_stops_before_model_or_tools_execute(meeting, monkeypatch, unavailable):
-    native = await _native(meeting, monkeypatch)
+async def test_unavailable_meeting_stops_before_model_or_tools_execute(meeting, monkeypatch, unavailable, native_factory):
+    native = await native_factory()
     if unavailable == "closed":
         await meeting.coordinator.close()
     else:
         monkeypatch.setattr(meeting.coordinator, "get_state", AsyncMock(side_effect=OSError("unavailable")))
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["result_type"] == "error" and result["meeting_error"] == "meeting_unavailable"
-        native.model.invoke.assert_not_awaited()
-        native.model.stream.assert_not_called()
-        assert all(not tool.sent for tool in native.ordinary.values())
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["result_type"] == "error" and result["meeting_error"] == "meeting_unavailable"
+    native.model.invoke.assert_not_awaited()
+    native.model.stream.assert_not_called()
+    assert all(not tool.sent for tool in native.ordinary.values())
 
 
 @pytest.mark.asyncio
-async def test_iteration_limit_final_answer_cannot_escape_without_a_post(meeting, monkeypatch):
-    native = await _native(meeting, monkeypatch, max_iterations=1)
+async def test_iteration_limit_final_answer_cannot_escape_without_a_post(meeting, native_factory):
+    native = await native_factory(max_iterations=1)
     native.agent.config.on_max_iterations = "final_answer"
     native.model.invoke.side_effect = [AssistantMessage(content="Unqueued draft"), AssistantMessage(content="Final bypass")]
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["meeting_error"] == "missing_meeting_post"
-        assert await meeting.coordinator.list_pending() == ()
-        assert not meeting.conversation.history_path.exists()
-        assert not any(call.args[0].type == "llm_output" for call in native.session.write_stream.await_args_list)
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["meeting_error"] == "missing_meeting_post"
+    assert await meeting.coordinator.list_pending() == ()
+    assert not meeting.conversation.history_path.exists()
+    assert not any(call.args[0].type == "llm_output" for call in native.session.write_stream.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -354,17 +318,14 @@ async def test_deep_agent_registration_bridges_the_publication_hooks(meeting, mo
 
 
 @pytest.mark.asyncio
-async def test_second_scope_cannot_overwrite_a_members_tools(meeting, monkeypatch):
-    native = await _native(meeting, monkeypatch)
+async def test_second_scope_cannot_overwrite_a_members_tools(meeting, native_factory):
+    native = await native_factory()
     second = await create_meeting_publication_rail(meeting.coordinator, "leader")
-    try:
-        with pytest.raises(ValueError, match="already has"):
-            await native.agent.register_rail(second)
-        native.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session)
-        assert result["meeting_queued"]
-    finally:
-        await _cleanup(native)
+    with pytest.raises(ValueError, match="already has"):
+        await native.agent.register_rail(second)
+    native.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session)
+    assert result["meeting_queued"]
 
 
 @pytest.fixture
@@ -399,42 +360,40 @@ async def _enable_host(host, on_queued):
 
 @pytest.mark.asyncio
 async def test_production_provider_mounts_all_three_tools_for_leader_and_later_member(
-    meeting, publication_host, monkeypatch,
+    meeting, publication_host, native_factory,
 ):
     wakeups = []
     scope = await _enable_host(publication_host, lambda: wakeups.append("queued"))
-    leader = await _native(meeting, monkeypatch, participant=True)
+    leader = await native_factory(participant=True)
     leader.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
-    later = None
-    try:
-        result = await leader.agent.invoke({"query": "Discuss"}, session=leader.session, _streaming=True)
-        assert result["meeting_queued"]
-        schemas = {tool.name: tool for tool in leader.model.invoke.await_args_list[0].kwargs["tools"]}
-        assert {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"} <= schemas.keys()
-        assert schemas["meeting_read_history"].parameters["properties"]["limit"]["maximum"] == 100
-        assert "send_message" not in schemas and "group_send_message" not in schemas
-        assert "same language" in schemas["meeting_post_message"].description
-        first_messages = leader.model.invoke.await_args_list[0].kwargs["messages"]
-        assert any("A coordinated meeting is active" in str(message.content) for message in first_messages)
-        assert any("Host the discussion" in str(message.content) for message in first_messages)
-        assert "Host the discussion" in leader.agent.system_prompt_builder.build()
-        await meeting.db.member.create_member("later", "publication-team", "Later", "{}", "ready", role="teammate")
-        later = await _native(meeting, monkeypatch, "later", participant=True)
-        later.model.invoke.side_effect = [_post_call(content="Later report", mentions=["leader"]), AssistantMessage(content="")]
-        await later.agent.invoke({"query": "Report"}, session=later.session, _streaming=True)
-        assert "Host the discussion" not in later.agent.system_prompt_builder.build()
-        assert {item.member_name for item in await scope.coordinator.list_pending()} == {"leader", "later"}
-        assert wakeups == ["queued", "queued"]
-        assert not meeting.conversation.history_path.exists()
-        assert await meeting.db.message.get_team_messages("publication-team") == []
-    finally:
-        if later is not None:
-            await _cleanup(later)
-        await _cleanup(leader)
+    result = await leader.agent.invoke({"query": "Discuss"}, session=leader.session, _streaming=True)
+    assert result["meeting_queued"]
+    schemas = {tool.name: tool for tool in leader.model.invoke.await_args_list[0].kwargs["tools"]}
+    assert {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"} <= schemas.keys()
+    assert schemas["meeting_read_history"].parameters["properties"]["limit"]["maximum"] == 100
+    assert "send_message" not in schemas and "group_send_message" not in schemas
+    assert "same language" in schemas["meeting_post_message"].description
+    first_messages = leader.model.invoke.await_args_list[0].kwargs["messages"]
+    assert any("A coordinated meeting is active" in str(message.content) for message in first_messages)
+    assert any("Host the discussion" in str(message.content) for message in first_messages)
+    assert "Host the discussion" in leader.agent.system_prompt_builder.build()
+    await meeting.db.member.create_member("later", "publication-team", "Later", "{}", "ready", role="teammate")
+    later = await native_factory("later", participant=True)
+    later.model.invoke.side_effect = [_post_call(content="Later report", mentions=["leader"]), AssistantMessage(content="")]
+    await later.agent.invoke({"query": "Report"}, session=later.session, _streaming=True)
+    assert "Host the discussion" not in later.agent.system_prompt_builder.build()
+    assert {item.member_name for item in await scope.coordinator.list_pending()} == {"leader", "later"}
+    for native in (leader, later):
+        assert "meeting_interrupt_speech" not in {tool.name for tool in await native.agent.ability_manager.list_tool_info()}
+    later_request = next(item for item in await scope.coordinator.list_pending() if item.member_name == "later")
+    assert later_request.mentions == ("leader",)
+    assert wakeups == ["queued", "queued"]
+    assert not meeting.conversation.history_path.exists()
+    assert await meeting.db.message.get_team_messages("publication-team") == []
 
 
 @pytest.mark.asyncio
-async def test_history_tool_is_exposed_and_reads_without_acknowledging_mailbox(meeting, publication_host, monkeypatch):
+async def test_history_tool_is_exposed_and_reads_without_acknowledging_mailbox(meeting, publication_host, native_factory):
     scope = await _enable_host(publication_host, lambda: None)
     await scope.coordinator.for_member("analyst").post_message(
         "Previously published context", speech_text="Prior context", mentions=["leader"],
@@ -442,115 +401,107 @@ async def test_history_tool_is_exposed_and_reads_without_acknowledging_mailbox(m
     grant = await scope.coordinator.grant_next()
     await scope.coordinator.complete_playback(grant.lease_token)
     before = await meeting.db.message.get_broadcast_messages("publication-team", "leader", unread_only=True)
-    leader = await _native(meeting, monkeypatch, participant=True)
+    leader = await native_factory(participant=True)
     leader.model.invoke.side_effect = [
         AssistantMessage(content="", tool_calls=[ToolCall(
             type="function", id="read-context", name="meeting_read_history", arguments='{"limit":5}',
         )]), _post_call(), AssistantMessage(content=""),
     ]
-    try:
-        await leader.agent.invoke({"query": "Recall"}, session=leader.session)
-        assert any("Previously published context" in str(message.content) for message in leader.messages)
-        after = await meeting.db.message.get_broadcast_messages("publication-team", "leader", unread_only=True)
-        assert [message.message_id for message in after] == [message.message_id for message in before]
-    finally:
-        await _cleanup(leader)
+    await leader.agent.invoke({"query": "Recall"}, session=leader.session)
+    assert any("Previously published context" in str(message.content) for message in leader.messages)
+    after = await meeting.db.message.get_broadcast_messages("publication-team", "leader", unread_only=True)
+    assert [message.message_id for message in after] == [message.message_id for message in before]
 
 
 @pytest.mark.asyncio
-async def test_normal_meeting_start_without_consumer_keeps_ordinary_behavior(meeting, publication_host, monkeypatch):
-    native = await _native(meeting, monkeypatch, participant=True)
+async def test_normal_meeting_start_without_consumer_keeps_ordinary_behavior(publication_host, native_factory):
+    native = await native_factory(participant=True)
 
     async def stream(**kwargs):
         assert not any(tool.name.startswith("meeting_") for tool in kwargs["tools"])
         yield AssistantMessageChunk(content="Ordinary streaming reply")
 
     native.model.stream.side_effect = stream
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["output"] == "Ordinary streaming reply"
-        assert native.agent.system_prompt_builder.get_section("meeting_publication") is None
-        assert publication_host.manager.publication_for_session("publication-session", "publication-team") is None
-        with pytest.raises(ValueError, match="consumer"):
-            await _enable_host(publication_host, None)
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["output"] == "Ordinary streaming reply"
+    assert native.agent.system_prompt_builder.get_section("meeting_publication") is None
+    assert publication_host.manager.publication_for_session("publication-session", "publication-team") is None
+    with pytest.raises(ValueError, match="consumer"):
+        await _enable_host(publication_host, None)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("closure", ["end", "feature_off", "runtime_replaced"])
-async def test_closure_removes_tools_and_guidance_from_existing_native(meeting, publication_host, monkeypatch, closure):
+async def test_closure_removes_tools_and_guidance_from_existing_native(publication_host, closure, native_factory):
     scope = await _enable_host(publication_host, lambda: None)
-    native = await _native(meeting, monkeypatch, participant=True)
+    native = await native_factory(participant=True)
     native.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
-    try:
-        await native.agent.invoke({"query": "Discuss"}, session=native.session)
-        retained = native.rail._policy._tools["meeting_post_message"]
-        if closure == "end":
-            assert await publication_host.manager.end("publication-session", publication_host.state.scope.meeting_id)
+    await native.agent.invoke({"query": "Discuss"}, session=native.session)
+    retained = native.rail._policy._tools["meeting_post_message"]
+    if closure == "end":
+        assert await publication_host.manager.end("publication-session", publication_host.state.scope.meeting_id)
+    else:
+        if closure == "feature_off":
+            publication_host.flags.enabled = False
         else:
-            if closure == "feature_off":
-                publication_host.flags.enabled = False
-            else:
-                publication_host.flags.active = False
-            assert publication_host.manager.publication_for_session("publication-session", "publication-team") is None
-        assert scope.closed
-        assert native.agent.system_prompt_builder.get_section("meeting_publication") is None
-        assert not any(tool.name.startswith("meeting_") for tool in await native.agent.ability_manager.list_tool_info())
-        assert not (await retained.invoke({"content": "Late", "speech_text": "Late"})).success
+            publication_host.flags.active = False
+        assert publication_host.manager.publication_for_session("publication-session", "publication-team") is None
+    assert scope.closed
+    assert native.agent.system_prompt_builder.get_section("meeting_publication") is None
+    assert not any(tool.name.startswith("meeting_") for tool in await native.agent.ability_manager.list_tool_info())
+    assert not (await retained.invoke({"content": "Late", "speech_text": "Late"})).success
 
-        async def stream(**kwargs):
-            yield AssistantMessageChunk(content="Normal after meeting")
+    async def stream(**kwargs):
+        yield AssistantMessageChunk(content="Normal after meeting")
 
-        native.model.stream.side_effect = stream
-        result = await native.agent.invoke({"query": "Continue"}, session=native.session, _streaming=True)
-        assert result["output"] == "Normal after meeting"
-    finally:
-        await _cleanup(native)
+    native.model.stream.side_effect = stream
+    result = await native.agent.invoke({"query": "Continue"}, session=native.session, _streaming=True)
+    assert result["output"] == "Normal after meeting"
 
 
 @pytest.mark.asyncio
-async def test_end_during_model_call_cannot_publish_or_fall_back(meeting, publication_host, monkeypatch):
+async def test_end_during_model_call_cannot_publish_or_fall_back(meeting, publication_host, native_factory):
     await _enable_host(publication_host, lambda: None)
-    native = await _native(meeting, monkeypatch, participant=True)
+    native = await native_factory(participant=True)
 
     async def end_while_thinking(**kwargs):
         await publication_host.manager.end("publication-session", publication_host.state.scope.meeting_id)
         return AssistantMessage(content="Late final must not escape")
 
     native.model.invoke.side_effect = end_while_thinking
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["result_type"] == "error"
-        assert "Late final" not in result["output"]
-        assert not meeting.conversation.history_path.exists()
-        native.model.stream.assert_not_called()
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["result_type"] == "error"
+    assert "Late final" not in result["output"]
+    assert not meeting.conversation.history_path.exists()
+    native.model.stream.assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", [
-    "send_file_to_user", "spawn_external_cli", "spawn_bridge_agent", "spawn_human_agent",
-    "swarmflow", "org_send_leader_message", "org_delegate_task",
-    "org_create_task", "session_new", "session_send_message",
+@pytest.mark.parametrize("name,error", [
+    (name, "meeting_post_message")
+    for name in ("send_message", "group_send_message", "ask_user_question")
+] + [
+    (name, "not supported") for name in (
+        "send_file_to_user", "spawn_external_cli", "spawn_bridge_agent", "spawn_human_agent",
+        "swarmflow", "org_send_leader_message", "org_delegate_task",
+        "org_create_task", "session_new", "session_send_message",
+    )
 ])
-async def test_unsupported_publication_and_runtime_side_effects_are_blocked(meeting, publication_host, monkeypatch, name):
-    await _enable_host(publication_host, lambda: None)
-    native = await _native(meeting, monkeypatch, participant=True)
+async def test_cached_tools_cannot_bypass_publication(meeting, publication_host, name, error, native_factory):
+    scope = await _enable_host(publication_host, lambda: None)
+    native = await native_factory(participant=True)
     side_effect = _OrdinarySend(name)
     native.agent.ability_manager.add_ability(side_effect.card, side_effect)
     native.model.invoke.side_effect = [
         AssistantMessage(content="", tool_calls=[ToolCall(type="function", id="unsupported", name=name, arguments="{}")]),
         _post_call(), AssistantMessage(content=""),
     ]
-    try:
-        result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-        assert result["meeting_queued"]
-        assert side_effect.sent == []
-        assert any("not supported" in str(message.content) for message in native.messages)
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
+    assert result["meeting_queued"]
+    assert side_effect.sent == []
+    assert any(error in str(message.content) for message in native.messages)
+    assert len(await scope.coordinator.list_pending()) == 1
+    assert await meeting.db.message.get_team_messages("publication-team") == []
 
 
 @pytest.mark.asyncio
@@ -595,11 +546,11 @@ async def test_host_rejects_execution_modes_without_the_native_meeting_contract(
 
 
 @pytest.mark.asyncio
-async def test_installation_does_not_restore_tools_hidden_by_another_rail(meeting, publication_host, monkeypatch):
+async def test_installation_does_not_restore_tools_hidden_by_another_rail(publication_host, native_factory):
     from openjiuwen.core.single_agent.rail.base import AgentCallbackEvent
 
     await _enable_host(publication_host, lambda: None)
-    native = await _native(meeting, monkeypatch, participant=True)
+    native = await native_factory(participant=True)
     hidden = _OrdinarySend("unrelated_hidden_tool")
     native.agent.ability_manager.add_ability(hidden.card, hidden)
 
@@ -608,18 +559,15 @@ async def test_installation_does_not_restore_tools_hidden_by_another_rail(meetin
 
     await native.agent.register_callback(AgentCallbackEvent.BEFORE_MODEL_CALL, filter_other_capability, priority=1)
     native.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
-    try:
-        await native.agent.invoke({"query": "Discuss"}, session=native.session)
-        for call in native.model.invoke.await_args_list:
-            names = {tool.name for tool in call.kwargs["tools"]}
-            assert hidden.card.name not in names
-            assert "meeting_post_message" in names
-    finally:
-        await _cleanup(native)
+    await native.agent.invoke({"query": "Discuss"}, session=native.session)
+    for call in native.model.invoke.await_args_list:
+        names = {tool.name for tool in call.kwargs["tools"]}
+        assert hidden.card.name not in names
+        assert "meeting_post_message" in names
 
 
 @pytest.mark.asyncio
-async def test_task_completion_control_event_does_not_need_speaking_ownership(meeting, publication_host, monkeypatch):
+async def test_task_completion_control_event_does_not_need_speaking_ownership(meeting, publication_host, native_factory):
     from openjiuwen.agent_teams.tools.task_manager import TeamTaskManager
     from openjiuwen.agent_teams.tools.tool_task import MemberCompleteTaskTool
     from openjiuwen.agent_teams.tools.locales import make_translator
@@ -629,7 +577,7 @@ async def test_task_completion_control_event_does_not_need_speaking_ownership(me
     created = await tasks.add("Review", "Review the proposal")
     assert created.ok
     assert (await tasks.claim(created.task.task_id)).ok
-    native = await _native(meeting, monkeypatch, "analyst", participant=True)
+    native = await native_factory("analyst", participant=True)
     native.agent.ability_manager.add_ability(
         (tool := MemberCompleteTaskTool(tasks, make_translator("en"))).card, tool,
     )
@@ -639,11 +587,8 @@ async def test_task_completion_control_event_does_not_need_speaking_ownership(me
             arguments=json.dumps({"task_id": created.task.task_id, "note": "Control metadata"}),
         )]), _post_call(mentions=["leader"]), AssistantMessage(content=""),
     ]
-    try:
-        result = await native.agent.invoke({"query": "Finish and report"}, session=native.session)
-        assert result["meeting_queued"]
-        assert (await tasks.get(created.task.task_id)).status == "completed"
-        assert len(await scope.coordinator.list_pending()) == 1
-        assert not meeting.conversation.history_path.exists()
-    finally:
-        await _cleanup(native)
+    result = await native.agent.invoke({"query": "Finish and report"}, session=native.session)
+    assert result["meeting_queued"]
+    assert (await tasks.get(created.task.task_id)).status == "completed"
+    assert len(await scope.coordinator.list_pending()) == 1
+    assert not meeting.conversation.history_path.exists()

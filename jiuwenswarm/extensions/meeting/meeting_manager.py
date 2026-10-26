@@ -19,6 +19,7 @@ from jiuwenswarm.common.config import get_config
 
 if TYPE_CHECKING:
     from jiuwenswarm.agents.harness.team.team_manager import TeamManager
+    from .grant_driver import MeetingGrantDriver, MeetingPlaybackConsumer
     from .participants import MeetingPublicationSession
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class _Meeting:
     initializing: asyncio.Task | None = None
     startup_id: str | None = None
     publication: MeetingPublicationSession | None = None
+    driver: MeetingGrantDriver | None = None
 
 
 def _meeting_enabled() -> bool:
@@ -73,6 +75,9 @@ class MeetingManager:
             or not self._runtime_matches(session_id, meeting)
         ):
             meeting.publication.close()
+            if meeting.driver is not None and meeting.driver.state.phase not in {"closing", "closed"}:
+                meeting.driver.close()
+                self._spawn(self._driver_is_current(session_id, meeting))
             return None
         if meeting.state is None or meeting.state.scope.team_name != team_name:
             return None
@@ -83,36 +88,110 @@ class MeetingManager:
     ) -> MeetingPublicationSession:
         """Internal host entry, not a browser RPC or a new mode setting.
 
-        Startup intentionally does not call this until the host grant/playback
-        driver is implemented. Tests can supply a controlled consumer wake-up.
+        Browser startup intentionally does not call this until playback transport
+        exists. Tests can supply a controlled consumer wake-up.
         """
-        from .participants import MeetingPublicationSession
-
         if not callable(on_queued):
             raise ValueError("A meeting publication consumer wake-up callback is required")
         async with self._lock:
+            meeting = self._require_publication_locked(session_id, meeting_id)
+            return await self._enable_publication_locked(session_id, meeting, on_queued)
+
+    def _require_publication_locked(self, session_id: str, meeting_id: str) -> _Meeting:
+        meeting = self._sessions.get(session_id)
+        if (
+            meeting is None or meeting.phase != "active" or meeting.state is None
+            or meeting.state.scope.meeting_id != meeting_id or not self._enabled()
+            or not self._runtime_matches(session_id, meeting)
+        ):
+            raise ValueError("A matching active meeting is required for publication")
+        return meeting
+
+    async def _enable_publication_locked(
+        self, session_id: str, meeting: _Meeting, on_queued: Callable[[], None],
+    ) -> MeetingPublicationSession:
+        from .participants import MeetingPublicationSession
+
+        if meeting.publication is not None:
+            if meeting.publication.on_queued != on_queued or meeting.publication.closed:
+                raise ValueError("Meeting publication already has a consumer")
+            return meeting.publication
+        team_agent = self._team_manager.get_team_agent(session_id)
+        if getattr(getattr(team_agent, "spec", None), "spawn_mode", "inprocess") != "inprocess":
+            raise ValueError("Coordinated publication supports native in-process members only")
+        if getattr(getattr(team_agent, "spec", None), "enable_team_plan", False):
+            raise ValueError("Finish Team plan mode before enabling coordinated publication")
+        members = await meeting.backend.db.member.get_team_members(meeting.state.scope.team_name)
+        if any(member.role not in {"leader", "teammate"} for member in members):
+            raise ValueError("Coordinated publication supports native in-process members only")
+        assert meeting.coordinator is not None
+        meeting.publication = MeetingPublicationSession(meeting.coordinator, on_queued)
+        return meeting.publication
+
+    async def enable_grant_driver(
+        self, session_id: str, meeting_id: str, *, consumer: MeetingPlaybackConsumer,
+    ) -> MeetingGrantDriver:
+        """Internal host attachment; browser startup stays unchanged until transport exists."""
+        from .grant_driver import MeetingGrantDriver
+
+        async with self._lock:
+            meeting = self._require_publication_locked(session_id, meeting_id)
+            if meeting.driver is not None:
+                if meeting.driver.consumer is not consumer or meeting.driver.state.phase in {"closing", "closed"}:
+                    raise ValueError("Meeting grant driver already has a consumer")
+                return meeting.driver
+            assert meeting.coordinator is not None
+            state = await meeting.coordinator.get_state()
+            if state is None or state.closed or state.owner_request_id or state.interruption_id:
+                raise ValueError("Grant driver requires an open meeting without an existing lease or interruption")
+            driver = MeetingGrantDriver(
+                meeting.coordinator, consumer,
+                is_current=lambda: self._driver_is_current(session_id, meeting),
+            )
+            await self._enable_publication_locked(session_id, meeting, driver.wake)
+            meeting.driver = driver
+            driver.start()
+            return driver
+
+    async def _driver_is_current(self, session_id: str, meeting: _Meeting) -> bool:
+        async with self._lock:
+            if self._sessions.get(session_id) is not meeting or meeting.phase != "active":
+                return False
+            if (
+                not self._enabled() or not self._runtime_matches(session_id, meeting)
+                or meeting.publication is None or meeting.publication.closed
+            ):
+                self._begin_close_locked(session_id, meeting)
+                return False
+            return True
+
+    async def _owned_driver(self, session_id: str, meeting_id: str, owner_id: str) -> MeetingGrantDriver | None:
+        async with self._lock:
             meeting = self._sessions.get(session_id)
             if (
-                meeting is None or meeting.phase != "active" or meeting.state is None
-                or meeting.state.scope.meeting_id != meeting_id or not self._enabled()
-                or not self._runtime_matches(session_id, meeting)
+                not owner_id or meeting is None or meeting.phase != "active" or meeting.state is None
+                or meeting.state.scope.meeting_id != meeting_id or meeting.owner_id != owner_id
             ):
-                raise ValueError("A matching active meeting is required for publication")
-            if meeting.publication is not None:
-                if meeting.publication.on_queued != on_queued or meeting.publication.closed:
-                    raise ValueError("Meeting publication already has a consumer")
-                return meeting.publication
-            team_agent = self._team_manager.get_team_agent(session_id)
-            if getattr(getattr(team_agent, "spec", None), "spawn_mode", "inprocess") != "inprocess":
-                raise ValueError("Coordinated publication supports native in-process members only")
-            if getattr(getattr(team_agent, "spec", None), "enable_team_plan", False):
-                raise ValueError("Finish Team plan mode before enabling coordinated publication")
-            members = await meeting.backend.db.member.get_team_members(meeting.state.scope.team_name)
-            if any(member.role not in {"leader", "teammate"} for member in members):
-                raise ValueError("Coordinated publication supports native in-process members only")
-            assert meeting.coordinator is not None
-            meeting.publication = MeetingPublicationSession(meeting.coordinator, on_queued)
-            return meeting.publication
+                return None
+            return meeting.driver
+
+    async def complete_playback(
+        self, session_id: str, meeting_id: str, request_id: str, lease_token: str, *, owner_id: str,
+    ) -> bool:
+        driver = await self._owned_driver(session_id, meeting_id, owner_id)
+        return await driver.complete_playback(driver.coordinator.scope, request_id, lease_token) if driver else False
+
+    async def fail_playback(
+        self, session_id: str, meeting_id: str, request_id: str, lease_token: str, *, owner_id: str,
+    ) -> bool:
+        driver = await self._owned_driver(session_id, meeting_id, owner_id)
+        return await driver.fail_playback(driver.coordinator.scope, request_id, lease_token) if driver else False
+
+    async def retry_publication(
+        self, session_id: str, meeting_id: str, request_id: str, lease_token: str, *, owner_id: str,
+    ) -> bool:
+        driver = await self._owned_driver(session_id, meeting_id, owner_id)
+        return await driver.retry_publication(driver.coordinator.scope, request_id, lease_token) if driver else False
 
     def _spawn(self, coroutine) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
@@ -298,6 +377,8 @@ class MeetingManager:
         meeting.phase = "closing"
         if meeting.publication is not None:
             meeting.publication.close()
+        if meeting.driver is not None:
+            meeting.driver.close()
         if meeting.coordinator is None:
             self._sessions.pop(session_id)
             return None
@@ -307,6 +388,8 @@ class MeetingManager:
     async def _close(self, session_id: str, meeting: _Meeting) -> None:
         assert meeting.coordinator is not None
         try:
+            if meeting.driver is not None:
+                await meeting.driver.aclose()
             # Startup might fail before a row exists. Missing/closed is already clean.
             state = await meeting.coordinator.get_state()
             if state is not None and not state.closed:
@@ -405,6 +488,9 @@ class MeetingManager:
             if state is None or state.closed:
                 if meeting.publication is not None:
                     meeting.publication.close()
+                if meeting.driver is not None:
+                    self._begin_close_locked(session_id, meeting)
+                    return {"state": "closing"}
                 self._sessions.pop(session_id)
                 return {"state": "idle"}
             meeting.state = state
