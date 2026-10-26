@@ -17,6 +17,7 @@ await require('esbuild').build({
     export {TaskMeetingRuntime} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingRuntime.tsx', import.meta.url)))};
     export {setTeamMeetingEnabled} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/featureFlag.ts'))};
     export {requests,meetingServer,webClient,emit} from 'meeting-test-transport';
+    export {hasMeetingAudioOwner} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/playbackOwnership.ts'))};
     export {rememberGroupChatInput,defaultGroupChatInput} from ${JSON.stringify(path.join(frontend, 'src/features/groupChatInput.ts'))};
   `, resolveDir: frontend },
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', packages: 'external',
@@ -33,7 +34,7 @@ await require('esbuild').build({
       sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
       transport: `
         export const requests=[];
-        export const meetingServer={state:'active',acceptInputs:true,failInput:false};
+        export const meetingServer={state:'active',acceptInputs:true,failInput:false,failEnd:false,failReady:false};
         const handlers=new Map();
         export function emit(name,payload){for(const fn of handlers.get(name)||[])fn({payload});}
         export const webClient={
@@ -42,18 +43,21 @@ await require('esbuild').build({
           onStateChange:()=>()=>{},
           request:async(name,params)=>{
             requests.push({name,params});
+            if(name==='meeting.end' && meetingServer.failEnd) throw new Error('unconfirmed cleanup');
+            if(name==='meeting.status' && meetingServer.failEnd) return {state:'cleanup_failed'};
+            if(name==='meeting.playback.ready' && meetingServer.failReady) throw new Error('unavailable');
             if(name==='chat.send'&&meetingServer.acceptInputs)queueMicrotask(()=>{
               if(meetingServer.failInput)emit('chat.error',{session_id:params.session_id,request_id:params.request_id,error:'delivery failed'});
               else emit('team.group_message.accepted',{session_id:params.session_id,client_message_id:params.client_message_id});
             });
-            return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'?{state:'idle'}:{};
+            return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'||name==='meeting.release'?{state:'idle'}:name==='meeting.playback.ready'?{ready:true}:{};
           },
         };`,
       toast: `export const toast={open:()=>{}};`,
     }[path]}));
   }}],
 });
-const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput}=require(output);
+const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner}=require(output);
 
 async function mount(extra={}) {
   const dom=new JSDOM('<div id="root"></div>',{url:'http://localhost'});
@@ -65,13 +69,13 @@ async function mount(extra={}) {
     start(){this.state='recording';}stop(){this.state='inactive';this.ondataavailable?.({data:new Blob(['audio'])});this.onstop?.();}
   };
   globalThis.FileReader=class {readAsDataURL(){this.result='data:audio/webm;base64,YQ==';this.onload();}};
-  setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';meetingServer.acceptInputs=true;meetingServer.failInput=false;
+  setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';meetingServer.acceptInputs=true;meetingServer.failInput=false;meetingServer.failEnd=false;meetingServer.failReady=false;
   const drafts=[],capture=[],messages=[];
   const onSendMessage=async(text,options)=>{
     messages.push(text);
     const requestId=`chat-${messages.length}`;
     options.groupChat.onRequestId?.(requestId);
-    await webClient.request('chat.send',{session_id:'s',content:text,type:'group_chat',body:text,client_message_id:options.groupChat.clientMessageId,mentions:options.groupChat.mentions,request_id:requestId});
+    await webClient.request('chat.send',{session_id:'s',content:text,type:'group_chat',body:text,client_message_id:options.groupChat.clientMessageId,mentions:options.groupChat.mentions,meeting_mode:options.groupChat.meeting,request_id:requestId});
     return true;
   };
   const root=createRoot(document.getElementById('root'));
@@ -102,6 +106,7 @@ test('meeting initializes visibly and sends speech automatically through the nor
     assert.equal(inputs.length,2);
     assert.deepEqual(inputs[0].params.mentions,[]);
     assert.deepEqual(inputs[1].params.mentions,['leader']);
+    assert.ok(inputs.every(input=>input.params.meeting_mode===true));
     await h.click('chat-panel-input-meeting');
     assert.ok(h.track.stopped);assert.equal(h.capture.at(-1),false);
     assert.ok(requests.some(request=>request.name==='meeting.end'&&request.params.meeting_id==='meeting-one'));
@@ -133,7 +138,7 @@ test('session creation disables End until the meeting becomes active',async()=>{
   } finally {await h.close();}
 });
 
-test('pending Team readiness disables End and handles the server returning idle',async()=>{
+test('pending Team readiness can be cancelled without opening the microphone',async()=>{
   const h=await mount();
   try {
     meetingServer.state='starting';
@@ -141,9 +146,10 @@ test('pending Team readiness disables End and handles the server returning idle'
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
     assert.ok(h.find('chat-panel-meeting-waiting'));
     assert.equal(h.microphoneCalls(),0);
-    assert.equal(h.find('chat-panel-input-meeting').disabled,true);
+    assert.equal(h.find('chat-panel-input-meeting').disabled,false);
     await h.click('chat-panel-input-meeting');
-    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+    assert.ok(requests.some(request=>request.name==='meeting.release'));
     assert.ok(!requests.some(request=>request.name==='meeting.end'));
     await act(async()=>{
       meetingServer.state='idle';
@@ -257,7 +263,7 @@ test('initialization errors prevent recording and retries reuse the public messa
     assert.ok(!requests.some(request=>request.name==='meeting.start'));
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
     const first=requests.find(request=>request.name==='chat.send');
-    meetingServer.failInput=false;
+    meetingServer.failInput=false;meetingServer.failEnd=false;meetingServer.failReady=false;
     await h.click('chat-panel-input-meeting');
     const inputs=requests.filter(request=>request.name==='chat.send');
     assert.equal(inputs[1].params.client_message_id,first.params.client_message_id);
@@ -312,4 +318,57 @@ test('an unrelated request error cannot end startup but a matching mode conflict
     assert.equal(h.microphoneCalls(),0);
     assert.ok(!requests.some(request=>request.name==='meeting.start'));
   } finally {await h.close();}
+});
+
+test('paused and failed speech remain visible with an available End control',async()=>{
+ const h=await mount();try {
+  await h.click('chat-panel-input-meeting');
+  await act(async()=>emit('meeting.speech.error',{session_id:'s',meeting_id:'meeting-one',error:'provider failed'}));
+  assert.equal(h.find('chat-panel-meeting-playback').getAttribute('data-variant'),'failed');
+  assert.equal(h.find('chat-panel-input-meeting').disabled,false);
+  await h.click('chat-panel-input-meeting-stop-audio');
+  assert.equal(h.find('chat-panel-meeting-playback').getAttribute('data-variant'),'paused');
+  await h.click('chat-panel-input-meeting');
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+ }finally{await h.close();}
+});
+
+test('unconfirmed cleanup preserves End retry and prevents a replacement meeting',async()=>{
+ const h=await mount();try {
+  await h.click('chat-panel-input-meeting');meetingServer.failEnd=true;
+  await h.click('chat-panel-input-meeting');
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'cleanup_failed');
+  assert.ok(h.find('chat-panel-meeting-cleanup-error'));
+  assert.ok(hasMeetingAudioOwner('s'));
+  assert.equal(h.find('chat-panel-input-meeting').disabled,false);
+  await h.updateProps({sessionId:'another-session'});
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'cleanup_failed');
+  meetingServer.failEnd=false;await h.click('chat-panel-input-meeting');
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+  assert.equal(requests.filter(r=>r.name==='meeting.start').length,1);
+  assert.equal(hasMeetingAudioOwner('s'),false);
+ }finally{await h.close();}
+});
+
+test('failed playback readiness releases media and closes the server meeting',async()=>{
+ const h=await mount();try {
+  meetingServer.failReady=true;await h.click('chat-panel-input-meeting');
+  assert.ok(h.track.stopped);
+  assert.ok(requests.some(r=>r.name==='meeting.end'));
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+ }finally{await h.close();}
+});
+
+test('failed cleanup can be retried after the Task runtime remounts',async()=>{
+ const first=await mount();
+ await first.click('chat-panel-input-meeting');meetingServer.failEnd=true;
+ await first.click('chat-panel-input-meeting');
+ assert.equal(first.find('chat-panel-input-meeting').getAttribute('data-variant'),'cleanup_failed');
+ await first.close();
+ const second=await mount();try {
+  assert.equal(second.find('chat-panel-input-meeting').getAttribute('data-variant'),'cleanup_failed');
+  await second.click('chat-panel-input-meeting');
+  assert.equal(second.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+  assert.ok(requests.some(r=>r.name==='meeting.end'&&r.params.meeting_id==='meeting-one'));
+ }finally{await second.close();}
 });

@@ -183,6 +183,7 @@ export interface ChatSendOptions {
     sessionId: string;
     clientMessageId: string;
     mentions: string[];
+    meeting?: boolean;
     onRequestId?: (id: string) => void;
   };
 }

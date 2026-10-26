@@ -1,5 +1,7 @@
 .task-meeting-actions {
   display: inline-flex;
+  flex-wrap: wrap;
+  max-width: 100%;
   align-items: center;
   gap: 4px;
 }
@@ -13,6 +15,9 @@
 .task-meeting-waiting {
   color: var(--color-text-secondary);
   font-size: 12px;
+  max-width: 240px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 @keyframes task-meeting-spin {
   to {

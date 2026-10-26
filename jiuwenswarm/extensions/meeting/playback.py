@@ -1,0 +1,170 @@
+"""AgentServer-owned speech records and browser playback completion boundary."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from uuid import uuid4
+
+EVENT = "meeting.playback"
+STOP_TIMEOUT_SECONDS = 10
+IDENTITY_FIELDS = ("session_id", "meeting_id", "request_id", "lease_token", "source_message_id", "speaker_id", "playback_id")
+
+
+def speech_chunks(text: str, limit: int = 800) -> tuple[str, ...]:
+    if not isinstance(text, str) or not text.strip() or len(text) > 16_000:
+        raise ValueError("Speech summary must contain 1-16000 characters")
+    rest, chunks = text.strip(), []
+    while len(rest) > limit:
+        prefix = rest[:limit]
+        boundary = max(prefix.rfind(mark) for mark in ("。", ". ", "\n", "！", "？", "! ", "? "))
+        end = boundary + 1 if boundary >= limit // 2 else limit
+        chunks.append(rest[:end])
+        rest = rest[end:]
+    if rest:
+        chunks.append(rest)
+    return tuple(chunks)
+
+
+@dataclass(frozen=True)
+class SpeechPlayback:
+    session_id: str
+    meeting_id: str
+    request_id: str
+    lease_token: str
+    source_message_id: str
+    speaker_id: str
+    playback_id: str
+    voice: str
+    model: str
+    catalog_version: str
+    config_revision: str
+    chunks: tuple[str, ...]
+
+    def identity(self) -> dict:
+        return {key: getattr(self, key) for key in IDENTITY_FIELDS}
+
+    def matches(self, params: dict) -> bool:
+        return all(params.get(key) == value for key, value in self.identity().items())
+
+
+class BrowserPlaybackConsumer:
+    def __init__(self, scope, voices, *, owner_id, route_id, config_revision, emit, stop_timeout=STOP_TIMEOUT_SECONDS):
+        self.scope, self.voices = scope, voices
+        self.owner_id, self.route_id = owner_id, route_id
+        self.config_revision, self.emit = config_revision, emit
+        self.driver = None
+        self._records: dict[str, SpeechPlayback] = {}
+        self._request_ids: dict[str, str] = {}
+        self._receipts: dict[str, tuple[str, int]] = {}
+        self._current: str | None = None
+        self._closing = False
+        self._result_lock = asyncio.Lock()
+        self._stop_id: str | None = None
+        self._stop_waiter: asyncio.Future | None = None
+        self._stop_timeout = stop_timeout
+
+    async def _push(self, event: str, payload: dict) -> None:
+        if not await self.emit({
+            "event_type": EVENT, "event": event, "route_id": self.route_id,
+            "owner_id": self.owner_id, "session_id": self.scope.session_id,
+            "meeting_id": self.scope.meeting_id, **payload,
+        }):
+            raise RuntimeError("Meeting playback could not reach its owning browser")
+
+    async def speech_ready(self, request) -> None:
+        if self._closing or request.scope != self.scope or not request.lease_token or request.source_message_id is None:
+            raise ValueError("A matching granted speech request is required")
+        playback_id = self._request_ids.get(request.request_id)
+        if playback_id is None:
+            voice = self.voices.get_voice(request.member_name)
+            playback_id = uuid4().hex
+            record = SpeechPlayback(
+                self.scope.session_id, self.scope.meeting_id, request.request_id,
+                request.lease_token, str(request.source_message_id), request.member_name,
+                playback_id, voice.provider_voice_id, voice.model, voice.catalog_version,
+                self.config_revision, speech_chunks(request.speech_text),
+            )
+            self._records[playback_id] = record
+            self._request_ids[request.request_id] = playback_id
+        record = self._records[playback_id]
+        self._current = playback_id
+        await self._push("meeting.speech.ready", {
+            **record.identity(), "voice": record.voice, "model": record.model,
+            "catalog_version": record.catalog_version, "chunks": list(record.chunks),
+            "chunk_count": len(record.chunks),
+        })
+
+    async def speech_error(self, request, error) -> None:
+        await self._push("meeting.speech.error", {"error": error})
+
+    def _record(self, params: dict) -> SpeechPlayback:
+        record = self._records.get(params.get("playback_id"))
+        if record is None or not record.matches(params):
+            raise ValueError("Speech identity is stale or does not belong to this meeting")
+        return record
+
+    async def resolve_chunk(self, params: dict) -> dict:
+        record = self._record(params)
+        if self._closing or self._current != record.playback_id or record.playback_id in self._receipts:
+            raise ValueError("Speech playback is no longer active")
+        speaker = await self.driver.coordinator.get_speaker()
+        if (
+            self.driver.state.phase != "awaiting_playback" or speaker is None
+            or speaker.request_id != record.request_id or speaker.lease_token != record.lease_token
+        ):
+            raise ValueError("Speech lease is no longer active")
+        index = params.get("chunk_index")
+        if type(index) is not int or not 0 <= index < len(record.chunks):
+            raise ValueError("Invalid speech chunk index")
+        return {**record.identity(), "chunk_index": index, "text": record.chunks[index],
+                "voice": record.voice, "model": record.model, "config_revision": record.config_revision}
+
+    async def result(self, params: dict) -> dict:
+        record = self._record(params)
+        outcome, count = params.get("outcome"), params.get("completed_chunks")
+        if outcome not in {"completed", "stopped", "failed"} or type(count) is not int or not 0 <= count <= len(record.chunks):
+            raise ValueError("Invalid playback outcome")
+        if outcome == "completed" and count != len(record.chunks):
+            raise ValueError("All speech chunks must naturally finish before completion")
+        async with self._result_lock:
+            previous = self._receipts.get(record.playback_id)
+            if previous is not None:
+                if previous != (outcome, count):
+                    raise ValueError("Conflicting playback result")
+                return {"accepted": True}
+            if self._closing or self._current != record.playback_id:
+                raise ValueError("Playback result is no longer current")
+            method = self.driver.complete_playback if outcome == "completed" else self.driver.fail_playback
+            if not await method(self.scope, record.request_id, record.lease_token):
+                raise ValueError("Playback lease is no longer current")
+            self._receipts[record.playback_id] = (outcome, count)
+        return {"accepted": True}
+
+    def confirm_stop(self, stop_id: str) -> dict:
+        # Deliberately independent from driver/result locks: aclose holds the
+        # driver lock while waiting for this receipt, including cleanup retries.
+        if not self._stop_id or stop_id != self._stop_id or self._stop_waiter is None:
+            raise ValueError("Unknown playback stop acknowledgement")
+        if not self._stop_waiter.done():
+            self._stop_waiter.set_result(True)
+        return {"accepted": True}
+
+    async def stop(self) -> None:
+        self._closing = True
+        if self._stop_waiter is None:
+            self._stop_id = uuid4().hex
+            self._stop_waiter = asyncio.get_running_loop().create_future()
+        if self._stop_waiter.done():
+            return
+        # A locally confirmed stop/failure leaves the driver held and prevents
+        # another grant. Gateway drained matching synthesis before forwarding it.
+        receipt = self._receipts.get(self._current)
+        if receipt is not None and receipt[0] in {"stopped", "failed"}:
+            self._stop_waiter.set_result(True)
+            return
+        await self._push("meeting.playback.stop", {"stop_id": self._stop_id})
+        try:
+            await asyncio.wait_for(asyncio.shield(self._stop_waiter), self._stop_timeout)
+        except TimeoutError:
+            raise RuntimeError("Browser playback stop was not confirmed; retry End meeting") from None

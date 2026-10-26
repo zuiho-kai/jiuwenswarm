@@ -32,7 +32,8 @@ export function TaskMeetingAction({
   const mounted = useRef(true);
   const current = useRef({ sessionId, teamEligible });
   current.current = { sessionId, teamEligible };
-  const active = snapshot.sessionId === sessionId;
+  const active =
+    snapshot.sessionId === sessionId || snapshot.state === 'closing' || snapshot.state === 'cleanup_failed';
   const status = creating ? 'starting' : active ? snapshot.state : 'idle';
   const recording = snapshot.recording;
 
@@ -96,6 +97,7 @@ export function TaskMeetingAction({
                 'unsupported',
                 'disconnected',
                 'microphoneFailed',
+                'playbackUnavailable',
                 'meetingStartFailed',
                 'deliveryFailed',
                 'meetingRequiresNewConversation',
@@ -112,10 +114,12 @@ export function TaskMeetingAction({
     setCreating(false);
     stopMeeting();
   };
-  const title = t(`meeting.task.${status === 'idle' ? 'start' : status === 'starting' ? 'starting' : 'stop'}`);
+  const title = t(
+    `meeting.task.${status === 'idle' ? 'start' : status === 'starting' ? 'starting' : status === 'closing' ? 'closing' : status === 'cleanup_failed' ? 'retryCleanup' : 'stop'}`,
+  );
   return (
     <>
-      {enabled && (teamEligible || onSelectTeamMode || status !== 'idle') && (
+      {(enabled || status !== 'idle') && (teamEligible || onSelectTeamMode || status !== 'idle') && (
         <div className="task-meeting-actions" data-testid="chat-panel-meeting-controls" data-variant={status}>
           <button
             type="button"
@@ -123,15 +127,19 @@ export function TaskMeetingAction({
             title={title}
             aria-label={title}
             aria-pressed={status === 'active'}
-            disabled={status === 'starting' || (status === 'idle' && (microphoneBusy || disabled))}
+            disabled={
+              status === 'closing' ||
+              (status === 'starting' && creating) ||
+              (status === 'idle' && (microphoneBusy || disabled))
+            }
             data-testid="chat-panel-input-meeting"
             data-variant={status}
             onClick={() => {
-              if (status === 'active') stop();
+              if (['active', 'starting', 'cleanup_failed'].includes(status)) stop();
               else if (status === 'idle') void start();
             }}
           >
-            {status === 'starting' ? (
+            {status === 'starting' || status === 'closing' ? (
               <LoaderCircle className="chat-input-btn-icon task-meeting-spinner" aria-hidden="true" />
             ) : (
               <UsersRound className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
@@ -140,6 +148,21 @@ export function TaskMeetingAction({
           {status === 'starting' && !creating && (
             <span className="task-meeting-waiting" data-testid="chat-panel-meeting-waiting">
               {t('meeting.task.waiting')}
+            </span>
+          )}
+          {status === 'cleanup_failed' && (
+            <span className="task-meeting-waiting" role="status" data-testid="chat-panel-meeting-cleanup-error">
+              {t('meeting.errors.cleanupFailed')}
+            </span>
+          )}
+          {status === 'active' && snapshot.playback !== 'idle' && (
+            <span
+              className="task-meeting-waiting"
+              role="status"
+              data-testid="chat-panel-meeting-playback"
+              data-variant={snapshot.playback}
+            >
+              {t(`meeting.playback.${snapshot.playback}`, { speaker: snapshot.speaker, voice: snapshot.voice })}
             </span>
           )}
           {status === 'active' && (

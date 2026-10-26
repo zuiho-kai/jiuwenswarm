@@ -1,7 +1,15 @@
 {
   "meeting": {
     "startMessage": "Start meeting",
+    "playback": {
+      "loading": "Preparing {{speaker}} ({{voice}})…",
+      "playing": "{{speaker}} speaking ({{voice}})",
+      "paused": "Speech paused. End this meeting to start again.",
+      "failed": "Speech failed. Read the transcript, then end this meeting."
+    },
     "task": {
+      "closing": "Ending meeting…",
+      "retryCleanup": "Retry End meeting",
       "start": "Start Team meeting",
       "starting": "Starting meeting…",
       "waiting": "Preparing the Team and meeting…",
@@ -16,6 +24,8 @@
       "transcribing": "Transcribing…"
     },
     "errors": {
+      "playbackUnavailable": "Meeting audio could not be prepared. Check the Qwen configuration and try again.",
+      "cleanupFailed": "Meeting cleanup was not confirmed. Retry End meeting.",
       "vadUnavailable": "Automatic speech-end detection is unavailable. Use Finish recording to send your message.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
       "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",

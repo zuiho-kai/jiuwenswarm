@@ -64,7 +64,62 @@ class MeetingManager:
         self._sessions: dict[str, _Meeting] = {}
         self._tasks: set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
+        self._playback_ready_lock = asyncio.Lock()
+        self._voice_registries: dict[str, tuple[Any, Any]] = {}
         self._stopping = False
+
+    async def prepare_browser_playback(
+        self, session_id: str, meeting_id: str, *, owner_id: str, startup_id: str,
+        route_id: str, model: str, config_revision: str, default_voice: str, emit,
+    ) -> dict:
+        from jiuwenswarm.common.voice_matching import MemberVoiceRegistry
+        from .playback import BrowserPlaybackConsumer
+
+        if not all((owner_id, startup_id, route_id, model, config_revision)):
+            raise ValueError("Playback readiness requires complete owner/configuration identity")
+        async with self._playback_ready_lock:
+            async with self._lock:
+                meeting = self._require_publication_locked(session_id, meeting_id)
+                if meeting.owner_id != owner_id or meeting.startup_id != startup_id:
+                    raise ValueError("Meeting playback is not owned by this connection/startup")
+                if meeting.driver is not None:
+                    consumer = meeting.driver.consumer
+                    if (
+                        not isinstance(consumer, BrowserPlaybackConsumer) or consumer.route_id != route_id
+                        or consumer.config_revision != config_revision
+                    ):
+                        raise ValueError("Meeting already has a different playback consumer")
+                    return {"ready": True, "meeting_id": meeting_id}
+                cached = self._voice_registries.get(session_id)
+                if cached is not None and cached[0] is meeting.backend and cached[1].model == model:
+                    voices = cached[1]
+                else:
+                    voices = MemberVoiceRegistry(session_id, meeting.state.scope.team_name, model)
+                    voices.assign_voice(meeting.state.leader_member_name, preference=default_voice)
+                    self._voice_registries[session_id] = (meeting.backend, voices)
+                consumer = BrowserPlaybackConsumer(
+                    meeting.state.scope, voices, owner_id=owner_id, route_id=route_id,
+                    config_revision=config_revision, emit=emit,
+                )
+            consumer.driver = await self.enable_grant_driver(session_id, meeting_id, consumer=consumer, voices=voices)
+            return {"ready": True, "meeting_id": meeting_id}
+
+    async def browser_playback(self, session_id: str, meeting_id: str, owner_id: str, *, closing=False):
+        from .playback import BrowserPlaybackConsumer
+
+        async with self._lock:
+            meeting = self._sessions.get(session_id)
+            if (
+                not owner_id or meeting is None or meeting.state is None or meeting.owner_id != owner_id
+                or meeting.state.scope.meeting_id != meeting_id or meeting.driver is None
+                or meeting.phase not in ({"active", "closing", "cleanup_failed"} if closing else {"active"})
+                or not isinstance(meeting.driver.consumer, BrowserPlaybackConsumer)
+            ):
+                raise ValueError("Meeting playback is not owned by this connection or no longer active")
+            if not closing and (not self._enabled() or not self._runtime_matches(session_id, meeting)):
+                self._begin_close_locked(session_id, meeting)
+                raise ValueError("Meeting playback runtime has ended")
+            return meeting.driver.consumer
 
     def publication_for_session(self, session_id: str, team_name: str) -> MeetingPublicationSession | None:
         """Resolve only the current native scope; ordinary sessions allocate nothing."""
@@ -146,7 +201,7 @@ class MeetingManager:
         self, session_id: str, meeting_id: str, *, consumer: MeetingPlaybackConsumer,
         voices: MemberVoiceRegistry | None = None,
     ) -> MeetingGrantDriver:
-        """Internal host attachment; browser startup stays unchanged until transport exists."""
+        """Attach a playback consumer before enabling native publication and grants."""
         from .grant_driver import MeetingGrantDriver
 
         async with self._lock:
@@ -459,7 +514,7 @@ class MeetingManager:
             if (
                 meeting is None
                 or meeting.state is None
-                or meeting.phase not in ("active", "closing")
+                or meeting.phase not in ("active", "closing", "cleanup_failed")
                 or meeting.state.scope.meeting_id != meeting_id
                 or (owner_id is not None and meeting.owner_id != owner_id)
             ):
@@ -541,6 +596,7 @@ class MeetingManager:
             raise RuntimeError(
                 "Meeting cleanup failed during shutdown; retry before closing Team databases"
             )
+        self._voice_registries.clear()
 
 
 _server_manager: MeetingManager | None = None

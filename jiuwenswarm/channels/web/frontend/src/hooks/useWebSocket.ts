@@ -6,6 +6,7 @@
 
 import { readOutputOrder } from '../features/sessionOutput';
 import { defaultGroupChatInput } from '../features/groupChatInput';
+import { hasMeetingAudioOwner } from '../features/teamMeeting/playbackOwnership';
 import { handleTaskInputReceipt, sendQueuedTaskInput, handleSessionOutputBoundary, shouldIgnoreSessionOutput } from '../features/sessionInput';
 import {
   assetKindFromMime,
@@ -1238,6 +1239,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
   const handleTtsPlayback = useCallback(
     (sessionId: string, messageId: string, content: string) => {
+      if (hasMeetingAudioOwner(sessionId)) return;
       const sanitized = sanitizeTtsText(content);
       if (!sanitized || sanitized.startsWith('[任务已中断]')) {
         return;
@@ -1255,7 +1257,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           sanitized,
           ttsSessionId && ttsSessionId !== 'new' ? ttsSessionId : undefined
         );
-        if (!response?.success || !response.audio_base64) {
+        if (hasMeetingAudioOwner(sessionId) || !response?.success || !response.audio_base64) {
           return;
         }
 
@@ -2167,6 +2169,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
                 body: outgoingContent,
                 client_message_id: groupChat.clientMessageId,
                 mentions: groupChat.mentions,
+                ...(groupChat.meeting ? { meeting_mode: true } : {}),
               }
             : {}),
           ...(outgoingMediaItems ? { media_items: outgoingMediaItems } : {}),

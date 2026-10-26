@@ -1,10 +1,13 @@
 import { useSyncExternalStore } from 'react';
-import type { RecordingState } from './meetingRuntime';
+import type { RecordingState, PlaybackState } from './meetingRuntime';
 
 export type MeetingSnapshot = {
-  state: 'idle' | 'starting' | 'active';
+  state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed';
   sessionId: string | null;
   recording: RecordingState;
+  playback: PlaybackState;
+  speaker: string;
+  voice: string;
 };
 type Controller = {
   start: (sessionId: string) => Promise<void>;
@@ -13,7 +16,14 @@ type Controller = {
   stopAudio: () => void;
 };
 let controller: Controller | null = null;
-let snapshot: MeetingSnapshot = { state: 'idle', sessionId: null, recording: 'ready' };
+let snapshot: MeetingSnapshot = {
+  state: 'idle',
+  sessionId: null,
+  recording: 'ready',
+  playback: 'idle',
+  speaker: '',
+  voice: '',
+};
 const listeners = new Set<() => void>();
 
 export function registerMeetingController(next: Controller): () => void {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { speechChunks, replyFromEvent, MeetingSession } from '../../../channels/web/frontend/node_modules/.cache/meeting/meetingRuntime.mjs';
+import { MeetingSession } from '../../../channels/web/frontend/node_modules/.cache/meeting/meetingRuntime.mjs';
 
 const context = {leader:'leader',members:[
   {member_name:'leader',display_name:'Leader'},
@@ -10,20 +10,6 @@ const context = {leader:'leader',members:[
 import { SpeechGate } from '../../../channels/web/frontend/node_modules/.cache/meeting/speechGate.mjs';
 
 const tick = () => new Promise(resolve=>setImmediate(resolve));
-
-test('long replies split into bounded chunks without truncating content', () => {
-  const text = 'Report。'.repeat(500);
-  const chunks = speechChunks(text);
-  assert.ok(chunks.every(chunk => chunk.length <= 800));
-  assert.equal(chunks.join(''), text);
-});
-test('only human-directed replies are spoken in the frontend pass', () => {
-  const event = {type:'team.message.p2p',from_member:'dev',to_member:'user',content:'Ready',message_id:'m'};
-  assert.equal(replyFromEvent('team.message',{event},'leader').speaker,'dev');
-  assert.equal(replyFromEvent('team.message',{event:{...event,to_member:'leader'}},'leader'),null);
-  assert.equal(replyFromEvent('team.message',{event:{...event,type:'team.message.broadcast'}},'leader'),null);
-  assert.equal(replyFromEvent('chat.final',{content:'Ready',member_name:'dev'},'leader'),null);
-});
 
 function harness({startVad = async()=>{}} = {}) {
   const handlers = new Map();
@@ -35,8 +21,8 @@ function harness({startVad = async()=>{}} = {}) {
     onStateChange:fn=>{onState=fn;return ()=>{onState=null;};},
     request:async(name,params)=>{
       requests.push({name,params});
-      if(name === 'tts.synthesize' || name === 'video.transcribe') return new Promise(resolve=>{resolvers[name]=resolve;});
-      return {};
+      if(name === 'meeting.speech.synthesize' || name === 'video.transcribe') return new Promise(resolve=>{resolvers[name]=resolve;});
+      return name === 'meeting.playback.ready' ? {ready:true} : {accepted:true};
     },
   };
   const callbacks={line:line=>lines.push(line),error:code=>errors.push(code),draft:text=>drafts.push(text),recording:state=>states.push(state),ended:()=>{}};
@@ -60,15 +46,59 @@ function harness({startVad = async()=>{}} = {}) {
     disconnect:()=>onState?.('closed')};
 }
 
-test('ending a meeting discards late synthesis and releases microphone',async()=>{
-  const h=harness();let played=0;
-  globalThis.Audio=class {constructor(){played++;}};
-  await h.meeting.start();
-  h.handlers.get('chat.final')({payload:{session_id:'s',content:'Reply',request_id:'r'}});
-  await tick();
-  assert.equal(h.requests.filter(r=>r.name==='tts.synthesize').length,1);
-  h.meeting.stop();h.resolvers['tts.synthesize']({success:true,audio_base64:'YQ==',audio_mime:'audio/mpeg'});
-  await tick();assert.equal(played,0);assert.ok(h.track.stopped);assert.equal(h.handlers.size,0);
+const speech = (extra={}) => ({session_id:'s', meeting_id:'meeting', request_id:'request', lease_token:'lease',
+  source_message_id:'message', speaker_id:'dev', playback_id:'playback', voice:'Serena', chunks:['Summary'], chunk_count:1, ...extra});
+const emitSpeech = (h,extra) => h.handlers.get('meeting.speech.ready')({payload:speech(extra)});
+async function ready(h) { await h.meeting.start(); await h.meeting.activatePlayback('meeting','startup'); }
+function audioHarness() {
+  const audios=[];
+  globalThis.Audio=class { constructor(){audios.push(this);} async play(){} pause(){this.paused=true;} };
+  return audios;
+}
+test('ending discards late synthesis and keeps shutdown acknowledgements alive',async()=>{
+  const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+  const request=h.requests.find(r=>r.name==='meeting.speech.synthesize');
+  assert.equal(request.params.voice,undefined);assert.equal(request.params.text,undefined);
+  h.meeting.stop();h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+  await tick();assert.equal(audios.length,0);assert.ok(h.track.stopped);
+  assert.ok(h.handlers.has('meeting.playback.stop'));
+  h.handlers.get('meeting.playback.stop')({payload:{session_id:'s',meeting_id:'meeting',stop_id:'stop'}});
+  await tick();assert.ok(h.requests.some(r=>r.name==='meeting.playback.stopped'));
+  assert.ok(!h.requests.some(r=>r.name==='meeting.playback.result'&&r.params.outcome==='completed'));
+  h.meeting.finishCleanup();assert.equal(h.handlers.size,0);
+});
+
+test('only natural completion of every chunk reports completed',async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h,{chunks:['First','Second'],chunk_count:2});await tick();
+ const finishChunk=async(index)=>{h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:index});await tick();};
+ await finishChunk(0);assert.equal(audios.length,1);
+ assert.ok(!h.requests.some(r=>r.name==='meeting.playback.result'));
+ audios[0].onended();await tick();await finishChunk(1);
+ assert.ok(!h.requests.some(r=>r.name==='meeting.playback.result'));
+ audios[1].onended();await tick();
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.completed_chunks,2);
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.outcome,'completed');
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+test('stop during playback holds the lease and never starts another chunk',async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h,{chunks:['First','Second'],chunk_count:2});await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});await tick();
+ const oldEnd=audios[0].onended;h.meeting.stopPlayback();oldEnd();await tick();
+ assert.ok(audios[0].paused);assert.equal(h.requests.filter(r=>r.name==='meeting.speech.synthesize').length,1);
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.outcome,'stopped');
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.completed_chunks,0);
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+test('failed synthesis holds the queue and duplicate or foreign events do not replay',async()=>{
+ const h=harness();await ready(h);emitSpeech(h,{session_id:'other'});emitSpeech(h);emitSpeech(h);await tick();
+ h.resolvers['meeting.speech.synthesize']({success:false});await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.speech.synthesize').length,1);
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.outcome,'failed');
+ emitSpeech(h,{playback_id:'next'});await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.speech.synthesize').length,1);
+ h.meeting.stop();h.meeting.finishCleanup();
 });
 
 test('recording uses existing ASR and returns the transcript without sending chat',async()=>{
@@ -88,14 +118,10 @@ test('late ASR after stop cannot modify the next meeting draft',async()=>{
   h.meeting.stop();h.resolvers['video.transcribe']({transcript:'Late'});await tick();assert.deepEqual(h.drafts,[]);
 });
 
-test('duplicate reply events and other sessions never enqueue extra speech',async()=>{
-  const h=harness();await h.meeting.start();
-  const event={payload:{session_id:'s',event:{type:'team.message.p2p',from_member:'dev',to_member:'user',content:'Ready',message_id:'m'}}};
-  h.handlers.get('team.message')({payload:{...event.payload,session_id:'other'}});
-  h.handlers.get('team.message')(event);h.handlers.get('team.event')(event);await tick();
-  assert.equal(h.lines.length,1);assert.equal(h.requests.filter(r=>r.name==='tts.synthesize').length,1);
-  assert.equal(h.requests.at(-1).params.member_name,undefined); // Backend voice mapping is deferred.
-  h.meeting.stop();h.resolvers['tts.synthesize']({success:true,audio_base64:'YQ=='});await tick();
+test('chat events cannot narrate a meeting independently of the granted speech',async()=>{
+ const h=harness();await ready(h);
+ assert.ok(!h.handlers.has('team.message'));assert.ok(!h.handlers.has('chat.final'));
+ assert.ok(!h.requests.some(r=>r.name==='tts.synthesize'));h.meeting.stop();h.meeting.finishCleanup();
 });
 
 test('disconnect stops recording and releases microphone',async()=>{
@@ -251,4 +277,11 @@ test('cancelling while VAD starts releases resources and never records', async (
   assert.equal(h.track.stopped, true);
   assert.equal(h.recorders.length, 0);
   assert.deepEqual(h.errors, []);
+});
+
+test('a long authorized summary may contain more than 32 bounded chunks',async()=>{
+ const h=harness();await ready(h);
+ emitSpeech(h,{chunks:Array.from({length:34},()=> 'x'.repeat(430)),chunk_count:34});await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.speech.synthesize').length,1);
+ h.meeting.stop();h.resolvers['meeting.speech.synthesize']({success:false});await tick();h.meeting.finishCleanup();
 });

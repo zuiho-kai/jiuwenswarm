@@ -26,17 +26,29 @@ Conversation and coordinator initialization follow their SDK behavior. The
 browser bounds waiting for message acceptance to 60 seconds and abandons that
 wait on page teardown or disconnection; this adds no active-meeting polling.
 
-The SDK and dependency pins are unchanged. A new default Team starts with its
+Meeting input explicitly sets `meeting_mode` before the initialization message.
+AgentServer selects `TeamAgentSpec.conversation_history_location="session"` for a
+meeting-created runtime; its archive is under
+`<team-home>/sessions/<session-id>/conversation/history.jsonl`. Ordinary group-chat
+requests retain the SDK's existing shared-workspace layout. Reopening a meeting
+archive remembers its location. Existing ordinary group-chat runtimes are not
+silently converted; use a new meeting conversation. This requires an updated
+agent-core SDK supporting the option; older SDKs fail with a specific update error.
+File tools retain their current permissions, and the SDK still supplies scoped
+message excerpts without granting broader filesystem access.
+
+The dependency pin has not yet been updated. A new default Team starts with its
 Leader; membership can grow through existing SDK tools. Existing ordinary Team
 runtimes are not converted. Start a new conversation for a meeting in that case.
 Ending a meeting leaves its group-chat runtime intact. This browser remembers
 accepted group-chat conversations (including across tab reloads), so subsequent
 typed input uses group-chat routing to the Leader as well.
 
-The End control is disabled during startup; `meeting.end` requires an active
-meeting and its exact meeting ID. Leaving the page or disconnecting uses
-`meeting.release`, scoped to the connection owner and startup ID, so late cleanup
-cannot affect a replacement.
+End can cancel server preparation after conversation creation. `meeting.end`
+requires the exact active meeting ID; an earlier startup uses `meeting.release`,
+scoped to the connection owner and startup ID. The browser retains its shutdown
+listener while cleanup is pending. Unconfirmed cleanup shows **Retry End meeting**
+and prevents a replacement meeting until cleanup succeeds.
 
 The manager retains lifecycle tasks independently of request cancellation. A
 cancelled or abandoned initializer must finish unwinding before its coordinator
@@ -47,18 +59,38 @@ drains meetings before closing runtime resources. This protects the running
 process; recovery after a process crash is not implemented here.
 
 The browser checks meeting status while startup is pending. Once active, it uses
-existing request errors and connection-state notifications, without periodic
-meeting status requests. ASR/TTS failures display errors; a disconnect stops local
-capture and playback. ASR/TTS requests do not validate meeting ownership, so their
-success alone does not establish that the server meeting is still active. Immediate
-detection of server-only closure while the connection stays open is not provided.
+request errors and connection-state notifications without periodic meeting status
+requests or automatic reconnection/resume.
 
-Replies stay in the existing Task conversation. Human-directed member replies
-and Leader final replies play in order using the configured **default voice**.
-The video-duplex plugin and its ASR/TTS providers must be configured. The frontend
-reuses `video.transcribe` and `tts.synthesize`; per-member matching is not wired
-into that browser path yet.
-There is no standalone meeting sidebar destination or second conversation editor.
+After local media and event listeners are ready, `meeting.playback.ready` installs
+an owner-specific Gateway route and activates native publication/grant scheduling.
+AgentServer freezes each granted spoken summary, member voice, source message,
+lease and playback identity. The browser calls `meeting.speech.synthesize` with
+that identity and a chunk index; it cannot override text, model or voice. Gateway
+resolves the canonical chunk on AgentServer, synthesizes it using the shared Qwen
+Omni component, then rechecks the lease/configuration before returning WAV audio.
+Credentials stay on Gateway. Qwen must be configured through `QWEN_OMNI_*`;
+recording continues to use the existing `video.transcribe` ASR endpoint.
+
+Only natural playback completion of every chunk reports `meeting.playback.result`
+as completed and releases the SDK speaking lease. Synthesized audio alone never
+advances it. Stop audio, taking the microphone, or synthesis/playback failure holds
+the queue and displays a persistent paused/failed state. End this meeting to start
+again; seamless resume is deferred. Duplicate result receipts are idempotent,
+including after the next grant. Foreign identities and stale leases are rejected.
+
+End revokes synthesis, sends `meeting.playback.stop`, and waits for the browser's
+`meeting.playback.stopped` receipt. The stop acknowledgement handler runs without
+the driver lock; Gateway drains provider cancellation before forwarding the
+receipt. Missing receipts retain `cleanup_failed` for an explicit End retry.
+Disconnect never fabricates successful playback. Late audio cannot restart a
+locally stopped player. Automatic chat-event narration is suppressed for the owned
+session, and manual TTS shares an audio-stop signal with meeting playback.
+
+Replies remain in the existing Task conversation. There is no standalone meeting
+sidebar destination or second conversation editor. This path supports native
+in-process Team members; process runtimes, Team plan mode and unsupported rosters
+reject coordinated activation. Video-duplex files and their imports are unchanged.
 
 Local speech-end detection reuses the full-duplex extension's Silero v5 worker,
 PCM capture worklet, and 16 kHz resampler. The existing speech gate confirms speech
@@ -74,13 +106,13 @@ automatically submits its transcript after ASR, then returns to the Record messa
 control; recording does not restart automatically.
 Stopping or leaving the meeting releases the VAD worker, audio graph, and microphone.
 
-Still pending for the full RFC PR1: server-side Silero VAD and microphone
-streaming, supervisor recipient selection, JEV interruption filtering, per-agent
-voice UI/browser integration, and a recorded real meeting demonstration. Speaking
-locks, spoken summaries, and A2A/broadcast narration remain PR2/PR3 work.
+Deferred work includes semantic turn completion, server-side Silero VAD,
+upstream microphone streaming, supervisor recipient selection, JEV interruption
+filtering, seamless speech resume, voice selection UI, a recorded full meeting
+demonstration, and recovery after process restart.
 
-Agent-side publication wiring is now implemented behind an internal host-consumer
-gate. The shared native member provider installs scoped meeting guidance and the
+Agent-side publication uses the host-consumer readiness gate. The shared native
+member provider installs scoped meeting guidance and the
 SDK's `meeting_post_message`, `meeting_read_history`, and `meeting_get_speaker`
 tools for the Leader and later members. Work and code profiles use the same
 provider. Native discussion output must queue before publication; unsupported
@@ -93,13 +125,7 @@ completion releases the lease. Publication retry preserves the original token
 and message identity. Delivery/playback failures hold the turn. Meeting cleanup
 drains the worker and confirms consumer stop before closing the SDK coordinator.
 
-Browser startup does not enable that gate yet: coordinated TTS delivery, browser
-transport, and actual playback acknowledgements remain deferred. Browser narration
-retains the behavior described above. This increment supports native in-process
-members; process runtimes, Team plan mode, and unsupported rosters reject
-coordinated activation. No active-meeting polling was added.
-
-Host-enabled publication and grant scheduling now accept an optional
+Publication and grant scheduling accept an optional
 `MemberVoiceRegistry` from `jiuwenswarm.common.voice_matching`. The host supplies
 the exact Qwen Omni model and a registry scoped to the native Team/session; no
 Gateway credentials are read by the meeting runtime. Existing roster bindings
@@ -115,8 +141,8 @@ create a new one when that runtime is replaced. Catalog updates affect future
 assignments while retained bindings keep queued speech reproducible.
 `publication.voice_for_speech(request).provider_voice_id` supplies the voice
 argument for the Gateway TTS component. Lookup does not release the speaking
-lease or start audio. Browser playback wiring and process-restart restoration
-remain deferred; no registry means existing behavior is unchanged.
+lease or start audio. Browser readiness now creates/reuses this registry for the
+same native runtime; process-restart restoration remains deferred.
 
 Validation (from `jiuwenswarm/channels/web/frontend`):
 
@@ -131,7 +157,7 @@ Backend lifecycle validation (from the repository root, using the project
 Python environment):
 
 ```sh
-python -m pytest tests/unit_tests/agentserver/test_meeting_manager.py tests/unit_tests/agentserver/test_meeting_sdk_dependency.py tests/unit_tests/agentserver/test_team_helpers.py tests/unit_tests/common/test_team_meeting_config.py tests/unit_tests/gateway/test_app_web_handlers.py -o addopts='' -q --asyncio-mode=auto
+python -m pytest tests/unit_tests/agentserver/test_meeting_browser_playback.py tests/unit_tests/agentserver/test_meeting_manager.py tests/unit_tests/agentserver/test_meeting_sdk_dependency.py tests/unit_tests/agentserver/test_team_helpers.py tests/unit_tests/common/test_team_meeting_config.py tests/unit_tests/gateway/test_app_web_handlers.py -o addopts='' -q --asyncio-mode=auto
 ```
 
 Set `JIUWENSWARM_DATA_DIR` to a temporary directory to isolate application logs
@@ -155,3 +181,15 @@ $vadSynth.Dispose()
 
 The browser tests use synthetic audio only; they do not access a physical
 microphone or call ASR/TTS providers.
+
+The opt-in protocol smoke test uses the configured Qwen service and saves WAV
+artifacts under `tmp/meeting-playback-smoke` (isolated SDK/SQLite session):
+
+```powershell
+$env:MEETING_LIVE_TTS_SMOKE='1'
+python -m pytest tests/unit_tests/agentserver/test_meeting_browser_playback.py -k live_qwen -o addopts='' -q --asyncio-mode=auto
+```
+
+This checks live synthesis through RPC and push routing. It simulates playback
+receipts; physical microphone/speaker quality and a complete live browser meeting
+still require user acceptance testing.

@@ -2541,6 +2541,8 @@ class AgentWebSocketServer:
             if request.req_method in {
                 ReqMethod.MEETING_START, ReqMethod.MEETING_STATUS, ReqMethod.MEETING_END,
                 ReqMethod.MEETING_RELEASE,
+                ReqMethod.MEETING_PLAYBACK_READY, ReqMethod.MEETING_SPEECH_GET,
+                ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED,
             }:
                 await self._handle_meeting_lifecycle(ws, request, send_lock)
                 return
@@ -5360,8 +5362,34 @@ class AgentWebSocketServer:
             if not is_team_mode(get_session_metadata(session_id).get("mode")):
                 raise ValueError("Meeting requires a Team session")
             manager = get_server_meeting_manager()
+            playback_payload = None
             if request.req_method == ReqMethod.MEETING_START:
                 await manager.request_start(session_id, owner_id, startup_id)
+            elif request.req_method == ReqMethod.MEETING_PLAYBACK_READY:
+                async def emit(payload):
+                    return await self.send_push({
+                        "request_id": request.request_id, "channel_id": request.channel_id,
+                        "session_id": session_id, "payload": payload,
+                    })
+
+                playback_payload = await manager.prepare_browser_playback(
+                    session_id, str(params.get("meeting_id") or ""), owner_id=owner_id,
+                    startup_id=startup_id or "", route_id=str(params.get("_meeting_route_id") or ""),
+                    model=str(params.get("_qwen_model") or ""),
+                    config_revision=str(params.get("_qwen_revision") or ""),
+                    default_voice=str(params.get("_qwen_default_voice") or ""), emit=emit,
+                )
+            elif request.req_method in {ReqMethod.MEETING_SPEECH_GET, ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED}:
+                consumer = await manager.browser_playback(
+                    session_id, str(params.get("meeting_id") or ""), owner_id,
+                    closing=request.req_method != ReqMethod.MEETING_SPEECH_GET,
+                )
+                if request.req_method == ReqMethod.MEETING_SPEECH_GET:
+                    playback_payload = await consumer.resolve_chunk(params)
+                elif request.req_method == ReqMethod.MEETING_PLAYBACK_RESULT:
+                    playback_payload = await consumer.result(params)
+                else:
+                    playback_payload = consumer.confirm_stop(str(params.get("stop_id") or ""))
             elif request.req_method == ReqMethod.MEETING_RELEASE:
                 if not await manager.release(session_id, owner_id, startup_id):
                     raise ValueError("Meeting is not owned by this connection")
@@ -5370,7 +5398,7 @@ class AgentWebSocketServer:
                 ended = await manager.end(session_id, meeting_id, owner_id=owner_id)
                 if not ended:
                     raise ValueError("Meeting is not owned by this connection or no longer active")
-            payload = await manager.lifecycle_status(session_id, startup_id)
+            payload = playback_payload if playback_payload is not None else await manager.lifecycle_status(session_id, startup_id)
             resp = AgentResponse(
                 request_id=request.request_id, channel_id=request.channel_id,
                 ok=True, payload=payload, metadata=request.metadata,

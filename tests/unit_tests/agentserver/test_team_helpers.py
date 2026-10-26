@@ -83,8 +83,11 @@ def test_group_input_validates_without_core_payload_type(fields, error):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("active,mentions", [(False, []), (True, []), (True, ["alice"])])
-async def test_group_request_routes_without_prompt_and_finishes_public_ack(monkeypatch, active, mentions):
+@pytest.mark.parametrize("active,mentions,meeting", [
+    (False, [], False), (True, [], False), (True, ["alice"], False),
+    (False, [], True), (True, [], True),
+])
+async def test_group_request_routes_without_prompt_and_finishes_public_ack(monkeypatch, active, mentions, meeting):
     started = active
     class Manager(_InactiveTeamRuntimeManagerMixin):
         def has_stream_task(self, session_id):
@@ -94,9 +97,14 @@ async def test_group_request_routes_without_prompt_and_finishes_public_ack(monke
             return active
 
     manager = Manager()
-    manager.get_swarm_enriched_team_spec = AsyncMock(
-        return_value=SimpleNamespace(team_name="unit-team", enable_swarmflow=False),
-    )
+    class Spec(SimpleNamespace):
+        model_fields = {"conversation_history_location": object()}
+    spec = Spec(team_name="unit-team", enable_swarmflow=False, conversation_history_location=None)
+    manager.get_swarm_enriched_team_spec = AsyncMock(return_value=spec)
+    manager.get_team_agent = lambda _: SimpleNamespace(team_backend=SimpleNamespace(
+        group_chat_spec=SimpleNamespace(conversation_history_location="session"),
+    ))
+    monkeypatch.setattr("jiuwenswarm.extensions.meeting.startup._meeting_enabled", lambda: True)
     manager.interact = AsyncMock(return_value=(True, None))
     queue = asyncio.Queue()
     queue.put_nowait({"event_type": "team.group_message.accepted", "client_message_id": "req-group"})
@@ -113,11 +121,13 @@ async def test_group_request_routes_without_prompt_and_finishes_public_ack(monke
     monkeypatch.setattr(team_helpers, "_handle_team_slash_command", AsyncMock(return_value=None))
     request = SimpleNamespace(
         session_id="session-group", request_id="req-group", channel_id="web", metadata=None,
-        params={"mode": "team", "type": "group_chat", "mentions": mentions},
+        params={"mode": "team", "type": "group_chat", "mentions": mentions, **({"meeting_mode": True} if meeting else {})},
     )
     chunks = [chunk async for chunk in team_helpers.process_team_message_stream(
         request, {"query": "讨论"}, object(),
     )]
+    if not active:
+        assert start.await_args.kwargs["team_spec"].conversation_history_location == ("session" if meeting else None)
     payload = (manager.interact.await_args.args[1] if active else start.await_args.kwargs["query"])
     assert payload == {
         "type": "group_chat", "body": "讨论", "client_message_id": "req-group",

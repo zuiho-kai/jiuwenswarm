@@ -3280,6 +3280,11 @@ class MessageHandler(ABC):
             logger.exception("[MessageHandler] server_push 解析失败: %s", e)
             return
         rid = str(chunk.request_id or "")
+        if isinstance(chunk.payload, dict) and chunk.payload.get("event_type") == "meeting.playback":
+            from jiuwenswarm.extensions.meeting.gateway_playback import handle_playback_push
+
+            await handle_playback_push(chunk.payload)
+            return
         if await self._handle_login_credential_refresh_push(chunk):
             return
         sid_raw = wire.get("session_id")

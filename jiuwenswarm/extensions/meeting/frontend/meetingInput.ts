@@ -63,6 +63,7 @@ export function sendMeetingInput(
             sessionId,
             clientMessageId,
             mentions,
+            meeting: true,
             onRequestId: (id) => {
               requestId = id;
             },

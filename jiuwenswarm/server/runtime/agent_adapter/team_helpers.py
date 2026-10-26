@@ -2479,6 +2479,13 @@ async def _process_team_message_stream(
     query = turn.text
     try:
         group_input = _group_chat_input(request, query)
+        from jiuwenswarm.extensions.meeting.startup import meeting_history_requested
+
+        runtime = team_manager.get_team_agent(session_id) if (
+            (getattr(request, "params", None) or {}).get("meeting_mode") is True
+            and team_manager.is_runtime_active(session_id)
+        ) else None
+        meeting_history = meeting_history_requested(getattr(request, "params", None) or {}, group_input, runtime)
     except ValueError as exc:
         yield AgentResponseChunk(
             request_id=rid, channel_id=channel_id,
@@ -2792,6 +2799,10 @@ async def _process_team_message_stream(
             swarmflow_config=swarmflow_config,
             model_selection=runtime_model_selection,
         )
+        if meeting_history:
+            from jiuwenswarm.extensions.meeting.startup import configure_meeting_history
+
+            configure_meeting_history(team_spec)
         if isinstance(model_selection, dict) and model_selection.get("type") and model_selection.get("id"):
             from jiuwenswarm.common.model_selection import ModelSelection as SwarmModelSelection
             from jiuwenswarm.server.runtime.session.model_selection_store import (

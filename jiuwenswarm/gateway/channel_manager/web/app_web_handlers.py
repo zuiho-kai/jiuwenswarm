@@ -5079,6 +5079,10 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("openai_account.auth.logout", _openai_account_auth_logout)
     channel.register_method("openai_account.models.list", _openai_account_models_list)
 
+    from jiuwenswarm.extensions.meeting.gateway_playback import bind_playback_handlers, forget_playback_routes
+
+    bind_playback_handlers(channel, lambda: _resolve(agent_client))
+
     async def _meeting_control(ws, req_id, params, session_id, user_id, method):
         """Forward meeting control to the AgentServer that owns the Team."""
         from secrets import token_hex
@@ -5119,6 +5123,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                     await _release_meeting(ws, target_session, user_id, startup_id)
             elif ok:
                 owned.pop(ownership_key, None)
+                if method == ReqMethod.MEETING_END:
+                    forget_playback_routes(ws, target_session, params.get("meeting_id"))
 
         await proxy_unary_request(
             channel=channel,
