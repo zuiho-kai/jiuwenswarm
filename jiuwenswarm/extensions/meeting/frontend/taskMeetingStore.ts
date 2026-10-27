@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react';
+import { blockTaskInput } from '../../../channels/web/frontend/src/applicationPlugins/taskInputReadiness';
 import type { RecordingState, PlaybackState } from './meetingRuntime';
 
 export type MeetingSnapshot = {
@@ -25,6 +26,7 @@ let snapshot: MeetingSnapshot = {
   voice: '',
 };
 const listeners = new Set<() => void>();
+let releaseInput: (() => void) | undefined;
 
 export function registerMeetingController(next: Controller): () => void {
   controller = next;
@@ -34,6 +36,11 @@ export function registerMeetingController(next: Controller): () => void {
 }
 export function publishMeeting(update: Partial<MeetingSnapshot>): void {
   snapshot = { ...snapshot, ...update };
+  const previous = releaseInput;
+  releaseInput = snapshot.state === 'starting'
+    ? blockTaskInput(snapshot.sessionId)
+    : undefined;
+  previous?.();
   listeners.forEach((listener) => listener());
 }
 export function useMeetingSnapshot(): MeetingSnapshot {

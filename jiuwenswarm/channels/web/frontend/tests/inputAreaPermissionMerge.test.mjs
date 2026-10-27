@@ -119,6 +119,8 @@ const { InputArea } =
 const { useChatStore, useSessionStore, useWorkspaceStore, usePlanStore } =
   await import('../node_modules/.cache/input-area-permission-merge/stores/index.js');
 const { default: i18n } = await import('../node_modules/.cache/input-area-permission-merge/i18n/index.js');
+const { blockTaskInput } =
+  await import('../node_modules/.cache/input-area-permission-merge/applicationPlugins/taskInputReadiness.js');
 
 function byId(id, variant) {
   const selector = `[data-testid="${id}"]${variant === undefined ? '' : `[data-variant="${variant}"]`}`;
@@ -165,6 +167,34 @@ test('idle composer still submits normally', async () => {
     await click(byId('chat-panel-input-send'));
     assert.deepEqual(sent, ['ordinary input']);
     assert.deepEqual(useChatStore.getState().getRuntime(sessionId).taskQueue, []);
+  });
+});
+
+test('meeting startup disables the actual editor and send button, including same-event Enter', async () => {
+  await mount({ mode: 'team' }, async ({ props, render, sessionId }) => {
+    const sent = [];
+    props.onSubmit = (text) => sent.push(text);
+    await render();
+    await typeInput('Keep this draft until ready');
+    let release;
+    try {
+      await act(async () => {
+        release = blockTaskInput(sessionId);
+        byId('chat-panel-input').dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+          key: 'Enter', bubbles: true, cancelable: true,
+        }));
+      });
+      assert.equal(byId('chat-panel-input').getAttribute('contenteditable'), 'false');
+      assert.equal(byId('chat-panel-input-send').disabled, true);
+      await click(byId('chat-panel-input-send'));
+      assert.deepEqual(sent, []);
+      assert.equal(byId('chat-panel-input').textContent, 'Keep this draft until ready');
+    } finally {
+      await act(async () => release?.());
+    }
+    assert.equal(byId('chat-panel-input').getAttribute('contenteditable'), 'true');
+    await click(byId('chat-panel-input-send'));
+    assert.deepEqual(sent, ['Keep this draft until ready']);
   });
 });
 

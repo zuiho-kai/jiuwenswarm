@@ -18,6 +18,7 @@ await require('esbuild').build({
     export {setTeamMeetingEnabled} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/featureFlag.ts'))};
     export {requests,meetingServer,webClient,emit} from 'meeting-test-transport';
     export {hasMeetingAudioOwner} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/playbackOwnership.ts'))};
+    export {isTaskInputBlocked} from ${JSON.stringify(path.join(frontend, 'src/applicationPlugins/taskInputReadiness.ts'))};
     export {rememberGroupChatInput,defaultGroupChatInput} from ${JSON.stringify(path.join(frontend, 'src/features/groupChatInput.ts'))};
   `, resolveDir: frontend },
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', packages: 'external',
@@ -46,6 +47,7 @@ await require('esbuild').build({
             if(name==='meeting.end' && meetingServer.failEnd) throw new Error('unconfirmed cleanup');
             if(name==='meeting.status' && meetingServer.failEnd) return {state:'cleanup_failed'};
             if(name==='meeting.playback.ready' && meetingServer.failReady) throw new Error('unavailable');
+            if(name==='meeting.playback.ready' && meetingServer.beforeReady) await meetingServer.beforeReady();
             if(name==='chat.send'&&meetingServer.acceptInputs)queueMicrotask(()=>{
               if(meetingServer.failInput)emit('chat.error',{session_id:params.session_id,request_id:params.request_id,error:'delivery failed'});
               else emit('team.group_message.accepted',{session_id:params.session_id,client_message_id:params.client_message_id});
@@ -58,7 +60,7 @@ await require('esbuild').build({
     }[path]}));
   }}],
 });
-const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner}=require(output);
+const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner,isTaskInputBlocked}=require(output);
 
 async function mount(extra={}) {
   const dom=new JSDOM('<div id="root"></div>',{url:'http://localhost'});
@@ -66,6 +68,7 @@ async function mount(extra={}) {
   const track={stopped:false,stop(){this.stopped=true;},onended:null};let microphoneCalls=0;
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>{microphoneCalls++;return{getTracks:()=>[track],getAudioTracks:()=>[track]};}}}});
   setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';meetingServer.acceptInputs=true;meetingServer.failInput=false;meetingServer.failEnd=false;meetingServer.failReady=false;
+  meetingServer.beforeReady=null;
   const drafts=[],capture=[],messages=[];
   const onSendMessage=async(text,options)=>{
     messages.push(text);
@@ -126,8 +129,10 @@ test('session creation disables End until the meeting becomes active',async()=>{
     await h.click('chat-panel-input-meeting');
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
     assert.equal(h.find('chat-panel-input-meeting').disabled,true);
+    assert.equal(isTaskInputBlocked('s'),true);
     await h.click('chat-panel-input-meeting');
     await act(async()=>ready('s'));
+    assert.equal(isTaskInputBlocked('s'),false);
     assert.equal(h.microphoneCalls(),1);
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'active');
     assert.equal(h.find('chat-panel-input-meeting').disabled,false);
@@ -145,6 +150,7 @@ test('pending Team readiness can be cancelled without opening the microphone',as
     assert.equal(h.find('chat-panel-input-meeting').disabled,false);
     await h.click('chat-panel-input-meeting');
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+    assert.equal(isTaskInputBlocked('s'),false);
     assert.ok(requests.some(request=>request.name==='meeting.release'));
     assert.ok(!requests.some(request=>request.name==='meeting.end'));
     await act(async()=>{
@@ -352,6 +358,7 @@ test('failed playback readiness releases media and closes the server meeting',as
   assert.ok(h.track.stopped);
   assert.ok(requests.some(r=>r.name==='meeting.end'));
   assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
+  assert.equal(isTaskInputBlocked('s'),false);
  }finally{await h.close();}
 });
 
@@ -367,4 +374,24 @@ test('failed cleanup can be retried after the Task runtime remounts',async()=>{
   assert.equal(second.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');
   assert.ok(requests.some(r=>r.name==='meeting.end'&&r.params.meeting_id==='meeting-one'));
  }finally{await second.close();}
+});
+
+test('input stays blocked through acceptance and playback preparation, then unlocks',async()=>{
+ const h=await mount();let finishReady;
+ try {
+  meetingServer.acceptInputs=false;
+  meetingServer.beforeReady=()=>new Promise(resolve=>{finishReady=resolve;});
+  await h.click('chat-panel-input-meeting');
+  assert.equal(isTaskInputBlocked('s'),true);
+  assert.equal(isTaskInputBlocked('unrelated'),false);
+  const initial=requests.find(r=>r.name==='chat.send');
+  await act(async()=>emit('team.group_message.accepted',{session_id:'s',client_message_id:initial.params.client_message_id}));
+  assert.equal(h.microphoneCalls(),1);
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'starting');
+  assert.equal(isTaskInputBlocked('s'),true);
+  assert.equal(h.find('chat-panel-input-meeting-record'),null);
+  await act(async()=>finishReady());
+  assert.equal(isTaskInputBlocked('s'),false);
+  assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'active');
+ }finally{await h.close();}
 });

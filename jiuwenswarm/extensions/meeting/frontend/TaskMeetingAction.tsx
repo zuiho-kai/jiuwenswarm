@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { LoaderCircle, Mic, Square, UsersRound, VolumeX } from 'lucide-react';
 import type { ApplicationPluginTaskInputActionProps } from '../../../channels/web/frontend/src/applicationPlugins/types';
+import { blockTaskInput } from '../../../channels/web/frontend/src/applicationPlugins/taskInputReadiness';
 import {
   setTeamMeetingEnabled,
   useTeamMeetingEnabled,
@@ -26,8 +27,11 @@ export function TaskMeetingAction({
   const snapshot = useMeetingSnapshot();
   const [creating, setCreating] = useState(false);
   const attempt = useRef(0);
+  const releaseCreation = useRef<(() => void) | undefined>();
   const cancelPending = useCallback(() => {
     attempt.current++;
+    releaseCreation.current?.();
+    releaseCreation.current = undefined;
   }, []);
   const mounted = useRef(true);
   const current = useRef({ sessionId, teamEligible });
@@ -69,16 +73,18 @@ export function TaskMeetingAction({
   }, [status, onMicrophoneActiveChange]);
   useEffect(() => {
     if (!enabled || !teamEligible) {
-      attempt.current++;
+      cancelPending();
       setCreating(false);
       if (active && !teamEligible) stopMeeting();
     }
-  }, [enabled, teamEligible, active]);
+  }, [enabled, teamEligible, active, cancelPending]);
 
   const start = async () => {
     if (creating || microphoneBusy || disabled || (!teamEligible && !onSelectTeamMode)) return;
     const id = ++attempt.current;
     const origin = sessionId;
+    const release = blockTaskInput(null);
+    releaseCreation.current = release;
     setCreating(true);
     try {
       if (!teamEligible) onSelectTeamMode?.();
@@ -86,7 +92,10 @@ export function TaskMeetingAction({
       if (id !== attempt.current || !mounted.current || !enabled) return;
       if (!readyId || (current.current.sessionId !== origin && current.current.sessionId !== readyId)) return;
       setCreating(false);
-      await startMeeting(readyId);
+      const started = startMeeting(readyId);
+      release();
+      releaseCreation.current = undefined;
+      await started;
     } catch (error) {
       if (id !== attempt.current || !mounted.current) return;
       const code =
@@ -106,11 +115,13 @@ export function TaskMeetingAction({
             : 'meetingStartFailed';
       toast.open({ content: t(`meeting.errors.${code}`), variant: 'error' });
     } finally {
+      release();
+      if (releaseCreation.current === release) releaseCreation.current = undefined;
       if (id === attempt.current && mounted.current) setCreating(false);
     }
   };
   const stop = () => {
-    attempt.current++;
+    cancelPending();
     setCreating(false);
     stopMeeting();
   };

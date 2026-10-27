@@ -11,7 +11,9 @@ group-chat message with no mentions, using the existing chat sender and selected
 model/project/equipment. It prepares the Team without asking an Agent to reply.
 The browser waits for that message's SDK acceptance and the meeting coordinator
 before requesting microphone access. Initialization retries within the same
-startup flow reuse the message identity.
+startup flow reuse the message identity. The text editor, Send button, and Enter
+submission stay disabled until the existing startup and playback-ready handshake
+finish. The microphone starts transmitting only after that handshake.
 
 After confirmed speech, a pause automatically finishes the recording, transcribes
 it, and sends the text through normal chat with the Leader as its group-chat

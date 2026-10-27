@@ -189,6 +189,7 @@ import { isImeCompositionKey } from './imeComposition';
 import { useTaskAsr } from '../../features/taskAsr/useTaskAsr';
 import { useTaskAsrEnabled } from '../../features/taskAsr/featureFlag';
 import { ApplicationPluginTaskInputActions } from '../../applicationPlugins/ApplicationPluginOutlet';
+import { isTaskInputBlocked, useTaskInputBlocked } from '../../applicationPlugins/taskInputReadiness';
 
 /** 输入栏下拉所需的最小技能数据结构（与 SkillPanel 中的 SkillItem 保持一致） */
 type InputAreaSkillItem = {
@@ -871,7 +872,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     const runs = s.runtimes[activeSessionId ?? '']?.workflowRuns ?? [];
     return runs.some((run) => run.phases?.some((phase) => phase.agents?.some((agent) => agent.status === 'running')));
   });
-  const composerDisabled = agentGroupUnavailable || isCompactRunning || (hasPendingQuestion && !hasRunningAgent);
+  const applicationInputBlocked = useTaskInputBlocked(activeSessionId);
+  const composerDisabled = applicationInputBlocked || agentGroupUnavailable || isCompactRunning || (hasPendingQuestion && !hasRunningAgent);
   const selectedAgentId = useSessionStore((s) => {
     const runtime = s.runtimes[activeSessionId ?? ''];
     if (runtime?.mode !== 'agent') return null;
@@ -2364,7 +2366,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   );
 
   const handleSubmit = useCallback(() => {
-    if (composerDisabled) return;
+    if (composerDisabled || isTaskInputBlocked(activeSessionId)) return;
 
     // 用富文本（含 chip 标记）作为发送内容，气泡可交织渲染技能
     const richContent = extractRichContent();
@@ -2489,6 +2491,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     hasUploadingAttachments,
     hasAttachmentErrors,
     composerDisabled,
+    activeSessionId,
     isInterruptible,
     onSubmit,
     onForkSession,
