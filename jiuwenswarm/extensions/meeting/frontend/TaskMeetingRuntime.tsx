@@ -250,7 +250,6 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           if (current.current !== active || input.signal.aborted) return;
           initialization.current.delete(id);
           publishMeeting({ state: 'active' });
-          meeting.startRecording(false);
         }
       } catch (error) {
         meeting.stop();

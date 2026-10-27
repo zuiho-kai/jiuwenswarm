@@ -1,21 +1,18 @@
-import { SileroVad, type SpeechDetection } from '../../../channels/web/frontend/src/utils/speechDetection/sileroVad';
 import { resamplePcm16 } from '../../video_duplex/frontend/VideoLivePanel/joyaiVoice';
 
-export interface MeetingSpeechMonitor {
+export interface MeetingCapture {
   start(): Promise<void>;
-  reset(): void;
   stop(): void;
 }
 
-export type MeetingSpeechMonitorFactory = (
+export type MeetingCaptureFactory = (
   stream: MediaStream,
-  onDetection: (detection: SpeechDetection) => void,
+  onPcm: (pcm: Int16Array) => void,
   onError: () => void,
-) => MeetingSpeechMonitor;
+) => MeetingCapture;
 
-/** Observe the meeting's existing microphone stream; ASR still receives the recorder's blob. */
-export class MeetingVad implements MeetingSpeechMonitor {
-  private readonly vad: SileroVad;
+/** Capture only: speech detection and utterance boundaries belong to Gateway. */
+export class MeetingPcmCapture implements MeetingCapture {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private capture: AudioWorkletNode | null = null;
@@ -24,24 +21,13 @@ export class MeetingVad implements MeetingSpeechMonitor {
 
   constructor(
     private readonly stream: MediaStream,
-    onDetection: (detection: SpeechDetection) => void,
+    private readonly onPcm: (pcm: Int16Array) => void,
     private readonly onError: () => void,
-  ) {
-    this.vad = new SileroVad(
-      (detection) => {
-        if (!this.stopped) onDetection(detection);
-      },
-      () => {
-        if (!this.stopped) onError();
-      },
-    );
-  }
+  ) {}
 
   async start(): Promise<void> {
     if (this.stopped) return;
     try {
-      await this.vad.start();
-      if (this.stopped) return;
       const context = new AudioContext({ sampleRate: 16_000 });
       this.context = context;
       await context.audioWorklet.addModule(
@@ -51,7 +37,7 @@ export class MeetingVad implements MeetingSpeechMonitor {
       this.source = context.createMediaStreamSource(this.stream);
       this.capture = new AudioWorkletNode(context, 'jiuwen-duplex-capture');
       this.capture.port.onmessage = ({ data }) => {
-        if (!this.stopped) this.vad.push(resamplePcm16(new Int16Array(data), context.sampleRate, 16_000));
+        if (!this.stopped) this.onPcm(resamplePcm16(new Int16Array(data), context.sampleRate, 16_000));
       };
       this.capture.onprocessorerror = () => {
         if (!this.stopped) this.onError();
@@ -67,26 +53,17 @@ export class MeetingVad implements MeetingSpeechMonitor {
     }
   }
 
-  reset(): void {
-    this.vad.reset();
-  }
-
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
-    this.vad.stop();
     if (this.capture) {
       this.capture.port.onmessage = null;
       this.capture.onprocessorerror = null;
       this.capture.port.close();
       this.capture.disconnect();
-      this.capture = null;
     }
     this.source?.disconnect();
-    this.source = null;
     this.silent?.disconnect();
-    this.silent = null;
-    if (this.context) void this.context.close().catch(() => {});
-    this.context = null;
+    void this.context?.close().catch(() => {});
   }
 }

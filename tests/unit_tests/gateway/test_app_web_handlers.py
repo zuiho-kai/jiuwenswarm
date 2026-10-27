@@ -42,7 +42,7 @@ class FakeWebChannel:
         self.disconnect_handlers = []
         self.routing_keys: list[RoutingKey] = []
 
-    def register_method(self, name, handler):
+    def register_method(self, name, handler, *, local_only=False):
         self.methods[name] = handler
 
     def on_connect(self, handler):

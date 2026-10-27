@@ -15,6 +15,7 @@ from jiuwenswarm.common.voice_matching import load_qwen_voice_catalog
 from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
 from jiuwenswarm.gateway.voice.providers.qwen_omni import QwenOmniRealtimeConfig
 from jiuwenswarm.gateway.voice.tts import QwenOmniTts
+from .gateway_input import MeetingInputStream, bind_input_handlers
 from .playback import IDENTITY_FIELDS
 
 _routes = weakref.WeakValueDictionary()
@@ -25,11 +26,13 @@ def config_revision(config: QwenOmniRealtimeConfig) -> str:
 
 
 class GatewayPlaybackRoute:
-    def __init__(self, channel, ws, agent_client, session_id, meeting_id, owner_id, user_id, config):
+    def __init__(self, channel, ws, agent_client, session_id, meeting_id, owner_id, user_id, config, startup_id):
         self.id = uuid4().hex
         self.channel, self.ws, self.agent_client = channel, ws, agent_client
         self.session_id, self.meeting_id = session_id, meeting_id
         self.owner_id, self.user_id, self.config = owner_id, user_id, config
+        self.startup_id = startup_id
+        self.input = MeetingInputStream(channel, ws, session_id, meeting_id)
         self.revision = config_revision(config)
         self.revoked = False
         self.records = {}
@@ -66,6 +69,11 @@ class GatewayPlaybackRoute:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def stop_media(self):
+        self.revoked = True
+        self.input.revoke()
+        await asyncio.gather(self.cancel_synthesis(), self.input.close())
+
     async def push(self, payload):
         if (payload.get("owner_id"), payload.get("session_id"), payload.get("meeting_id")) != (
             self.owner_id, self.session_id, self.meeting_id,
@@ -84,11 +92,12 @@ class GatewayPlaybackRoute:
             self.produced.setdefault(record["playback_id"], set())
         elif event == "meeting.playback.stop":
             self.revoked = True
+            self.input.revoke()
             stop_id = payload.get("stop_id")
             if not isinstance(stop_id, str) or not stop_id:
                 raise ValueError("Invalid playback stop identity")
             if stop_id not in self.stops:
-                self.stops[stop_id] = asyncio.create_task(self.cancel_synthesis())
+                self.stops[stop_id] = asyncio.create_task(self.stop_media())
         elif event != "meeting.speech.error":
             raise ValueError("Unknown meeting playback event")
         await self.channel.send_event(self.ws, event, {
@@ -102,10 +111,15 @@ async def handle_playback_push(payload: dict) -> None:
         await route.push(payload)
 
 
-def forget_playback_routes(ws, session_id: str, meeting_id: str | None = None):
+def forget_playback_routes(ws, session_id: str, meeting_id: str | None = None, *, startup_id=None):
     routes = getattr(ws, "_meeting_playback_routes", {})
     for key, route in list(routes.items()):
-        if key[0] == session_id and (meeting_id is None or key[1] == meeting_id):
+        if (
+            key[0] == session_id and (meeting_id is None or key[1] == meeting_id)
+            and (startup_id is None or route.startup_id == startup_id)
+        ):
+            route.revoked = True
+            route.input.revoke()
             routes.pop(key, None)
             _routes.pop(route.id, None)
 
@@ -121,6 +135,8 @@ def bind_playback_handlers(channel, agent_client):
         return route
 
     async def ready(ws, req_id, params, session_id, user_id=None):
+        route = None
+        created = False
         try:
             params = params if isinstance(params, dict) else {}
             target = str(params.get("session_id") or session_id or "")
@@ -141,17 +157,26 @@ def bind_playback_handlers(channel, agent_client):
                 setattr(ws, "_meeting_playback_routes", routes)
             route = routes.get((target, meeting_id))
             if route is None:
-                route = GatewayPlaybackRoute(channel, ws, agent_client, target, meeting_id, owner, user_id, config)
+                route = GatewayPlaybackRoute(channel, ws, agent_client, target, meeting_id, owner, user_id, config, startup_id)
                 routes[(target, meeting_id)] = route
-            if route.revoked or route.revision != config_revision(config):
+                created = True
+            if route.revoked or route.input.closed or route.startup_id != startup_id or route.revision != config_revision(config):
                 raise ValueError("Meeting playback configuration changed or has stopped")
+            await route.input.start()
             payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_READY, {
                 "meeting_id": meeting_id, "startup_id": startup_id,
                 "_meeting_route_id": route.id, "_qwen_model": config.model,
                 "_qwen_revision": route.revision, "_qwen_default_voice": config.voice,
             })
-            await channel.send_response(ws, req_id, ok=True, payload=payload)
-        except (ValueError, RuntimeError) as exc:
+            await channel.send_response(ws, req_id, ok=True, payload={**payload, "stream_id": route.input.id})
+        except asyncio.CancelledError:
+            if route is None or not route.input.closed:
+                raise
+            await channel.send_response(ws, req_id, ok=False, error="Meeting audio startup cancelled", code="CANCELLED")
+        except Exception as exc:
+            if created:
+                await route.stop_media()
+                forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
             await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
 
     async def synthesize(ws, req_id, params, session_id, user_id=None):
@@ -248,13 +273,13 @@ def bind_playback_handlers(channel, agent_client):
 
     async def disconnect(ws, _sessions):
         for route in list(getattr(ws, "_meeting_playback_routes", {}).values()):
-            route.revoked = True
-            await route.cancel_synthesis()
+            await route.stop_media()
 
     channel.register_method("meeting.playback.ready", ready)
     channel.register_method("meeting.speech.synthesize", synthesize)
     channel.register_method("meeting.playback.result", result)
     channel.register_method("meeting.playback.stopped", stopped)
+    bind_input_handlers(channel, route_for)
     register_disconnect = getattr(channel, "on_disconnect", None)
     if callable(register_disconnect):
         register_disconnect(disconnect)

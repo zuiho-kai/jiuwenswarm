@@ -118,6 +118,81 @@ async def activate(browser):
     return meeting.driver, meeting.driver.consumer
 
 
+async def test_end_drains_asr_without_delaying_browser_stop(browser, monkeypatch):
+    from jiuwenswarm.extensions.meeting import gateway_input
+    from tests.unit_tests.agentserver.test_meeting_input_audio import Probability, UtteranceSegmenter, frame
+
+    monkeypatch.setattr(gateway_input, "UtteranceSegmenter", lambda: UtteranceSegmenter(Probability()))
+    started, cancelled, finish_cancellation = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def transcribe(_pcm):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await finish_cancellation.wait()
+            return "Late"
+
+    monkeypatch.setattr(gateway_input, "transcribe_utterance", transcribe)
+    driver, _ = await activate(browser)
+    await queue(browser, driver)
+    await next_speech(browser)
+    stream = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])].input
+    for sequence in range(2):
+        assert (await browser.call("meeting.input.append", {
+            "stream_id": stream.id, "sequence": sequence,
+            "audio_base64": base64.b64encode(frame() * 4).decode(),
+        }))["ok"]
+    assert (await browser.call("meeting.input.pause", {"stream_id": stream.id}))["ok"]
+    await asyncio.wait_for(started.wait(), 3)
+    ending = asyncio.create_task(browser.call("meeting.end"))
+    async with asyncio.timeout(3):
+        while not any(event == "meeting.playback.stop" for _, event, _ in browser.channel.events):
+            await asyncio.sleep(0.005)
+    assert not ending.done()  # Browser receives Stop while provider cancellation is draining.
+    finish_cancellation.set()
+    assert (await asyncio.wait_for(ending, 3))["ok"]
+    assert cancelled.is_set() and stream.closed
+    assert not browser.ws._meeting_playback_routes
+    assert not any(event == "meeting.input.transcript" for _, event, _ in browser.channel.events)
+
+
+async def test_input_uses_audio_route_ownership_and_model_readiness(browser, monkeypatch):
+    from jiuwenswarm.extensions.meeting import gateway_input
+    from unittest.mock import Mock
+
+    with monkeypatch.context() as model_patch:
+        model_patch.setattr(gateway_input, "UtteranceSegmenter", Mock(side_effect=RuntimeError("Model unavailable")))
+        assert not (await browser.call("meeting.playback.ready"))["ok"]
+        assert browser.host.manager._sessions[browser.base["session_id"]].driver is None
+        assert not browser.ws._meeting_playback_routes
+    driver, _ = await activate(browser)
+    await queue(browser, driver)
+    await next_speech(browser)
+    stream = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])].input
+    for extra in ({"stream_id": "stale"}, {"stream_id": stream.id, "meeting_id": "foreign"}):
+        assert not (await browser.call("meeting.input.pause", extra))["ok"]
+        assert not stream.closed
+    assert not (await browser.call("meeting.input.pause", {"stream_id": stream.id}, connection=SimpleNamespace()))["ok"]
+
+
+async def test_end_cancels_pending_audio_readiness(browser, monkeypatch):
+    from jiuwenswarm.extensions.meeting.gateway_input import MeetingInputStream
+    started = asyncio.Event()
+
+    async def initialize(_stream):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(MeetingInputStream, "initialize", initialize)
+    ready = asyncio.create_task(browser.call("meeting.playback.ready"))
+    await asyncio.wait_for(started.wait(), 3)
+    assert (await browser.call("meeting.end"))["ok"]
+    assert not (await asyncio.wait_for(ready, 3))["ok"]
+    assert not browser.ws._meeting_playback_routes
+
+
 async def queue(browser, driver, member="leader", text="Spoken summary"):
     await driver.coordinator.for_member(member).post_message(
         "Full public explanation, never synthesized", speech_text=text,

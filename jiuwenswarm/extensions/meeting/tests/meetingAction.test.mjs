@@ -23,13 +23,13 @@ await require('esbuild').build({
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', packages: 'external',
   outfile: output, loader: { '.css': 'empty' },
   plugins: [{ name: 'meeting-action-test-host', setup(build) {
-    build.onResolve({filter:/\/meetingVad$/},()=>({path:'vad',namespace:'meeting-test'}));
+    build.onResolve({filter:/\/meetingCapture$/},()=>({path:'capture',namespace:'meeting-test'}));
     build.onResolve({filter:/react-i18next$/},()=>({path:'i18n',namespace:'meeting-test'}));
     build.onResolve({filter:/stores\/sessionStore$/},()=>({path:'sessions',namespace:'meeting-test'}));
     build.onResolve({filter:/services\/webClient$|^meeting-test-transport$/},()=>({path:'transport',namespace:'meeting-test'}));
     build.onResolve({filter:/Toast\/toastStore$/},()=>({path:'toast',namespace:'meeting-test'}));
     build.onLoad({filter:/.*/,namespace:'meeting-test'},({path})=>({loader:'js',contents: {
-      vad: `export class MeetingVad {async start(){}reset(){}stop(){}}`,
+      capture: `export class MeetingPcmCapture {async start(){}stop(){}}`,
       i18n: `export const useTranslation=()=>({t:key=>key,i18n:{language:'en'}});`,
       sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
       transport: `
@@ -50,7 +50,8 @@ await require('esbuild').build({
               if(meetingServer.failInput)emit('chat.error',{session_id:params.session_id,request_id:params.request_id,error:'delivery failed'});
               else emit('team.group_message.accepted',{session_id:params.session_id,client_message_id:params.client_message_id});
             });
-            return name==='config.get'?{team_meeting_enabled:true}:name==='video.transcribe'?{transcript:'Please review the layout.'}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'||name==='meeting.release'?{state:'idle'}:name==='meeting.playback.ready'?{ready:true}:{};
+            if(name==='meeting.input.pause')queueMicrotask(()=>emit('meeting.input.transcript',{session_id:'s',meeting_id:'meeting-one',stream_id:'input',utterance_id:1,transcript:'Please review the layout.'}));
+            return name==='meeting.input.pause'||name==='meeting.input.resume'?{accepted:true}:name==='config.get'?{team_meeting_enabled:true}:name==='meeting.start'||name==='meeting.status'?{state:meetingServer.state,meeting_id:meetingServer.state==='active'?'meeting-one':undefined}:name==='meeting.end'||name==='meeting.release'?{state:'idle'}:name==='meeting.playback.ready'?{ready:true,stream_id:'input'}:{};
           },
         };`,
       toast: `export const toast={open:()=>{}};`,
@@ -64,11 +65,6 @@ async function mount(extra={}) {
   Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});
   const track={stopped:false,stop(){this.stopped=true;},onended:null};let microphoneCalls=0;
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>{microphoneCalls++;return{getTracks:()=>[track],getAudioTracks:()=>[track]};}}}});
-  globalThis.MediaRecorder=class {
-    static isTypeSupported=()=>true;state='inactive';mimeType='audio/webm';
-    start(){this.state='recording';}stop(){this.state='inactive';this.ondataavailable?.({data:new Blob(['audio'])});this.onstop?.();}
-  };
-  globalThis.FileReader=class {readAsDataURL(){this.result='data:audio/webm;base64,YQ==';this.onload();}};
   setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';meetingServer.acceptInputs=true;meetingServer.failInput=false;meetingServer.failEnd=false;meetingServer.failReady=false;
   const drafts=[],capture=[],messages=[];
   const onSendMessage=async(text,options)=>{

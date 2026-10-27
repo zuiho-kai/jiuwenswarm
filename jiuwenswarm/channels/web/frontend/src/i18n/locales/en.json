@@ -19,14 +19,14 @@
     "stopPlayback": "Stop audio",
     "leader": "Leader",
     "record": {
-      "ready": "Record message",
-      "recording": "Finish and send (or pause to send)",
+      "ready": "Resume microphone",
+      "recording": "Pause microphone (finishes current utterance)",
       "transcribing": "Transcribing…"
     },
     "errors": {
       "playbackUnavailable": "Meeting audio could not be prepared. Check the Qwen configuration and try again.",
       "cleanupFailed": "Meeting cleanup was not confirmed. Retry End meeting.",
-      "vadUnavailable": "Automatic speech-end detection is unavailable. Use Finish recording to send your message.",
+      "inputStreamFailed": "Microphone streaming stopped because the connection could not keep up. Start a new meeting.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
       "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
       "meetingStartFailed": "Could not start the Team meeting. Please try again.",
