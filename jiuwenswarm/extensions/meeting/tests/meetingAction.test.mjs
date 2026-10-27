@@ -224,6 +224,23 @@ test('one click on a new Agent task selects Team mode before creating and record
   } finally {await h.close();}
 });
 
+test('one click survives draft Team eligibility disappearing during session creation',async()=>{
+  let ready;
+  const h=await mount({sessionId:'new',ensureSession:()=>new Promise(resolve=>{ready=resolve;})});
+  try {
+    await h.click('chat-panel-input-meeting');
+    // App removes the draft runtime before its active-session effect selects
+    // the created conversation. The old composer briefly falls back to Agent.
+    await h.updateProps({teamEligible:false,onSelectTeamMode:()=>{}});
+    await h.updateProps({sessionId:'s',teamEligible:true,onSelectTeamMode:undefined});
+    await act(async()=>ready('s'));
+    assert.deepEqual(h.messages,['meeting.startMessage']);
+    assert.equal(h.microphoneCalls(),1);
+    assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'active');
+    assert.equal(isTaskInputBlocked('s'),false);
+  } finally {await h.close();}
+});
+
 test('existing Agent conversations do not offer Team meetings',async()=>{
   const h=await mount({teamEligible:false});
   try {

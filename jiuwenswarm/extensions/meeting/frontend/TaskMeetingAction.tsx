@@ -72,12 +72,15 @@ export function TaskMeetingAction({
     return () => onMicrophoneActiveChange?.(false);
   }, [status, onMicrophoneActiveChange]);
   useEffect(() => {
-    if (!enabled || !teamEligible) {
+    // Session creation removes the draft runtime before selecting the new ID.
+    // Its temporary Agent fallback must not cancel the pending meeting start.
+    const creatingDraft = sessionId === 'new' && releaseCreation.current !== undefined;
+    if (!enabled || (!teamEligible && !creatingDraft)) {
       cancelPending();
       setCreating(false);
       if (active && !teamEligible) stopMeeting();
     }
-  }, [enabled, teamEligible, active, cancelPending]);
+  }, [enabled, teamEligible, active, sessionId, cancelPending]);
 
   const start = async () => {
     if (creating || microphoneBusy || disabled || (!teamEligible && !onSelectTeamMode)) return;
