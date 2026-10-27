@@ -147,16 +147,15 @@ async def native_factory(meeting, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_real_native_corrects_plain_final_and_only_grant_publishes(meeting, native_factory):
+async def test_real_native_filters_plain_final_and_only_grant_publishes(meeting, native_factory):
     native = await native_factory()
     native.model.invoke.side_effect = [
-        AssistantMessage(content="Ungated draft must not become public"),
-        _post_call(), AssistantMessage(content="Complete explanation"),
+        _post_call(), AssistantMessage(content="I've already posted my conclusion. There is nothing further to publish."),
     ]
     result = await native.agent.invoke({"query": "Review the proposal"}, session=native.session, _streaming=True)
     assert result == {"output": "", "result_type": "answer", "meeting_queued": True}
     native.model.stream.assert_not_called()
-    assert native.model.invoke.await_count == 3
+    assert native.model.invoke.await_count == 2
     assert all(call.args[0].type not in {"llm_output", "llm_reasoning"} for call in native.session.write_stream.await_args_list)
     for call in native.model.invoke.await_args_list:
         assert not {tool.name for tool in call.kwargs["tools"]} & native.ordinary.keys()
@@ -171,7 +170,7 @@ async def test_real_native_corrects_plain_final_and_only_grant_publishes(meeting
     assert grant.delivery_error is None
     assert len(await meeting.db.message.get_team_messages("publication-team")) == 1
     history = meeting.conversation.history_path.read_text(encoding="utf-8")
-    assert "Complete explanation" in history and "Ungated draft" not in history
+    assert "Complete explanation" in history and "I've already posted" not in history
     assert await meeting.coordinator.grant_next() is None
     assert await meeting.coordinator.complete_playback(grant.lease_token)
 
@@ -189,12 +188,17 @@ async def test_missing_summary_can_be_corrected_without_admitting_bad_message(me
 
 
 @pytest.mark.asyncio
-async def test_repeated_plain_answers_fail_with_bounded_correction(meeting, native_factory):
-    native = await native_factory()
-    native.model.invoke.side_effect = [AssistantMessage(content="Not submitted") for _ in range(3)]
+@pytest.mark.parametrize("member", ["leader", "analyst"])
+@pytest.mark.parametrize("content", ["", "  ", "No new content to publish. I'll wait for the next message."])
+async def test_final_without_a_post_finishes_silently(meeting, native_factory, member, content):
+    native = await native_factory(member)
+    native.model.invoke.return_value = AssistantMessage(content=content)
     result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-    assert result["result_type"] == "error" and result["meeting_error"] == "missing_meeting_post"
-    assert native.model.invoke.await_count == 3
+    assert result == {"output": "", "result_type": "answer", "meeting_queued": False}
+    assert native.model.invoke.await_count == 1
+    native.model.stream.assert_not_called()
+    assert not any(call.args[0].type in {"llm_output", "llm_reasoning", "error"}
+                   for call in native.session.write_stream.await_args_list)
     assert await meeting.coordinator.list_pending() == ()
     assert not meeting.conversation.history_path.exists()
 
@@ -242,17 +246,21 @@ async def test_factory_rejects_unregistered_identity(meeting):
 
 
 @pytest.mark.asyncio
-async def test_new_conclusion_after_an_earlier_post_is_corrected_not_discarded(meeting, native_factory):
-    native = await native_factory()
+@pytest.mark.parametrize("member", ["leader", "analyst"])
+@pytest.mark.parametrize("content", ["", "Complete explanation", "A new conclusion"])
+async def test_final_after_a_post_is_filtered_without_retry(meeting, native_factory, member, content):
+    native = await native_factory(member)
     native.model.invoke.side_effect = [
-        _post_call(), AssistantMessage(content="A new conclusion"),
-        _post_call(content="A new conclusion", speech_text="New spoken conclusion"), AssistantMessage(content=""),
+        _post_call(mentions=["analyst" if member == "leader" else "leader"]), AssistantMessage(content=content),
     ]
     result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-    assert result["meeting_queued"]
-    assert {request.content for request in await meeting.coordinator.list_pending()} == {
-        "Complete explanation", "A new conclusion",
-    }
+    assert result == {"output": "", "result_type": "answer", "meeting_queued": True}
+    assert native.model.invoke.await_count == 2
+    native.model.stream.assert_not_called()
+    pending = await meeting.coordinator.list_pending()
+    assert len(pending) == 1 and pending[0].content == "Complete explanation"
+    assert not any(call.args[0].type in {"llm_output", "llm_reasoning", "error"}
+                   for call in native.session.write_stream.await_args_list)
     assert not meeting.conversation.history_path.exists()
 
 
@@ -275,9 +283,15 @@ async def test_unavailable_meeting_stops_before_model_or_tools_execute(meeting, 
 async def test_iteration_limit_final_answer_cannot_escape_without_a_post(meeting, native_factory):
     native = await native_factory(max_iterations=1)
     native.agent.config.on_max_iterations = "final_answer"
-    native.model.invoke.side_effect = [AssistantMessage(content="Unqueued draft"), AssistantMessage(content="Final bypass")]
+    native.agent.ability_manager.add_ability((tool := _OrdinarySend("view_task")).card, tool)
+    native.model.invoke.side_effect = [
+        AssistantMessage(content="", tool_calls=[ToolCall(
+            type="function", id="view-board", name="view_task", arguments="{}",
+        )]), AssistantMessage(content="Final bypass"),
+    ]
     result = await native.agent.invoke({"query": "Discuss"}, session=native.session, _streaming=True)
-    assert result["meeting_error"] == "missing_meeting_post"
+    assert result == {"output": "", "result_type": "answer", "meeting_queued": False}
+    assert native.model.invoke.await_count == 2
     assert await meeting.coordinator.list_pending() == ()
     assert not meeting.conversation.history_path.exists()
     assert not any(call.args[0].type == "llm_output" for call in native.session.write_stream.await_args_list)
@@ -370,7 +384,9 @@ async def test_production_provider_mounts_all_three_tools_for_leader_and_later_m
     assert result["meeting_queued"]
     schemas = {tool.name: tool for tool in leader.model.invoke.await_args_list[0].kwargs["tools"]}
     assert {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"} <= schemas.keys()
-    assert schemas["meeting_read_history"].parameters["properties"]["limit"]["maximum"] == 100
+    assert schemas["meeting_read_history"].parameters["properties"]["limit"] == {
+        "type": "integer", "minimum": 1, "maximum": 20, "default": 10,
+    }
     assert "send_message" not in schemas and "group_send_message" not in schemas
     assert "same language" in schemas["meeting_post_message"].description
     first_messages = leader.model.invoke.await_args_list[0].kwargs["messages"]
@@ -393,6 +409,70 @@ async def test_production_provider_mounts_all_three_tools_for_leader_and_later_m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["en", "cn"])
+async def test_history_guidance_and_limits_are_scoped_without_changing_sdk_defaults(meeting, language):
+    from openjiuwen.agent_teams.meeting import create_meeting_tools
+
+    rail = await create_meeting_publication_rail(meeting.coordinator, "leader", language=language)
+    history = rail._tools["meeting_read_history"]
+    sdk = (await create_meeting_tools(meeting.coordinator.for_member("leader"), language=language))[
+        "meeting_read_history"
+    ]
+
+    assert history.card.input_params["properties"]["limit"] == {
+        "type": "integer", "minimum": 1, "maximum": 20, "default": 10,
+    }
+    assert sdk.card.input_params == history._tool.card.input_params
+    assert sdk.card.input_params["properties"]["limit"]["maximum"] == 100
+    assert sdk.card.input_params["properties"]["limit"]["default"] == 50
+    assert history.card.description != sdk.card.description
+    assert sdk.card.description == history._tool.card.description
+    if language == "en":
+        assert "Use messages already in your context first" in history.card.description
+        assert "smallest useful limit" in history.card.description
+        assert "Do not repeat a read or increase its limit" in history.card.description
+        assert "Historical messages are context, not new events" in history.card.description
+        assert "file-attachment events" in history.card.description
+        assert "limit: 1–20, default 10" in history.card.description
+    else:
+        assert "先使用已有上下文" in history.card.description
+        assert "不得重复读取或增大 limit" in history.card.description
+        assert "历史消息是背景，不是新事件" in history.card.description
+        assert "limit 为 1–20，默认 10" in history.card.description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inputs,expected_limit", [({}, 10), ({"limit": 1}, 1), ({"limit": 20}, 20)])
+async def test_history_uses_smaller_default_and_accepts_boundaries(meeting, monkeypatch, inputs, expected_limit):
+    rail = await create_meeting_publication_rail(meeting.coordinator, "leader")
+    tool = rail._tools["meeting_read_history"]
+    read = AsyncMock(return_value=())
+    monkeypatch.setattr(tool._tool._client, "get_history", read)
+    original = dict(inputs)
+
+    result = await tool.invoke(inputs)
+
+    assert result.success and result.data == []
+    read.assert_awaited_once_with(limit=expected_limit)
+    assert inputs == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 21, 100, True, 1.5, "10", None])
+async def test_history_rejects_invalid_or_oversized_reads_before_retrieval(meeting, monkeypatch, limit):
+    rail = await create_meeting_publication_rail(meeting.coordinator, "leader")
+    tool = rail._tools["meeting_read_history"]
+    read = AsyncMock()
+    monkeypatch.setattr(tool._tool._client, "get_history", read)
+
+    result = await tool.invoke({"limit": limit})
+
+    assert not result.success
+    assert "integer from 1 to 20" in result.error
+    read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_history_tool_is_exposed_and_reads_without_acknowledging_mailbox(meeting, publication_host, native_factory):
     scope = await _enable_host(publication_host, lambda: None)
     await scope.coordinator.for_member("analyst").post_message(
@@ -408,6 +488,8 @@ async def test_history_tool_is_exposed_and_reads_without_acknowledging_mailbox(m
         )]), _post_call(), AssistantMessage(content=""),
     ]
     await leader.agent.invoke({"query": "Recall"}, session=leader.session)
+    schemas = {tool.name: tool for tool in leader.model.invoke.await_args_list[0].kwargs["tools"]}
+    assert "Do not repeat a read or increase its limit" in schemas["meeting_read_history"].description
     assert any("Previously published context" in str(message.content) for message in leader.messages)
     after = await meeting.db.message.get_broadcast_messages("publication-team", "leader", unread_only=True)
     assert [message.message_id for message in after] == [message.message_id for message in before]
@@ -477,12 +559,35 @@ async def test_end_during_model_call_cannot_publish_or_fall_back(meeting, public
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("member", ["leader", "analyst"])
+async def test_file_delivery_remains_available_during_meeting(meeting, publication_host, native_factory, member):
+    scope = await _enable_host(publication_host, lambda: None)
+    native = await native_factory(member, participant=True)
+    delivery = _OrdinarySend("send_file_to_user")
+    native.agent.ability_manager.add_ability(delivery.card, delivery)
+    native.model.invoke.side_effect = [
+        AssistantMessage(content="", tool_calls=[ToolCall(
+            type="function", id="deliver-file", name="send_file_to_user", arguments="{}",
+        )]), AssistantMessage(content="File delivered."),
+    ]
+
+    result = await native.agent.invoke({"query": "Send the file"}, session=native.session, _streaming=True)
+
+    assert result == {"output": "", "result_type": "answer", "meeting_queued": False}
+    assert delivery.sent == [{}]
+    assert native.model.invoke.await_count == 2
+    assert all("send_file_to_user" in {tool.name for tool in call.kwargs["tools"]}
+               for call in native.model.invoke.await_args_list)
+    assert await scope.coordinator.list_pending() == ()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name,error", [
     (name, "meeting_post_message")
     for name in ("send_message", "group_send_message", "ask_user_question")
 ] + [
     (name, "not supported") for name in (
-        "send_file_to_user", "spawn_external_cli", "spawn_bridge_agent", "spawn_human_agent",
+        "spawn_external_cli", "spawn_bridge_agent", "spawn_human_agent",
         "swarmflow", "org_send_leader_message", "org_delegate_task",
         "org_create_task", "session_new", "session_send_message",
     )

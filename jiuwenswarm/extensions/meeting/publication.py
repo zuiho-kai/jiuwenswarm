@@ -6,7 +6,6 @@ using this adapter. Browser activation waits for the grant/playback integration.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable
 from copy import deepcopy
@@ -26,7 +25,8 @@ from openjiuwen.core.single_agent.rail.base import (
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
-from .prompts import SECTION_NAME, build_meeting_role_section, summary_contract
+from .config import DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT
+from .prompts import SECTION_NAME, build_meeting_role_section, history_contract, summary_contract
 
 logger = logging.getLogger(__name__)
 _POST = "meeting_post_message"
@@ -38,7 +38,7 @@ _BYPASS_TOOLS = frozenset({"send_message", "group_send_message", "ask_user_quest
 # before it has side effects instead of allowing an uncoordinated speaker.
 _UNSUPPORTED_TOOLS = frozenset({
     "spawn_external_cli", "spawn_bridge_agent", "spawn_human_agent", "spawn_passive_human",
-    "swarmflow", "send_file_to_user",
+    "swarmflow",
     "session_new", "session_send_message", "session_continue_queued",
 })
 _ORG_OBSERVATION_TOOLS = frozenset({
@@ -62,7 +62,6 @@ class _PublicationTurn:
     # The SDK copies ctx.extra for parallel tool calls. Keep this one mutable
     # per-invocation value so successful admission is visible to the model hook.
     queued_content: list[str] = field(default_factory=list)
-    corrections: int = 0
 
 
 class _ScopedTool(TeamTool):
@@ -74,10 +73,21 @@ class _ScopedTool(TeamTool):
         self._owner = owner
         if self.card.name == _POST:
             self.card.description += "\n\n" + summary_contract(owner.language)
+        elif self.card.name == "meeting_read_history":
+            self.card.description = history_contract(owner.language)
+            self.card.input_params["properties"]["limit"].update(
+                maximum=MAX_HISTORY_LIMIT, default=DEFAULT_HISTORY_LIMIT,
+            )
 
     async def invoke(self, inputs: dict[str, Any], **kwargs: Any) -> ToolOutput:
         if not self._owner.active:
             return ToolOutput(success=False, error="This meeting publication scope has ended")
+        if self.card.name == "meeting_read_history" and isinstance(inputs, dict):
+            limit = inputs.get("limit", DEFAULT_HISTORY_LIMIT)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_HISTORY_LIMIT:
+                return ToolOutput(success=False, error=f"History limit must be an integer from 1 to {MAX_HISTORY_LIMIT}")
+            # The SDK still defaults to 50; always supply the meeting's default.
+            inputs = {**inputs, "limit": limit}
         result = await self._tool.invoke(inputs, **kwargs)
         if self.card.name == _POST and result.success and self._owner.on_queued is not None:
             try:
@@ -147,7 +157,7 @@ class MeetingPublicationRail(DeepAgentRail):
 
     async def before_model_call(self, ctx: AgentCallbackContext) -> None:
         # The pinned native runtime streams model text before AFTER_MODEL_CALL.
-        # Buffer this member's model response so only granted group sends publish.
+        # Buffer this member's model response so ordinary final text stays hidden.
         ctx.extra[_STREAMING] = ctx.extra.get("_streaming", False)
         ctx.extra["_streaming"] = False
         ctx.extra.setdefault(_TURN, _PublicationTurn())
@@ -180,22 +190,12 @@ class MeetingPublicationRail(DeepAgentRail):
         if response is None or response.tool_calls:
             return
         turn = ctx.extra[_TURN]
-        content = response.content.strip() if isinstance(response.content, str) else response.content
-        if turn.queued_content and (not content or content in turn.queued_content):
-            ctx.request_force_finish({"output": "", "result_type": "answer", "meeting_queued": True})
-            return
-        if turn.corrections >= 2 or ctx.extra.get("_finalizing_max_iterations"):
-            ctx.request_force_finish({
-                "output": "Meeting reply could not be queued: use meeting_post_message with both text fields.",
-                "result_type": "error",
-                "meeting_error": "missing_meeting_post",
-            })
-            return
-        turn.corrections += 1
-        if ctx.steering_queue is None:
-            ctx.bind_steering_queue(asyncio.Queue())
-        ctx.push_steering(_CORRECTION)
-        ctx.request_model_continue()
+        # A normal final answer ends the turn silently; it is not a meeting post.
+        # This includes idle turns with nothing new to post.
+        # Asking for another post here can duplicate an already queued message.
+        ctx.request_force_finish({
+            "output": "", "result_type": "answer", "meeting_queued": bool(turn.queued_content),
+        })
 
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
         if isinstance(ctx.inputs, ToolCallInputs) and (
@@ -221,7 +221,6 @@ class MeetingPublicationRail(DeepAgentRail):
         if isinstance(result, ToolOutput) and result.success and result.data.get("speech_request"):
             turn = ctx.extra[_TURN]
             turn.queued_content.append(result.data["message"]["content"].strip())
-            turn.corrections = 0
 
 
 async def create_meeting_publication_rail(
