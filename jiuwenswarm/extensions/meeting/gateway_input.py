@@ -14,14 +14,21 @@ MAX_PENDING_UTTERANCES = 4
 
 
 async def transcribe_utterance(pcm: bytes) -> str:
-    # Reuse the same provider selection, adapters, and filler filtering as video.transcribe.
-    from jiuwenswarm.extensions.video_duplex.backend.video_voice import (
-        is_ignorable_asr_filler, transcribe_audio,
+    from jiuwenswarm.gateway.channel_manager.web.task_asr import (
+        TaskAsrError, transcribe_task_audio,
     )
-    from jiuwenswarm.extensions.video_duplex.backend.video_live import _uses_joyai_voice_channel
+    from jiuwenswarm.extensions.video_duplex.backend.video_voice import is_ignorable_asr_filler
 
-    data_url = "data:audio/wav;base64," + base64.b64encode(pcm_wav(pcm)).decode("ascii")
-    transcript = await transcribe_audio([(data_url, "Meeting microphone")], use_joyai_voice=_uses_joyai_voice_channel())
+    # Meetings use Settings > Speech transcription, independently of video duplex.
+    try:
+        transcript = await transcribe_task_audio({
+            "audio_base64": base64.b64encode(pcm_wav(pcm)).decode("ascii"),
+            "mime_type": "audio/wav",
+        })
+    except TaskAsrError as exc:
+        if exc.code == "ASR_EMPTY_TRANSCRIPT":
+            return ""
+        raise
     return "" if is_ignorable_asr_filler(transcript) else transcript.strip()
 
 

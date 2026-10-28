@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""OpenAI-compatible ASR used by the regular task chat composer."""
+"""OpenAI-compatible Speech transcription ASR for task chat and meeting input."""
 
 from __future__ import annotations
 
@@ -113,7 +113,7 @@ async def transcribe_task_audio(
     environ: Mapping[str, str] | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> str:
-    """Transcribe one browser recording with the task-chat ASR configuration."""
+    """Transcribe one recording with the Speech transcription ASR configuration."""
 
     env = environ if environ is not None else os.environ
     endpoint = task_asr_endpoint(env.get("ASR_API_BASE", ""))

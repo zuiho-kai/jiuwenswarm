@@ -87,7 +87,8 @@ that identity and a chunk index; it cannot override text, model or voice. Gatewa
 resolves the canonical chunk on AgentServer, synthesizes it using the shared Qwen
 Omni component, then rechecks the lease/configuration before returning WAV audio.
 Credentials stay on Gateway. Qwen must be configured through `QWEN_OMNI_*`;
-recording continues to use the existing `video.transcribe` ASR endpoint.
+input uses Settings > Speech transcription (`ASR_API_BASE`, `ASR_API_KEY`, and
+`ASR_MODEL_NAME`), independently of the video-duplex provider and voice settings.
 
 Only natural playback completion of every chunk reports `meeting.playback.result`
 as completed and releases the SDK speaking lease. Synthesized audio alone never

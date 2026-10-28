@@ -2,9 +2,12 @@
 
 import asyncio
 import base64
+import io
+import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import numpy as np
 import pytest
 
@@ -12,10 +15,64 @@ from jiuwenswarm.extensions.meeting import gateway_input as gateway
 from jiuwenswarm.extensions.meeting.input_audio import (
     FRAME_SAMPLES, UtteranceSegmenter,
 )
+from jiuwenswarm.gateway.channel_manager.web import task_asr
 
 
 def frame(value=1000):
     return np.full(FRAME_SAMPLES, value, dtype="<i2").tobytes()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transcript, expected", [
+    (" meeting transcript ", "meeting transcript"),
+    ("嗯。", ""),
+    ("", ""),
+])
+async def test_meeting_uses_speech_transcription_settings_with_joyai_configured(
+    monkeypatch, transcript, expected,
+):
+    monkeypatch.setenv("ASR_API_BASE", "https://speech.example/v1/audio/transcriptions")
+    monkeypatch.setenv("ASR_API_KEY", "speech-secret")
+    monkeypatch.setenv("ASR_MODEL_NAME", "speech-model")
+    monkeypatch.setenv("VIDEO_LIVE_MODE", "joyai")
+    monkeypatch.setenv("VOICE_PROTOCOL", "native_ws")
+    monkeypatch.setenv("VOICE_ASR_ENDPOINT", "ws://127.0.0.1:8994/ws/asr")
+    monkeypatch.setenv("VOICE_ASR_MODEL", "unrelated-voice-model")
+    monkeypatch.setenv("VOICE_API_KEY", "unrelated-voice-secret")
+    monkeypatch.setattr(task_asr, "_decrypt_api_key", lambda value: value)
+    pcm = frame() * 10
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        assert str(request.url) == "https://speech.example/v1/audio/transcriptions"
+        assert request.headers["authorization"] == "Bearer speech-secret"
+        body = await request.aread()
+        assert b"speech-model" in body
+        assert b"Content-Type: audio/wav" in body
+        wav_start = body.index(b"RIFF")
+        with wave.open(io.BytesIO(body[wav_start:]), "rb") as recording:
+            assert recording.getnchannels() == 1
+            assert recording.getsampwidth() == 2
+            assert recording.getframerate() == 16_000
+            assert recording.readframes(recording.getnframes()) == pcm
+        return httpx.Response(200, json={"text": transcript})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        monkeypatch.setattr(task_asr.httpx, "AsyncClient", lambda **_kwargs: client)
+        assert await gateway.transcribe_utterance(pcm) == expected
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_meeting_requires_speech_transcription_config_even_with_joyai(monkeypatch):
+    monkeypatch.delenv("ASR_API_BASE", raising=False)
+    monkeypatch.setenv("VIDEO_LIVE_MODE", "joyai")
+    monkeypatch.setenv("VOICE_PROTOCOL", "native_ws")
+    monkeypatch.setenv("VOICE_ASR_ENDPOINT", "ws://127.0.0.1:8994/ws/asr")
+    with pytest.raises(task_asr.TaskAsrError) as error:
+        await gateway.transcribe_utterance(frame())
+    assert error.value.code == "ASR_NOT_CONFIGURED"
 
 
 class Probability:
