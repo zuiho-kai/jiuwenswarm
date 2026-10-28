@@ -99,6 +99,8 @@ class ReqMethod(Enum):
     MEETING_SPEECH_GET = "meeting.speech.get"
     MEETING_PLAYBACK_RESULT = "meeting.playback.result"
     MEETING_PLAYBACK_STOPPED = "meeting.playback.stopped"
+    MEETING_INPUT_PREPARE = "meeting.input.prepare"
+    MEETING_INPUT_ADMITTED = "meeting.input.admitted"
 
     PATH_GET = "path.get"
     PATH_SET = "path.set"

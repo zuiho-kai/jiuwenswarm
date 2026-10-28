@@ -10,7 +10,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -152,6 +152,17 @@ class _ScopedTool(TeamTool):
                 return ToolOutput(success=False, error=f"History limit must be an integer from 1 to {MAX_HISTORY_LIMIT}")
             # The SDK still defaults to 50; always supply the meeting's default.
             inputs = {**inputs, "limit": limit}
+        if self.card.name == "meeting_interrupt_speech":
+            if (
+                not isinstance(inputs, dict) or set(inputs) != {"expected_token"}
+                or not isinstance(inputs["expected_token"], str) or not inputs["expected_token"].strip()
+            ):
+                return ToolOutput(success=False, error="Provide the observed expected_token only")
+            try:
+                interruption = await self._owner.on_interrupt(self._owner._client.member_name, inputs["expected_token"])
+                return ToolOutput(success=True, data=asdict(interruption) if interruption is not None else None)
+            except (ValueError, RuntimeError, OSError, SQLAlchemyError) as exc:
+                return ToolOutput(success=False, error=str(exc))
         result = await self._tool.invoke(inputs, **kwargs)
         if self.card.name == _POST and result.success and self._owner.on_queued is not None:
             try:
@@ -179,12 +190,14 @@ class MeetingPublicationRail(DeepAgentRail):
     def __init__(
         self, coordinator: MeetingCoordinator, member_name: str, *, leader: bool,
         language: str = "en", on_queued: Callable[[], None] | None = None,
+        on_interrupt=None,
     ) -> None:
         super().__init__()
         self._client = coordinator.for_member(member_name)
         self._leader = leader
         self.language = language
         self.on_queued = on_queued
+        self.on_interrupt = on_interrupt
         self._tools: dict[str, TeamTool] = {}
         self._agent: Any = None
         self.system_prompt_builder: Any = None
@@ -364,6 +377,7 @@ async def create_meeting_publication_rail(
     coordinator: MeetingCoordinator, member_name: str, *, language: str = "en",
     on_queued: Callable[[], None] | None = None,
     on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
+    on_interrupt=None,
 ) -> MeetingPublicationRail:
     """Prepare one trusted native member; caller owns installation and removal.
 
@@ -375,7 +389,7 @@ async def create_meeting_publication_rail(
         raise ValueError("An active meeting is required for publication tools")
     rail = MeetingPublicationRail(
         coordinator, member_name, leader=member_name == state.leader_member_name,
-        language=language, on_queued=on_queued,
+        language=language, on_queued=on_queued, on_interrupt=on_interrupt,
     )
     tools = await create_meeting_tools(coordinator.for_member(member_name), language=language)
     if rail._leader:
@@ -383,6 +397,6 @@ async def create_meeting_publication_rail(
     rail._tools = {
         name: _ScopedTool(tool, rail)
         for name, tool in tools.items()
-        if name != "meeting_interrupt_speech"
+        if name != "meeting_interrupt_speech" or on_interrupt is not None
     }
     return rail

@@ -29,6 +29,7 @@ class MeetingPublicationSession:
         self, coordinator: MeetingCoordinator, on_queued: Callable[[], None], *,
         voices: MemberVoiceRegistry | None = None,
         on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
+        on_interrupt=None,
     ) -> None:
         if not callable(on_queued):
             raise ValueError("A meeting publication consumer wake-up callback is required")
@@ -40,6 +41,7 @@ class MeetingPublicationSession:
         self.on_queued = on_queued
         self.voices = voices
         self.on_addressed_members = on_addressed_members
+        self.on_interrupt = on_interrupt
         self.closed = False
         self._members: set[MeetingPublicationRail] = set()
 
@@ -61,6 +63,7 @@ class MeetingPublicationSession:
         policy = await create_meeting_publication_rail(
             self.coordinator, member_name, language=language, on_queued=self.on_queued,
             on_addressed_members=self.on_addressed_members,
+            on_interrupt=self.on_interrupt,
         )
         if self.closed:
             raise ValueError("Meeting publication scope has ended")

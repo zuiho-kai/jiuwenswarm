@@ -29,7 +29,7 @@ function harness({startCapture = async()=>{}} = {}) {
   const meeting=new MeetingSession(transport,'s',context,callbacks,(_stream,pcm,error)=>{onPcm=pcm;captureError=error;return capture;});
   const track={stop(){this.stopped=true;},onended:null};
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[track],getAudioTracks:()=>[track]})}}});
-  return {meeting,requests,handlers,track,lines,errors,drafts,states,resolvers,capture,
+  return {meeting,requests,handlers,track,lines,errors,drafts,states,resolvers,capture,callbacks,
     pcm:(samples=new Int16Array(1600).fill(1000))=>onPcm(samples), captureError:()=>captureError(),
     disconnect:()=>onState?.('closed')};
 }
@@ -83,4 +83,60 @@ test('microphone streams PCM before utterance completion and stays live across t
  assert.deepEqual(h.drafts,['First','Second']);assert.equal(h.states.at(-1),'recording');
  assert.deepEqual(h.requests.filter(r=>r.name==='meeting.input.append').map(r=>r.params.sequence),[0,1,2]);
  h.meeting.stop();h.meeting.finishCleanup();
+});
+
+const interruptSpeech=(h,extra={})=>h.handlers.get('meeting.speech.stop')({payload:{...speech(extra),stop_id:'interruption'}});
+
+test('interruption stops matching audio, retains microphone, and plays the next speaker',async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+ await tick();assert.equal(audios.length,1);
+ const oldEnd=audios[0].onended;
+ interruptSpeech(h);await tick();
+ assert.ok(audios[0].paused);assert.ok(!h.capture.stopped);assert.ok(!h.track.stopped);
+ assert.ok(h.requests.some(r=>r.name==='meeting.playback.stopped'&&r.params.stop_id==='interruption'));
+ assert.ok(!h.requests.some(r=>r.name==='meeting.playback.result'));
+ h.pcm();await tick();assert.ok(h.requests.some(r=>r.name==='meeting.input.append'));
+ emitSpeech(h,{playback_id:'next',request_id:'next-request',lease_token:'next-lease'});await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'next',chunk_index:0});
+ await tick();assert.equal(audios.length,2);
+ interruptSpeech(h);await tick();assert.ok(!audios[1].paused); // Duplicate old stop cannot stop the new speaker.
+ oldEnd();audios[1].onended();await tick();
+ const results=h.requests.filter(r=>r.name==='meeting.playback.result');
+ assert.equal(results.length,1);assert.equal(results[0].params.playback_id,'next');
+ assert.equal(results[0].params.outcome,'completed');
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+test('interrupted synthesis cannot start late audio or replay a duplicate ready event',async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+ interruptSpeech(h);await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+ await tick();emitSpeech(h);await tick();assert.equal(audios.length,0);
+ assert.equal(h.requests.filter(r=>r.name==='meeting.speech.synthesize').length,1);
+ assert.ok(!h.requests.some(r=>r.name==='meeting.playback.result'));
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+test('human interruption is released only after public input acceptance',async()=>{
+ const h=harness();await ready(h);
+ let accept;h.callbacks.draft=()=>new Promise(resolve=>{accept=resolve;});
+ inputEvent(h,'meeting.input.transcript',{transcript:'Wait, change that',interruption_id:'barrier'});
+ await tick();assert.ok(!h.requests.some(r=>r.name==='meeting.input.admitted'));
+ accept();await tick();
+ const admitted=h.requests.find(r=>r.name==='meeting.input.admitted');
+ assert.equal(admitted.params.interruption_id,'barrier');assert.equal(admitted.params.utterance_id,1);
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+test('failed human input and ended meetings never acknowledge admission',async()=>{
+ const h=harness();await ready(h);
+ h.callbacks.draft=async()=>{throw new Error('rejected');};
+ inputEvent(h,'meeting.input.transcript',{transcript:'Wait',interruption_id:'barrier'});await tick();
+ assert.ok(h.errors.includes('deliveryFailed'));assert.ok(!h.requests.some(r=>r.name==='meeting.input.admitted'));
+ let accept;h.callbacks.draft=()=>new Promise(resolve=>{accept=resolve;});
+ inputEvent(h,'meeting.input.transcript',{utterance_id:2,transcript:'Another',interruption_id:'barrier'});
+ h.meeting.stop();accept();await tick();
+ assert.ok(!h.requests.some(r=>r.name==='meeting.input.admitted'));
+ h.meeting.finishCleanup();
 });

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from functools import partial
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from .input_audio import UtteranceSegmenter, pcm_wav
 
 MAX_CHUNK_BYTES = 6_400  # Up to 200 ms of signed little-endian PCM16.
 MAX_PENDING_UTTERANCES = 4
+logger = logging.getLogger(__name__)
 
 
 async def transcribe_utterance(pcm: bytes) -> str:
@@ -47,6 +49,9 @@ class MeetingInputStream:
         self.queue = asyncio.Queue(maxsize=MAX_PENDING_UTTERANCES)
         self.worker = None
         self.initializing = None
+        self.prepare_transcript = None
+        self.admit_transcript = None
+        self.admissions: dict[int, str] = {}
 
     async def start(self):
         if self.initializing is None:
@@ -123,7 +128,17 @@ class MeetingInputStream:
                 await self.emit("meeting.input.transcribing", utterance_id=utterance_id)
                 async with asyncio.timeout(60):
                     text = await transcribe_utterance(pcm)
-                await self.emit("meeting.input.transcript", utterance_id=utterance_id, transcript=text)
+                prepared = {}
+                if text and not self.closed and self.prepare_transcript is not None:
+                    try:
+                        prepared = await self.prepare_transcript(text)
+                    except Exception:
+                        # ASR already succeeded. An unavailable interruption
+                        # control must not discard the human's actual message.
+                        logger.warning("Meeting interruption preparation failed; delivering transcript", exc_info=True)
+                    if prepared.get("interruption_id"):
+                        self.admissions[utterance_id] = prepared["interruption_id"]
+                await self.emit("meeting.input.transcript", utterance_id=utterance_id, transcript=text, **prepared)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -148,6 +163,12 @@ class MeetingInputStream:
             self.queue.get_nowait()
             self.queue.task_done()
 
+    async def admitted(self, params):
+        utterance_id, interruption_id = params.get("utterance_id"), params.get("interruption_id")
+        if type(utterance_id) is not int or self.admissions.get(utterance_id) != interruption_id or not interruption_id:
+            raise ValueError("Unknown human-input interruption")
+        await self.admit_transcript(interruption_id)
+
 
 
 def bind_input_handlers(channel, route_for):
@@ -162,15 +183,17 @@ def bind_input_handlers(channel, route_for):
             stream = candidate
             if operation == "append":
                 await stream.append(params)
+            elif operation == "admitted":
+                await stream.admitted(params)
             elif operation == "stop":
                 await stream.close()
             else:
                 await stream.listening_control(operation == "resume")
             await channel.send_response(ws, req_id, ok=True, payload={"accepted": True})
         except Exception as exc:
-            if stream is not None:
+            if stream is not None and operation != "admitted":
                 await stream.close()
             await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_INPUT_FAILED")
 
-    for operation in ("append", "pause", "resume", "stop"):
+    for operation in ("append", "pause", "resume", "stop", "admitted"):
         channel.register_method(f"meeting.input.{operation}", partial(control, operation=operation), local_only=True)

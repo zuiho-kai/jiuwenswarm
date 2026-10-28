@@ -128,6 +128,43 @@ sidebar destination or second conversation editor. This path supports native
 in-process Team members; process runtimes, Team plan mode and unsupported rosters
 reject coordinated activation. Video-duplex files and their imports are unchanged.
 
+## Human and Leader interruption
+
+After ASR, human speech during an active speaking lease is checked through the
+SDK's existing duplex supervisor classifier and the Team's configured endpoint,
+model, key environment and timeout. Without a configured endpoint it uses the
+shared JEV defaults (`TYPESAFE_API_KEY`). The judgment concerns taking the audio
+floor only: it does not reject, rewrite or reroute the human message. A confident
+`INTERRUPT` decision (at least 0.9) cuts speech; acknowledgements and uncertain,
+failed or timed-out judgments leave speech running and still deliver the text.
+VAD alone never stops agent audio.
+
+The Leader can inspect `meeting_get_speaker` and call
+`meeting_interrupt_speech(expected_token)` with its observed lease token. Only
+the Leader receives this tool, and only while the host playback consumer is
+installed. A stale token cannot cut a later speaker's speech. Interruptions stop
+audio only; published full text and the remaining queued requests are preserved.
+
+Both paths revoke the matching SDK lease and send `meeting.speech.stop` with its
+complete playback identity. The browser stops only that speech and keeps its
+microphone active. Gateway drains synthesis cancellation before forwarding the
+browser's `meeting.playback.stopped` acknowledgement. Cancelled Qwen sessions
+are replaced before the next speaker. Late synthesis, duplicate speech events
+and late completion receipts cannot replay or complete an interrupted speech.
+
+The SDK interruption barrier blocks new grants until this stop is confirmed.
+For human interruption it also waits for `meeting.input.admitted`, sent only
+after the existing `team.group_message.accepted` event confirms public input
+delivery. Duplicate admission receipts are idempotent. Failed delivery or a
+missing audio stop acknowledgement keeps the barrier held; End meeting remains
+the recovery action. Explicit Stop audio and audio failures retain their
+existing paused/failed behavior and are distinct from semantic interruption.
+
+Automated regressions cover the real SDK/SQLite queue, Gateway routes, native
+Leader tool and browser player using controlled supervisor/audio services.
+Physical microphone/speaker behavior and real supervisor classification still
+require a live meeting acceptance run.
+
 Local speech-end detection reuses the full-duplex extension's Silero v5 worker,
 PCM capture worklet, and 16 kHz resampler. The existing speech gate confirms speech
 before ending the recording after 640 ms of silence. Short pauses and initial
@@ -143,15 +180,14 @@ control; recording does not restart automatically.
 Stopping or leaving the meeting releases the VAD worker, audio graph, and microphone.
 
 Deferred work includes semantic turn completion, server-side Silero VAD,
-upstream microphone streaming, supervisor recipient selection, JEV interruption
-filtering, seamless speech resume, voice selection UI, a recorded full meeting
+upstream microphone streaming, supervisor recipient selection, seamless speech resume, voice selection UI, a recorded full meeting
 demonstration, and recovery after process restart.
 
 Agent-side publication uses the host-consumer readiness gate. The shared native
 member provider installs scoped meeting guidance and the
 SDK's `meeting_post_message`, `meeting_read_history`, and `meeting_get_speaker`
 tools for the Leader and later members, plus the Leader-only addressed-member
-tool. The Leader retains the existing `send_message` for silent addressed handoffs.
+and `meeting_interrupt_speech` tools. The Leader retains the existing `send_message` for silent addressed handoffs.
 Work and code profiles use the same
 provider. Native discussion output must queue before publication; unsupported
 direct-delivery/runtime tools are blocked while this scope is active. Ending the

@@ -2543,6 +2543,7 @@ class AgentWebSocketServer:
                 ReqMethod.MEETING_RELEASE,
                 ReqMethod.MEETING_PLAYBACK_READY, ReqMethod.MEETING_SPEECH_GET,
                 ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED,
+                ReqMethod.MEETING_INPUT_PREPARE, ReqMethod.MEETING_INPUT_ADMITTED,
             }:
                 await self._handle_meeting_lifecycle(ws, request, send_lock)
                 return
@@ -5378,6 +5379,15 @@ class AgentWebSocketServer:
                     model=str(params.get("_qwen_model") or ""),
                     config_revision=str(params.get("_qwen_revision") or ""),
                     default_voice=str(params.get("_qwen_default_voice") or ""), emit=emit,
+                )
+            elif request.req_method == ReqMethod.MEETING_INPUT_PREPARE:
+                playback_payload = await manager.prepare_human_input(
+                    session_id, str(params.get("meeting_id") or ""), owner_id, params.get("transcript"),
+                )
+            elif request.req_method == ReqMethod.MEETING_INPUT_ADMITTED:
+                playback_payload = await manager.human_input_admitted(
+                    session_id, str(params.get("meeting_id") or ""), owner_id,
+                    str(params.get("interruption_id") or ""),
                 )
             elif request.req_method in {ReqMethod.MEETING_SPEECH_GET, ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED}:
                 consumer = await manager.browser_playback(

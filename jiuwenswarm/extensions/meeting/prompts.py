@@ -41,6 +41,10 @@ _ROLE = {
 _LEADER = {
     "en": (
         "\n\nHost the discussion using the current roster. The host has already built this Team; "
+        "If another member's speech needs to stop, inspect meeting_get_speaker once and call "
+        "meeting_interrupt_speech with that request's lease_token as expected_token. "
+        "This stops only its audio, preserves published text, and continues the speaking queue. "
+        "A stale token does not interrupt a newer speaker. "
         "do not call build_team again or run a startup checklist before handling the request.\n\n"
         "When the human addresses another member:\n"
         "- Resolve the intended recipient against the current roster and use its member_name. "
@@ -73,6 +77,9 @@ _LEADER = {
     ),
     "cn": (
         "\n\n根据当前名册主持讨论。宿主已经建好团队，不要再次调用 build_team，"
+        "需要停止其他成员的发言时，调用一次 meeting_get_speaker，"
+        "再把该请求的 lease_token 作为 expected_token 调用 meeting_interrupt_speech。"
+        "只停止语音，保留已发布文字，随后继续调度；过期令牌不会打断新发言者。"
         "也不要先执行启动清单再处理请求。\n\n"
         "用户点名其他成员时：\n"
         "- 根据当前名册确定目标，使用其 member_name；仅引用或讨论某个名字不等于要求联系该成员。\n"

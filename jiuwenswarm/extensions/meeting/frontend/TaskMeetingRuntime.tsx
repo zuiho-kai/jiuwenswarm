@@ -131,7 +131,10 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
         } else if (current.current === active) {
           publishMeeting({ state: 'cleanup_failed', recording: 'ready' });
           if (mounted.current)
-            toast.open({ content: translator.current('meeting.errors.cleanupFailed'), variant: 'error' });
+            toast.open({
+              content: translator.current('meeting.errors.cleanupFailed'),
+              variant: 'error',
+            });
         }
       } finally {
         active.ending = undefined;
@@ -162,9 +165,10 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
       const meeting: MeetingSession = new MeetingSession(webClient, id, context(id), {
         line: () => {}, // Task handlers already own the conversation timeline.
         draft: (text) => {
-          if (!mounted.current || current.current?.meeting !== meeting || input.signal.aborted) return;
+          if (!mounted.current || current.current?.meeting !== meeting || input.signal.aborted)
+            throw new Error('disconnected');
           publishMeeting({ lastTranscript: text });
-          void sendMeetingInput(
+          return sendMeetingInput(
             webClient,
             send,
             id,
@@ -172,13 +176,7 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
             crypto.randomUUID(),
             routingMode === 'leader' ? [context(id).leader] : [],
             input.signal,
-          ).catch(() => {
-            if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
-              toast.open({
-                content: t('meeting.errors.deliveryFailed'),
-                variant: 'error',
-              });
-          });
+          );
         },
         error: (code) => {
           if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
@@ -204,7 +202,13 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           if (active?.meeting === meeting) void endServer(active);
         },
       });
-      const active: ActiveMeeting = { sessionId: id, meeting, meetingId: null, startupId, input };
+      const active: ActiveMeeting = {
+        sessionId: id,
+        meeting,
+        meetingId: null,
+        startupId,
+        input,
+      };
       current.current = active;
       publishMeeting({
         state: 'starting',

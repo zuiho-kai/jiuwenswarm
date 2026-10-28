@@ -168,6 +168,7 @@ class MeetingManager:
         self, session_id: str, meeting: _Meeting, on_queued: Callable[[], None],
         voices: MemberVoiceRegistry | None = None,
         on_addressed_members=None,
+        on_interrupt=None,
     ) -> MeetingPublicationSession:
         from .participants import MeetingPublicationSession
 
@@ -198,6 +199,7 @@ class MeetingManager:
         meeting.publication = MeetingPublicationSession(
             meeting.coordinator, on_queued, voices=voices,
             on_addressed_members=on_addressed_members,
+            on_interrupt=on_interrupt,
         )
         return meeting.publication
 
@@ -227,10 +229,39 @@ class MeetingManager:
             await self._enable_publication_locked(
                 session_id, meeting, driver.wake, voices,
                 on_addressed_members=getattr(consumer, "addressed_members_changed", None),
+                on_interrupt=lambda member, token: driver.interrupt(token, leader=member),
             )
             meeting.driver = driver
             driver.start()
             return driver
+
+    async def prepare_human_input(self, session_id: str, meeting_id: str, owner_id: str, text: str) -> dict:
+        from .interruption import is_human_interruption
+
+        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+            raise ValueError("Meeting transcript must contain 1-16000 characters")
+        consumer = await self.browser_playback(session_id, meeting_id, owner_id)
+        driver = consumer.driver
+        speaker = await driver.coordinator.get_speaker()
+        if speaker is None:
+            return {}
+        agent = self._team_manager.get_team_agent(session_id)
+        config = getattr(agent.spec, "duplex", None)
+        if not await is_human_interruption(text, speaker, config):
+            return {}
+        # The token observed before judgment prevents a slow answer from
+        # interrupting a newer speaker. Human text is still delivered either way.
+        try:
+            interruption = await driver.interrupt(speaker.lease_token, human=True)
+        except RuntimeError:
+            interruption = driver.pending_interruption
+        return {"interruption_id": interruption.interruption_id} if interruption is not None else {}
+
+    async def human_input_admitted(self, session_id: str, meeting_id: str, owner_id: str, interruption_id: str) -> dict:
+        consumer = await self.browser_playback(session_id, meeting_id, owner_id)
+        if not await consumer.driver.input_admitted(interruption_id):
+            raise ValueError("Human input interruption is no longer current")
+        return {"accepted": True}
 
     async def _driver_is_current(self, session_id: str, meeting: _Meeting) -> bool:
         async with self._lock:

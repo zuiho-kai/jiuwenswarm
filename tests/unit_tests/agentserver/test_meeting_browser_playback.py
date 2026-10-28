@@ -41,6 +41,7 @@ async def browser(publication_host, monkeypatch, tmp_path):
             self.closed = True
 
         async def synthesize(self, text, voice):
+            assert not self.closed, "Interrupted TTS sessions must be replaced before reuse"
             audio_calls.append((text, voice))
             return SimpleNamespace(audio=b"wav", audio_mime="audio/wav")
 
@@ -83,7 +84,7 @@ async def browser(publication_host, monkeypatch, tmp_path):
             self.events.append((ws, event, payload))
             if event == "meeting.speech.ready":
                 self.ready.put_nowait(payload)
-            if event == "meeting.playback.stop" and self.auto_ack:
+            if event in {"meeting.playback.stop", "meeting.speech.stop"} and self.auto_ack:
                 self.acks.append(asyncio.create_task(self.methods["meeting.playback.stopped"](
                     ws, "stop-ack", payload, payload["session_id"],
                 )))

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from openjiuwen.agent_teams.meeting import MeetingCoordinator
-from openjiuwen.agent_teams.schema.meeting import MeetingScope, SpeechRequest
+from openjiuwen.agent_teams.schema.meeting import MeetingScope, SpeechInterruption, SpeechRequest
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +27,15 @@ class MeetingPlaybackConsumer(Protocol):
 
     async def stop(self) -> None: ...
 
+    async def interrupt(self, interruption: SpeechInterruption) -> None: ...
+
 
 @dataclass(frozen=True)
 class GrantDriverState:
     phase: Literal[
         "idle", "publishing", "awaiting_playback", "publication_failed",
         "consumer_failed", "playback_failed", "coordination_failed", "closing", "closed",
+        "interrupting", "interruption_failed",
     ] = "idle"
     request: SpeechRequest | None = None
     error: str | None = None
@@ -43,8 +46,8 @@ class MeetingGrantDriver:
 
     SDK methods alone choose the next speaker and publish full text. No timer,
     synthesis result, or consumer callback return can release a speaking lease.
-    Failures hold the lease; only publication failure has an explicit retry here.
-    Audio recovery/stop handshakes belong to the later playback integration.
+    Failures hold coordination. Interruption revokes the observed lease, waits
+    for audio stop and human input acceptance, then resumes the SDK queue.
     """
 
     def __init__(
@@ -63,10 +66,18 @@ class MeetingGrantDriver:
         self._stopped = False
         self._retry_requested = False
         self._state = GrantDriverState()
+        self._interruption: SpeechInterruption | None = None
+        self._audio_stopped = False
+        self._input_admitted = False
+        self._finished_interruptions: set[str] = set()
 
     @property
     def state(self) -> GrantDriverState:
         return self._state
+
+    @property
+    def pending_interruption(self) -> SpeechInterruption | None:
+        return self._interruption
 
     def start(self) -> None:
         if self._closed:
@@ -140,6 +151,69 @@ class MeetingGrantDriver:
             self._retry_requested = True
             self.wake()
             return True
+
+    async def interrupt(
+        self, expected_token: str, *, leader: str | None = None, human: bool = False,
+    ) -> SpeechInterruption | None:
+        """Revoke exactly the observed lease; grants wait for real audio/input acks."""
+        if not await self._is_current():
+            return None
+        async with self._lock:
+            request = self._state.request
+            if (
+                self._closed or request is None or request.lease_token != expected_token
+                or self._interruption is not None or self._state.phase not in {"awaiting_playback", "publication_failed"}
+            ):
+                return None
+            interruption = (
+                await self.coordinator.interrupt_from_leader(leader, expected_token=expected_token)
+                if leader is not None else
+                await self.coordinator.interrupt_speech(expected_token=expected_token)
+            )
+            if interruption is None:
+                return None
+            self._interruption = interruption
+            self._audio_stopped = False
+            self._input_admitted = not human
+            self._state = GrantDriverState("interrupting", request)
+        # Stop acknowledgements are handled independently of the driver lock.
+        # The SDK's durable interruption barrier blocks all new grants meanwhile.
+        try:
+            await self.consumer.interrupt(interruption)
+        except Exception:
+            logger.exception("Meeting speech stop was not confirmed")
+            async with self._lock:
+                if not self._closed:
+                    self._state = GrantDriverState("interruption_failed", request, "interruption_stop_failed")
+            await self._report_error()
+            raise RuntimeError("Meeting speech stop was not confirmed; end the meeting to recover") from None
+        async with self._lock:
+            self._audio_stopped = True
+            await self._resume_interruption()
+        return interruption
+
+    async def input_admitted(self, interruption_id: str) -> bool:
+        async with self._lock:
+            if self._closed:
+                return False
+            if interruption_id in self._finished_interruptions:
+                return True
+            if self._interruption is None or self._interruption.interruption_id != interruption_id:
+                return False
+            self._input_admitted = True
+            await self._resume_interruption()
+            return True
+
+    async def _resume_interruption(self) -> None:
+        if self._closed or not self._audio_stopped or not self._input_admitted:
+            return
+        interruption_id = self._interruption.interruption_id
+        if not await self.coordinator.resume_after_interruption(interruption_id):
+            raise RuntimeError("Meeting interruption barrier is no longer current")
+        self._finished_interruptions.add(interruption_id)
+        self._interruption = None
+        self._state = GrantDriverState()
+        self.wake()
 
     async def _report_error(self) -> None:
         if self._closed:

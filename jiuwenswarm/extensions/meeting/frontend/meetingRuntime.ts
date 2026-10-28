@@ -58,6 +58,7 @@ export class MeetingSession {
   private finishAudio: (() => void) | null = null;
   private speechTail = Promise.resolve();
   private seen = new Set<string>();
+  private interrupted = new Set<string>();
   private meetingId: string | null = null;
   private currentSpeech: Attempt | null = null;
   private paused = false;
@@ -72,7 +73,7 @@ export class MeetingSession {
     public context: MeetingContext,
     private callbacks: {
       line: (line: MeetingLine) => void;
-      draft: (text: string) => void;
+      draft: (text: string) => void | Promise<void>;
       error: (code: string) => void;
       recording: (state: RecordingState) => void;
       ended: () => void;
@@ -116,6 +117,44 @@ export class MeetingSession {
     );
     this.off.push(this.transport.on('meeting.speech.ready', ({ payload }) => this.receiveSpeech(payload)));
     this.off.push(
+      this.transport.on('meeting.speech.stop', ({ payload }) => {
+        if (
+          !this.active ||
+          !this.matchesMeeting(payload) ||
+          typeof payload.stop_id !== 'string' ||
+          !payload.stop_id ||
+          identityFields.some((key) => typeof payload[key] !== 'string' || !payload[key])
+        )
+          return;
+        const attempt = this.currentSpeech;
+        if (
+          attempt?.speech.playback_id === payload.playback_id &&
+          identityFields.some((key) => attempt.speech[key] !== payload[key])
+        )
+          return;
+        this.interrupted.add(payload.playback_id as string);
+        if (attempt?.speech.playback_id === payload.playback_id) {
+          // This is a speech interruption, not End: keep capture and listeners live.
+          attempt.reported = true;
+          this.playbackEpoch++;
+          this.finishAudio?.();
+          this.currentSpeech = null;
+          this.callbacks.playback?.('idle');
+        }
+        void this.transport
+          .request(
+            'meeting.playback.stopped',
+            {
+              session_id: this.sessionId,
+              meeting_id: this.meetingId,
+              stop_id: payload.stop_id,
+            },
+            { timeoutMs: 20000 },
+          )
+          .catch(() => this.callbacks.error('playbackFailed'));
+      }),
+    );
+    this.off.push(
       this.transport.on('meeting.addressed_members', ({ payload }) => {
         if (!this.active || !this.matchesMeeting(payload) || !Array.isArray(payload.addressed_members)) return;
         const names = payload.addressed_members;
@@ -158,8 +197,7 @@ export class MeetingSession {
       }),
       this.transport.on('meeting.input.transcript', ({ payload }) => {
         if (!this.matchesInput(payload) || !this.acceptUtterance(payload)) return;
-        if (typeof payload.transcript === 'string' && payload.transcript.trim())
-          this.callbacks.draft(payload.transcript.trim());
+        if (typeof payload.transcript === 'string' && payload.transcript.trim()) void this.deliverTranscript(payload);
         this.callbacks.recording(this.listening ? 'recording' : 'ready');
       }),
       this.transport.on('meeting.input.error', ({ payload }) => {
@@ -174,6 +212,21 @@ export class MeetingSession {
       () => this.fail('recordingFailed'),
     );
     await this.capture.start();
+  }
+
+  private async deliverTranscript(payload: Payload): Promise<void> {
+    try {
+      await this.callbacks.draft((payload.transcript as string).trim());
+      if (!this.matchesInput(payload) || !payload.interruption_id) return;
+      const result = await this.transport.request<{ accepted?: boolean }>('meeting.input.admitted', {
+        ...this.inputIdentity(),
+        utterance_id: payload.utterance_id,
+        interruption_id: payload.interruption_id,
+      });
+      if (!result.accepted) throw new Error('deliveryFailed');
+    } catch {
+      if (this.active) this.callbacks.error('deliveryFailed');
+    }
   }
 
   private matchesInput(payload: Payload): boolean {
@@ -251,7 +304,10 @@ export class MeetingSession {
     this.resuming = true;
     this.queueInput(async () => {
       try {
-        const result = await this.transport.request<{ accepted?: boolean }>('meeting.input.resume', this.inputIdentity());
+        const result = await this.transport.request<{ accepted?: boolean }>(
+          'meeting.input.resume',
+          this.inputIdentity(),
+        );
         if (!result.accepted) throw new Error('inputStreamFailed');
         if (!this.active) return;
         this.listening = true;
@@ -275,7 +331,10 @@ export class MeetingSession {
   async activatePlayback(meetingId: string, startupId: string): Promise<void> {
     if (!this.active || this.disposed) throw new Error('disconnected');
     this.meetingId = meetingId;
-    const result = await this.transport.request<{ ready?: boolean; stream_id?: string }>(
+    const result = await this.transport.request<{
+      ready?: boolean;
+      stream_id?: string;
+    }>(
       'meeting.playback.ready',
       {
         session_id: this.sessionId,
@@ -307,12 +366,13 @@ export class MeetingSession {
     )
       return;
     const speech = payload as Speech;
-    if (this.seen.has(speech.playback_id)) return;
+    if (this.seen.has(speech.playback_id) || this.interrupted.has(speech.playback_id)) return;
     this.seen.add(speech.playback_id);
     const attempt: Attempt = { speech, completed: 0, reported: false };
     const epoch = this.playbackEpoch;
     this.speechTail = this.speechTail
       .then(async () => {
+        if (this.interrupted.has(speech.playback_id)) return;
         if (!this.active || this.paused || epoch !== this.playbackEpoch) {
           await this.report(attempt, 'stopped');
           return;

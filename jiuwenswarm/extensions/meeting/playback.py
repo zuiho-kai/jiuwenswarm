@@ -63,6 +63,8 @@ class BrowserPlaybackConsumer:
         self._stop_id: str | None = None
         self._stop_waiter: asyncio.Future | None = None
         self._stop_timeout = stop_timeout
+        self._interrupted: set[str] = set()
+        self._speech_stops: dict[str, asyncio.Future] = {}
 
     async def _push(self, event: str, payload: dict) -> None:
         if not await self.emit({
@@ -79,6 +81,14 @@ class BrowserPlaybackConsumer:
     async def speech_ready(self, request) -> None:
         if self._closing or request.scope != self.scope or not request.lease_token or request.source_message_id is None:
             raise ValueError("A matching granted speech request is required")
+        speaker = await self.driver.coordinator.get_speaker()
+        current = self.driver.state
+        if (
+            speaker is None or speaker.lease_token != request.lease_token
+            or current.phase != "awaiting_playback" or current.request is None
+            or current.request.lease_token != request.lease_token
+        ):
+            return
         playback_id = self._request_ids.get(request.request_id)
         if playback_id is None:
             voice = self.voices.get_voice(request.member_name)
@@ -110,7 +120,7 @@ class BrowserPlaybackConsumer:
 
     async def resolve_chunk(self, params: dict) -> dict:
         record = self._record(params)
-        if self._closing or self._current != record.playback_id or record.playback_id in self._receipts:
+        if self._closing or self._current != record.playback_id or record.playback_id in self._receipts or record.playback_id in self._interrupted:
             raise ValueError("Speech playback is no longer active")
         speaker = await self.driver.coordinator.get_speaker()
         if (
@@ -148,11 +158,36 @@ class BrowserPlaybackConsumer:
     def confirm_stop(self, stop_id: str) -> dict:
         # Deliberately independent from driver/result locks: aclose holds the
         # driver lock while waiting for this receipt, including cleanup retries.
+        speech_waiter = self._speech_stops.get(stop_id)
+        if speech_waiter is not None:
+            if not speech_waiter.done():
+                speech_waiter.set_result(True)
+            return {"accepted": True}
         if not self._stop_id or stop_id != self._stop_id or self._stop_waiter is None:
             raise ValueError("Unknown playback stop acknowledgement")
         if not self._stop_waiter.done():
             self._stop_waiter.set_result(True)
         return {"accepted": True}
+
+    async def interrupt(self, interruption) -> None:
+        playback_id = self._request_ids.get(interruption.request_id)
+        if playback_id is None:
+            # Publication failed before any audio was offered to the browser.
+            return
+        record = self._records[playback_id]
+        if record.lease_token != interruption.lease_token or self._closing:
+            raise ValueError("Speech interruption is no longer current")
+        self._interrupted.add(playback_id)
+        if self._current == playback_id:
+            self._current = None
+        waiter = self._speech_stops.setdefault(
+            interruption.interruption_id, asyncio.get_running_loop().create_future(),
+        )
+        await self._push("meeting.speech.stop", {**record.identity(), "stop_id": interruption.interruption_id})
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), self._stop_timeout)
+        except TimeoutError:
+            raise RuntimeError("Interrupted speech stop was not confirmed") from None
 
     async def stop(self) -> None:
         self._closing = True

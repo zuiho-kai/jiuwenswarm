@@ -33,6 +33,12 @@ class GatewayPlaybackRoute:
         self.owner_id, self.user_id, self.config = owner_id, user_id, config
         self.startup_id = startup_id
         self.input = MeetingInputStream(channel, ws, session_id, meeting_id)
+        self.input.prepare_transcript = lambda text: self.fetch(
+            ReqMethod.MEETING_INPUT_PREPARE, {"meeting_id": meeting_id, "transcript": text},
+        )
+        self.input.admit_transcript = lambda interruption_id: self.fetch(
+            ReqMethod.MEETING_INPUT_ADMITTED, {"meeting_id": meeting_id, "interruption_id": interruption_id},
+        )
         self.revision = config_revision(config)
         self.revoked = False
         self.records = {}
@@ -44,6 +50,7 @@ class GatewayPlaybackRoute:
         self.tasks: dict[tuple, asyncio.Task] = {}
         self.tts = QwenOmniTtsSession(config)
         self.stops: dict[str, asyncio.Task] = {}
+        self.interrupted: set[str] = set()
         _routes[self.id] = self
 
     async def fetch(self, method, params):
@@ -64,12 +71,23 @@ class GatewayPlaybackRoute:
         return {key: record[key] for key in IDENTITY_FIELDS}
 
     async def cancel_synthesis(self):
-        tasks = list(self.tasks.values())
+        pending = list(self.tasks.items())
+        tasks = [task for _, task in pending]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for key, task in pending:
+            if self.tasks.get(key) is task:
+                self.tasks.pop(key, None)
         await self.tts.aclose()
+
+    async def interrupt_synthesis(self):
+        await self.cancel_synthesis()
+        if not self.revoked:
+            # aclose permanently closes QwenSession; the next speaker needs a
+            # fresh provider session, never a replay of the interrupted reading.
+            self.tts = QwenOmniTtsSession(self.config)
 
     async def stop_media(self):
         self.revoked = True
@@ -100,6 +118,14 @@ class GatewayPlaybackRoute:
                 raise ValueError("Invalid playback stop identity")
             if stop_id not in self.stops:
                 self.stops[stop_id] = asyncio.create_task(self.stop_media())
+        elif event == "meeting.speech.stop":
+            identity = self.identity(payload)
+            stop_id = payload.get("stop_id")
+            if not isinstance(stop_id, str) or not stop_id:
+                raise ValueError("Invalid speech interruption identity")
+            self.interrupted.add(identity["playback_id"])
+            if stop_id not in self.stops:
+                self.stops[stop_id] = asyncio.create_task(self.interrupt_synthesis())
         elif event == "meeting.addressed_members":
             if self.revoked:
                 return
@@ -206,12 +232,12 @@ def bind_playback_handlers(channel, agent_client):
             if type(index) is not int:
                 raise ValueError("Invalid speech chunk index")
             key = (identity["playback_id"], index)
-            if route.revoked or route.tasks:
+            if route.revoked or route.tasks or identity["playback_id"] in route.interrupted:
                 raise ValueError("Meeting synthesis has stopped or is already active")
             chunk = await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
             config = QwenOmniRealtimeConfig.from_environment()
             if (
-                route.revoked or route.tasks or config_revision(config) != route.revision
+                route.revoked or route.tasks or identity["playback_id"] in route.interrupted or config_revision(config) != route.revision
                 or chunk.get("config_revision") != route.revision or chunk.get("model") != config.model
             ):
                 raise ValueError("Meeting TTS configuration changed")
@@ -219,7 +245,7 @@ def bind_playback_handlers(channel, agent_client):
             route.tasks[key] = task
             audio = await task
             await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
-            if route.revoked or config_revision(QwenOmniRealtimeConfig.from_environment()) != route.revision:
+            if route.revoked or identity["playback_id"] in route.interrupted or config_revision(QwenOmniRealtimeConfig.from_environment()) != route.revision:
                 raise ValueError("Meeting playback stopped or its configuration changed")
             route.produced[identity["playback_id"]].add(index)
             await channel.send_response(ws, req_id, ok=True, payload={
@@ -240,6 +266,8 @@ def bind_playback_handlers(channel, agent_client):
             route = route_for(ws, params, session_id)
             identity = route.identity(params)
             async with route.result_lock:
+                if identity["playback_id"] in route.interrupted:
+                    raise ValueError("Interrupted speech cannot be reported as played")
                 outcome, count = params.get("outcome"), params.get("completed_chunks")
                 record = route.records[identity["playback_id"]]
                 if outcome not in {"completed", "stopped", "failed"} or type(count) is not int or not 0 <= count <= record["chunk_count"]:

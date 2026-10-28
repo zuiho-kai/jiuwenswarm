@@ -144,6 +144,17 @@ async def test_capture_continues_during_asr_and_transcripts_remain_ordered(strea
 
 
 @pytest.mark.asyncio
+async def test_interruption_control_failure_does_not_discard_transcribed_input(stream, monkeypatch):
+    monkeypatch.setattr(gateway, "transcribe_utterance", AsyncMock(return_value="Wait, change the requirement"))
+    stream.prepare_transcript = AsyncMock(side_effect=TimeoutError)
+    stream.enqueue([frame()])
+    await asyncio.wait_for(stream.queue.join(), 3)
+    transcripts = [call.args[2] for call in stream.channel.send_event.call_args_list if call.args[1] == "meeting.input.transcript"]
+    assert len(transcripts) == 1 and transcripts[0]["transcript"] == "Wait, change the requirement"
+    assert not stream.closed
+
+
+@pytest.mark.asyncio
 async def test_pause_flushes_confirmed_speech_and_stop_discards_late_asr(stream, monkeypatch):
     started, cancelled = asyncio.Event(), asyncio.Event()
 
