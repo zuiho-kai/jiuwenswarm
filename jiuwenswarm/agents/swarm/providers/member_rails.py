@@ -98,10 +98,13 @@ def build_meeting_participant(params: dict[str, Any], context: SwarmBuildContext
     ):
         return None
     from jiuwenswarm.extensions.meeting.participants import MeetingParticipantRail
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.tool_member import ListMembersTool
 
     return MeetingParticipantRail(
         context.session_id, backend.team_name, context.member_name,
         language=context.language or "en",
+        roster_tool=ListMembersTool(backend, make_translator(context.language or "en")),
     )
 
 

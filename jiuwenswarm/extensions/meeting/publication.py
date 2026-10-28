@@ -375,6 +375,7 @@ class MeetingPublicationRail(DeepAgentRail):
 
 async def create_meeting_publication_rail(
     coordinator: MeetingCoordinator, member_name: str, *, language: str = "en",
+    roster_tool: TeamTool | None = None,
     on_queued: Callable[[], None] | None = None,
     on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
     on_interrupt=None,
@@ -392,6 +393,8 @@ async def create_meeting_publication_rail(
         language=language, on_queued=on_queued, on_interrupt=on_interrupt,
     )
     tools = await create_meeting_tools(coordinator.for_member(member_name), language=language)
+    if roster_tool is not None:
+        tools[roster_tool.card.name] = roster_tool
     if rail._leader:
         tools[_ADDRESSED] = MeetingSetAddressedMembersTool(coordinator, member_name, on_addressed_members)
     rail._tools = {

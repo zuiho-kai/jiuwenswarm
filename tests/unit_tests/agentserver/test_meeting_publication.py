@@ -134,6 +134,7 @@ async def _native(meeting, monkeypatch, member="leader", *, max_iterations=8, pa
         )
         inject_team_handles(context.extras, team_backend=SimpleNamespace(
             team_name="publication-team", conversation_mode="group_chat",
+            list_member_roster=AsyncMock(return_value=[]),
         ))
         rail = build_meeting_participant({}, context)
     else:
@@ -263,16 +264,23 @@ async def test_production_provider_mounts_meeting_tools_and_leader_only_routing(
     wakeups = []
     scope = await _enable_host(publication_host, lambda: wakeups.append("queued"))
     leader = await native_factory(participant=True, progressive=True)
-    leader.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
+    question = "Should the report cover revenue or profit?"
+    leader.model.invoke.side_effect = [
+        _post_call(content=question, speech_text=question, mentions=["user"]), AssistantMessage(content=""),
+    ]
     result = await leader.agent.invoke({"query": "Discuss"}, session=leader.session, _streaming=True)
     assert result["meeting_queued"]
     schemas = {tool.name: tool for tool in leader.model.invoke.await_args_list[0].kwargs["tools"]}
-    assert {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"} <= schemas.keys()
+    assert {"meeting_post_message", "meeting_read_history", "meeting_get_speaker", "list_members"} <= schemas.keys()
     assert "send_message" in schemas
     assert "meeting_forward_message" not in schemas
     assert "meeting_set_addressed_members" in schemas
     assert schemas["meeting_set_addressed_members"].parameters["properties"]["member_names"].get("minItems", 0) == 0
     assert "build_team" not in schemas
+    roster = await leader.rail._policy._tools["list_members"].invoke({})
+    assert roster.success and roster.data == {"members": [], "count": 0}
+    leader_question = (await scope.coordinator.list_pending())[0]
+    assert leader_question.content == question and leader_question.mentions == ("user",)
     assert schemas["meeting_read_history"].parameters["properties"]["limit"] == {
         "type": "integer", "minimum": 1, "maximum": 20, "default": 10,
     }
@@ -292,7 +300,7 @@ async def test_production_provider_mounts_meeting_tools_and_leader_only_routing(
     assert "meeting_set_addressed_members" not in {tool.name for tool in await later.agent.ability_manager.list_tool_info()}
     assert {item.member_name for item in await scope.coordinator.list_pending()} == {"leader", "later"}
     for native in (leader, later):
-        required = {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"}
+        required = {"meeting_post_message", "meeting_read_history", "meeting_get_speaker", "list_members"}
         if native is leader:
             required.update({"send_message", "meeting_set_addressed_members"})
         for call in native.model.invoke.await_args_list:

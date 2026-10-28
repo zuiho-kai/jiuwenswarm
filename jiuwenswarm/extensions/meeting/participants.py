@@ -16,6 +16,7 @@ from .publication import MeetingPublicationRail, create_meeting_publication_rail
 
 if TYPE_CHECKING:
     from openjiuwen.agent_teams.schema.meeting import SpeechRequest
+    from openjiuwen.agent_teams.tools.tool_base import TeamTool
     from jiuwenswarm.common.voice_matching import MemberVoiceRegistry, VoiceAssignment
 
 _POLICY = "_meeting_member_publication_policy"
@@ -55,13 +56,16 @@ class MeetingPublicationSession:
             raise ValueError("Speech voice requires the matching active publication scope")
         return self.voices.get_voice(request.member_name)
 
-    async def attach(self, agent: Any, member_name: str, language: str) -> MeetingPublicationRail:
+    async def attach(
+        self, agent: Any, member_name: str, language: str, roster_tool: TeamTool | None = None,
+    ) -> MeetingPublicationRail:
         if self.closed:
             raise ValueError("Meeting publication scope has ended")
         if self.voices is not None:
             self.voices.assign_voice(member_name, language=language)
         policy = await create_meeting_publication_rail(
             self.coordinator, member_name, language=language, on_queued=self.on_queued,
+            roster_tool=roster_tool,
             on_addressed_members=self.on_addressed_members,
             on_interrupt=self.on_interrupt,
         )
@@ -101,6 +105,7 @@ class MeetingParticipantRail(DeepAgentRail):
 
     def __init__(
         self, session_id: str, team_name: str, member_name: str, *, language: str = "en",
+        roster_tool: TeamTool | None = None,
         resolve_session: Callable[[str, str], MeetingPublicationSession | None] = _resolve_session,
     ) -> None:
         super().__init__()
@@ -108,6 +113,7 @@ class MeetingParticipantRail(DeepAgentRail):
         self._team_name = team_name
         self._member_name = member_name
         self._language = language
+        self._roster_tool = roster_tool
         self._resolve = resolve_session
         self._agent: Any = None
         self._session: MeetingPublicationSession | None = None
@@ -151,7 +157,7 @@ class MeetingParticipantRail(DeepAgentRail):
             if session.voices is not None:
                 self.voice_assignment = session.voices.assign_voice(self._member_name, language=self._language)
             if self._policy is None:
-                self._policy = await session.attach(self._agent, self._member_name, self._language)
+                self._policy = await session.attach(self._agent, self._member_name, self._language, self._roster_tool)
                 if isinstance(ctx.inputs, ModelCallInputs) and not ctx.extra.get("_finalizing_max_iterations"):
                     # Append only the new tools: never restore an unrelated tool
                     # that an earlier permission/mode rail has already filtered.

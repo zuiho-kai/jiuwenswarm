@@ -28,6 +28,13 @@ require intervention. Recipient selection uses the evolving roster; automatic
 name matching and supervisor inference are separate work. Startup already builds
 the Team, so `build_team` is hidden and blocked during coordinated publication.
 
+When the roster is missing or unclear, the Leader can call the SDK's
+`list_members` once, reuse existing members, and create only requested missing
+AI participants with `spawn_teammate`. Clarification questions use
+`meeting_post_message` with `mentions=["user"]` and a spoken question, then wait
+for the human's answer. Teammates also mention the Leader so the answer can be
+relayed back. A separate user agent is not required.
+
 **JEV routing for teammates** is a separate Experimental switch for the default
 Team. It sets `modes.team.jiuwen_team.duplex` to agent-core's native JEV router
 (`enabled: true`, `mode: active`, `format: jev`). Existing Team endpoint, model,
