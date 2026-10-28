@@ -10,6 +10,24 @@ mention only the Leader or have no mentions, respectively. Startup remains an
 unmentioned message. This selector leaves SDK delivery and evaluation unchanged;
 under the current SDK, unmentioned group messages are retained as context.
 
+With Leader routing, the Leader uses the existing `send_message` tool to relay
+requests silently to human-addressed agents. There is no separate forwarding
+tool. The Leader first selects those agents with
+`meeting_set_addressed_members(member_names)`, then uses `send_message(to, content)`
+(or its existing `targets` form) to pass on the request without speech. Silent
+sends are limited to the selected agents; user replies, broadcasts, and ordinary
+discussion still go through `meeting_post_message` and the speaking queue.
+
+The priority list is controlled explicitly by the Leader: replace it when focus
+changes and clear it with `[]` when the exchange ends, is abandoned, or discussion
+becomes general. Sending and playback do not reset it or interrupt the current
+speaker. The Leader asks the target to reply to both user and Leader so priority
+can be cleared silently. No spoken handoff, delivery acknowledgement, or redundant
+summary is needed. Clarification, routing failure, or a substantive issue may
+require intervention. Recipient selection uses the evolving roster; automatic
+name matching and supervisor inference are separate work. Startup already builds
+the Team, so `build_team` is hidden and blocked during coordinated publication.
+
 **JEV routing for teammates** is a separate Experimental switch for the default
 Team. It sets `modes.team.jiuwen_team.duplex` to agent-core's native JEV router
 (`enabled: true`, `mode: active`, `format: jev`). Existing Team endpoint, model,
@@ -132,10 +150,17 @@ demonstration, and recovery after process restart.
 Agent-side publication uses the host-consumer readiness gate. The shared native
 member provider installs scoped meeting guidance and the
 SDK's `meeting_post_message`, `meeting_read_history`, and `meeting_get_speaker`
-tools for the Leader and later members. Work and code profiles use the same
+tools for the Leader and later members, plus the Leader-only addressed-member
+tool. The Leader retains the existing `send_message` for silent addressed handoffs.
+Work and code profiles use the same
 provider. Native discussion output must queue before publication; unsupported
 direct-delivery/runtime tools are blocked while this scope is active. Ending the
 scope removes the tools and prompt. No SDK or dependency change is required.
+Meeting tool schemas stay directly exposed on every model request, including
+when progressive tool discovery is enabled. Members use the supplied message
+excerpts and roster first; startup does not require browsing `prompts/tool/`,
+workspace metadata, or history files. Additional history is read only to fill
+specific missing context needed by the user's request.
 
 The host grant driver is implemented with a controlled consumer boundary. Queue
 admission wakes SDK grant scheduling; only an explicit matching owner playback

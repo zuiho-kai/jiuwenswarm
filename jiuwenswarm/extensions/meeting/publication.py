@@ -6,6 +6,7 @@ using this adapter. Browser activation waits for the grant/playback integration.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from copy import deepcopy
@@ -17,6 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from openjiuwen.agent_teams.meeting import MeetingCoordinator, create_meeting_tools
 from openjiuwen.agent_teams.tools.tool_base import TeamTool
 from openjiuwen.core.foundation.llm import ToolMessage
+from openjiuwen.core.foundation.tool import ToolCard, ToolExposure
 from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackContext,
     ModelCallInputs,
@@ -30,6 +32,7 @@ from .prompts import SECTION_NAME, build_meeting_role_section, history_contract,
 
 logger = logging.getLogger(__name__)
 _POST = "meeting_post_message"
+_ADDRESSED = "meeting_set_addressed_members"
 _STREAMING = "_meeting_previous_streaming"
 _TURN = "_meeting_publication_turn"
 # send_message includes point-to-point, multicast, and broadcast variants.
@@ -37,6 +40,7 @@ _BYPASS_TOOLS = frozenset({"send_message", "group_send_message", "ask_user_quest
 # These runtimes do not mount the native member policy. Reject their creation
 # before it has side effects instead of allowing an uncoordinated speaker.
 _UNSUPPORTED_TOOLS = frozenset({
+    "build_team",
     "spawn_external_cli", "spawn_bridge_agent", "spawn_human_agent", "spawn_passive_human",
     "swarmflow",
     "session_new", "session_send_message", "session_continue_queued",
@@ -64,11 +68,62 @@ class _PublicationTurn:
     queued_content: list[str] = field(default_factory=list)
 
 
+class MeetingSetAddressedMembersTool(TeamTool):
+    def __init__(self, coordinator: MeetingCoordinator, member_name: str) -> None:
+        super().__init__(ToolCard(
+            id=f"team.{_ADDRESSED}", name=_ADDRESSED,
+            description=(
+                "Replace the meeting's addressed-member speaking-priority list. Leader only. "
+                "Use current roster member names; pass member_names=[] to clear it. "
+                "Set it for a human-addressed exchange, replace it when the focus changes, "
+                "and clear it when the exchange finishes or is abandoned. The list persists "
+                "until you change it; forwarding and playback do not change it automatically. "
+                "This does not send a message, speak, or interrupt the current speaker."
+            ),
+            input_params={
+                "type": "object", "properties": {
+                    "member_names": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
+                },
+                "required": ["member_names"], "additionalProperties": False,
+            },
+        ))
+        self.coordinator = coordinator
+        self.client = coordinator.for_member(member_name)
+
+    async def invoke(self, inputs: dict, **kwargs) -> ToolOutput:
+        if not isinstance(inputs, dict) or set(inputs) != {"member_names"}:
+            return ToolOutput(success=False, error="Provide only member_names; use [] to clear")
+        names = inputs["member_names"]
+        if (
+            not isinstance(names, list) or len(names) > 100
+            or any(not isinstance(name, str) or not name.strip() or len(name) > 255 for name in names)
+        ):
+            return ToolOutput(success=False, error="member_names must be a list of at most 100 member names")
+        try:
+            state = await self.client.get_state()
+            if state is None or state.closed or state.leader_member_name != self.client.member_name:
+                raise ValueError("Only the active meeting Leader may change addressed members")
+            names = sorted(set(names))
+            for name in names:
+                await self.coordinator.for_member(name).get_state()
+            if not await self.coordinator.set_addressed_members(names):
+                raise ValueError("Meeting has ended")
+            return ToolOutput(success=True, data={"addressed_members": names})
+        except ValueError as exc:
+            return ToolOutput(success=False, error=str(exc))
+        except (RuntimeError, OSError, SQLAlchemyError):
+            logger.exception("Meeting addressed-member update failed")
+            return ToolOutput(success=False, error="meeting_priority_update_failed")
+
+
 class _ScopedTool(TeamTool):
     """Retained tool instances cannot publish after their adapter is removed."""
 
     def __init__(self, tool: TeamTool, owner: MeetingPublicationRail) -> None:
         super().__init__(deepcopy(tool.card))
+        # Meeting control must remain callable without progressive discovery.
+        self.card.exposure = ToolExposure.DIRECT
+        self.card.set_exposure_declared(True)
         self._tool = tool
         self._owner = owner
         if self.card.name == _POST:
@@ -124,6 +179,9 @@ class MeetingPublicationRail(DeepAgentRail):
         self._tools: dict[str, TeamTool] = {}
         self._agent: Any = None
         self.system_prompt_builder: Any = None
+        self._bootstrap: Any = None
+        self._send_card: ToolCard | None = None
+        self._send_settings: Any = None
         self.active = True
 
     def init(self, agent: Any) -> None:
@@ -140,6 +198,20 @@ class MeetingPublicationRail(DeepAgentRail):
             raise ValueError("This member runtime already has a meeting publication scope")
         self._agent = agent
         self.system_prompt_builder = builder
+        if self._leader:
+            self._send_card = agent.ability_manager.get("send_message")
+            if self._send_card is not None:
+                card = self._send_card
+                self._send_settings = (card.exposure, card.get_exposure_declared(), card.description)
+                card.exposure = ToolExposure.DIRECT
+                card.set_exposure_declared(True)
+                card.description = (
+                    "Silently relay the human's request to the agents in addressed_members. "
+                    "Set them with meeting_set_addressed_members first. Use to for one agent "
+                    "or targets for several; preserve the request and ask them to reply through "
+                    "meeting_post_message to user and the Leader for silent priority cleanup. "
+                    "No user messages or broadcasts: use meeting_post_message for spoken discussion."
+                )
         for tool in self._tools.values():
             agent.ability_manager.add_ability(tool.card, tool)
         builder.add_section(build_meeting_role_section(leader=self._leader))
@@ -150,8 +222,16 @@ class MeetingPublicationRail(DeepAgentRail):
             return
         for name in self._tools:
             agent.ability_manager.remove_ability(name)
+        if self._send_card is not None:
+            self._send_card.exposure, declared, self._send_card.description = self._send_settings
+            self._send_card.set_exposure_declared(declared)
+            self._send_card = None
+            self._send_settings = None
         if self.system_prompt_builder is not None:
             self.system_prompt_builder.remove_section(SECTION_NAME)
+            if self._bootstrap is not None:
+                self.system_prompt_builder.add_section(self._bootstrap)
+                self._bootstrap = None
         self._agent = None
         self.system_prompt_builder = None
 
@@ -173,10 +253,26 @@ class MeetingPublicationRail(DeepAgentRail):
                 "result_type": "error", "meeting_error": "meeting_unavailable",
             })
             return
+        if self._leader and self.system_prompt_builder is not None:
+            # Group startup already built the Team. The SDK's ordinary Leader
+            # policy re-adds its cold-start instruction before each model call.
+            bootstrap = self.system_prompt_builder.get_section("team_bootstrap")
+            if bootstrap is not None:
+                self._bootstrap = bootstrap
+                self.system_prompt_builder.remove_section("team_bootstrap")
         if isinstance(ctx.inputs, ModelCallInputs) and ctx.inputs.tools:
             ctx.inputs.tools = [
-                tool for tool in ctx.inputs.tools if tool.name not in _BYPASS_TOOLS and not _unsupported_tool(tool.name)
+                tool for tool in ctx.inputs.tools if not self._blocked_tool(tool.name)
             ]
+            if self._send_card is not None:
+                # It may have been deferred before this scope attached on the first call.
+                send = next(tool for tool in await ctx.agent.ability_manager.list_tool_info() if tool.name == "send_message")
+                ctx.inputs.tools = [tool for tool in ctx.inputs.tools if tool.name != "send_message"] + [send]
+
+    def _blocked_tool(self, name: str) -> bool:
+        return _unsupported_tool(name) or (
+            name in _BYPASS_TOOLS and not (self._leader and name == "send_message")
+        )
 
     async def after_model_call(self, ctx: AgentCallbackContext) -> None:
         if _STREAMING in ctx.extra:
@@ -198,18 +294,50 @@ class MeetingPublicationRail(DeepAgentRail):
         })
 
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
-        if isinstance(ctx.inputs, ToolCallInputs) and (
-            ctx.inputs.tool_name in _BYPASS_TOOLS or _unsupported_tool(ctx.inputs.tool_name)
-        ):
-            # A model can still emit a hidden/cached tool name. Reject execution
-            # rather than relying on the tool list or prompt for enforcement.
-            inputs = ctx.inputs
-            call_id = inputs.tool_call.id
-            ctx.extra.setdefault("_skip_tool_calls", {})[call_id] = True
+        if not isinstance(ctx.inputs, ToolCallInputs):
+            return
+        inputs = ctx.inputs
+        message = None
+        if inputs.tool_name == "send_message" and self._leader:
+            args = inputs.tool_args
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = None
+            recipients = []
+            if isinstance(args, dict):
+                if "to" in args and "targets" not in args:
+                    recipients = [args["to"]]
+                elif "targets" in args and "to" not in args:
+                    recipients = args["targets"]
+            try:
+                state = await self._client.get_state()
+            except (ValueError, RuntimeError, OSError, SQLAlchemyError):
+                state = None
+            if (
+                not self.active or state is None or state.closed
+                or not isinstance(recipients, list) or not recipients
+                or any(not isinstance(name, str) or name.strip() in {"user", "*", state.leader_member_name}
+                       or name.strip() not in state.addressed_members for name in recipients)
+            ):
+                message = (
+                    "Silent send_message is only for currently addressed agents. "
+                    "Set them with meeting_set_addressed_members first. "
+                    "Use meeting_post_message for user replies, broadcasts, and spoken discussion."
+                )
+        elif self._blocked_tool(inputs.tool_name):
             message = (
+                "The host has already built this Team. Use the existing roster; do not call build_team again."
+                if inputs.tool_name == "build_team" else
                 "This runtime or cross-Team delivery is not supported during a coordinated native meeting."
                 if _unsupported_tool(inputs.tool_name) else _CORRECTION
             )
+        if message is not None:
+            # A model can still emit a hidden/cached tool name. Reject execution
+            # rather than relying on the tool list or prompt for enforcement.
+            call_id = inputs.tool_call.id
+            ctx.extra.setdefault("_skip_tool_calls", {})[call_id] = True
             inputs.tool_result = ToolOutput(success=False, error=message)
             inputs.tool_msg = ToolMessage(content=message, tool_call_id=call_id)
 
@@ -240,6 +368,8 @@ async def create_meeting_publication_rail(
         language=language, on_queued=on_queued,
     )
     tools = await create_meeting_tools(coordinator.for_member(member_name), language=language)
+    if rail._leader:
+        tools[_ADDRESSED] = MeetingSetAddressedMembersTool(coordinator, member_name)
     rail._tools = {
         name: _ScopedTool(tool, rail)
         for name, tool in tools.items()

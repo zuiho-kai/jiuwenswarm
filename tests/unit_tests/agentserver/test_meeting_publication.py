@@ -68,13 +68,26 @@ class _OrdinarySend(TeamTool):
         return ToolOutput(success=True, data={"sent": True})
 
 
-async def _native(meeting, monkeypatch, member="leader", *, max_iterations=8, participant=False):
+async def _native(meeting, monkeypatch, member="leader", *, max_iterations=8, participant=False, progressive=False):
     agent = ReActAgent(card=AgentCard(id=uuid4().hex, name="meeting-native"))
     agent.configure(ReActAgentConfig(model_name="fake", max_iterations=max_iterations))
+    if progressive:
+        # Mirror native DeepAgent registration and the production disclosure rail.
+        agent.ability_manager.set_tool_exposure_policy(True, direct_tool_names={"read_file"})
     agent.system_prompt_builder = SystemPromptBuilder(language="en")
     agent.prompt_builder = agent.system_prompt_builder
     agent.system_prompt_builder.add_section(PromptSection("existing", {"en": "Keep existing role guidance."}))
-    ordinary = {name: _OrdinarySend(name) for name in ("send_message", "group_send_message", "ask_user_question")}
+    if member == "leader":
+        agent.system_prompt_builder.add_section(PromptSection(
+            "team_bootstrap", {"en": "Call build_team before coordinating any work."}, priority=11,
+        ))
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.tool_message import SendMessageTool
+
+    ordinary = {name: _OrdinarySend(name) for name in ("group_send_message", "ask_user_question", "build_team")}
+    ordinary["send_message"] = SendMessageTool(
+        TeamMessageManager("publication-team", member, meeting.db, meeting.manager.messager), make_translator("en"),
+    )
     for tool in ordinary.values():
         agent.ability_manager.add_ability(tool.card, tool)
     if participant:
@@ -93,6 +106,10 @@ async def _native(meeting, monkeypatch, member="leader", *, max_iterations=8, pa
     else:
         rail = await create_meeting_publication_rail(meeting.coordinator, member)
     await agent.register_rail(rail)
+    if progressive:
+        from jiuwenswarm.agents.harness.common.rails.tool_retrieval_prompt_rail import ToolRetrievalPromptRail
+
+        await agent.register_rail(ToolRetrievalPromptRail(config_base={"progressive_tool_enabled": True}))
     messages = []
     context = MagicMock()
     context.get_messages.side_effect = lambda **_: list(messages)
@@ -144,18 +161,22 @@ async def native_factory(meeting, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_real_native_filters_plain_final_and_only_grant_publishes(meeting, native_factory):
+async def test_real_native_blocks_rebuild_and_only_grant_publishes(meeting, native_factory):
     native = await native_factory()
     native.model.invoke.side_effect = [
+        AssistantMessage(content="", tool_calls=[ToolCall(
+            type="function", id=uuid4().hex, name="build_team", arguments="{}",
+        )]),
         _post_call(), AssistantMessage(content="I've already posted my conclusion. There is nothing further to publish."),
     ]
     result = await native.agent.invoke({"query": "Review the proposal"}, session=native.session, _streaming=True)
     assert result == {"output": "", "result_type": "answer", "meeting_queued": True}
     native.model.stream.assert_not_called()
-    assert native.model.invoke.await_count == 2
+    assert native.model.invoke.await_count == 3
+    assert native.ordinary["build_team"].sent == []
     assert all(call.args[0].type not in {"llm_output", "llm_reasoning"} for call in native.session.write_stream.await_args_list)
     for call in native.model.invoke.await_args_list:
-        assert not {tool.name for tool in call.kwargs["tools"]} & native.ordinary.keys()
+        assert not {tool.name for tool in call.kwargs["tools"]} & (native.ordinary.keys() - {"send_message"})
         assert any("meeting_post_message" in str(message.content) for message in call.kwargs["messages"])
     assert len(await meeting.coordinator.list_pending()) == 1
     assert await meeting.db.message.get_team_messages("publication-team") == []
@@ -203,39 +224,134 @@ async def _enable_host(host, on_queued):
 
 
 @pytest.mark.asyncio
-async def test_production_provider_mounts_all_three_tools_for_leader_and_later_member(
+async def test_production_provider_mounts_meeting_tools_and_leader_only_routing(
     meeting, publication_host, native_factory,
 ):
     wakeups = []
     scope = await _enable_host(publication_host, lambda: wakeups.append("queued"))
-    leader = await native_factory(participant=True)
+    leader = await native_factory(participant=True, progressive=True)
     leader.model.invoke.side_effect = [_post_call(), AssistantMessage(content="")]
     result = await leader.agent.invoke({"query": "Discuss"}, session=leader.session, _streaming=True)
     assert result["meeting_queued"]
     schemas = {tool.name: tool for tool in leader.model.invoke.await_args_list[0].kwargs["tools"]}
     assert {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"} <= schemas.keys()
+    assert "send_message" in schemas
+    assert "meeting_forward_message" not in schemas
+    assert "meeting_set_addressed_members" in schemas
+    assert schemas["meeting_set_addressed_members"].parameters["properties"]["member_names"].get("minItems", 0) == 0
+    assert "build_team" not in schemas
     assert schemas["meeting_read_history"].parameters["properties"]["limit"] == {
         "type": "integer", "minimum": 1, "maximum": 20, "default": 10,
     }
-    assert "send_message" not in schemas and "group_send_message" not in schemas
+    assert "group_send_message" not in schemas
     assert "same language" in schemas["meeting_post_message"].description
     first_messages = leader.model.invoke.await_args_list[0].kwargs["messages"]
     assert any("A coordinated meeting is active" in str(message.content) for message in first_messages)
     assert any("Host the discussion" in str(message.content) for message in first_messages)
     assert "Host the discussion" in leader.agent.system_prompt_builder.build()
+    assert "Call build_team before coordinating" not in leader.agent.system_prompt_builder.build()
     await meeting.db.member.create_member("later", "publication-team", "Later", "{}", "ready", role="teammate")
-    later = await native_factory("later", participant=True)
+    later = await native_factory("later", participant=True, progressive=True)
     later.model.invoke.side_effect = [_post_call(content="Later report", mentions=["leader"]), AssistantMessage(content="")]
     await later.agent.invoke({"query": "Report"}, session=later.session, _streaming=True)
     assert "Host the discussion" not in later.agent.system_prompt_builder.build()
+    assert "meeting_forward_message" not in {tool.name for tool in await later.agent.ability_manager.list_tool_info()}
+    assert "meeting_set_addressed_members" not in {tool.name for tool in await later.agent.ability_manager.list_tool_info()}
     assert {item.member_name for item in await scope.coordinator.list_pending()} == {"leader", "later"}
     for native in (leader, later):
-        assert "meeting_interrupt_speech" not in {tool.name for tool in await native.agent.ability_manager.list_tool_info()}
+        required = {"meeting_post_message", "meeting_read_history", "meeting_get_speaker"}
+        if native is leader:
+            required.update({"send_message", "meeting_set_addressed_members"})
+        for call in native.model.invoke.await_args_list:
+            exposed = {tool.name for tool in call.kwargs["tools"]}
+            assert required <= exposed
+            assert "build_team" not in exposed and "meeting_interrupt_speech" not in exposed
+            if native is later:
+                assert "send_message" not in exposed and "meeting_set_addressed_members" not in exposed
     later_request = next(item for item in await scope.coordinator.list_pending() if item.member_name == "later")
     assert later_request.mentions == ("leader",)
     assert wakeups == ["queued", "queued"]
     assert not meeting.conversation.history_path.exists()
     assert await meeting.db.message.get_team_messages("publication-team") == []
+
+
+@pytest.mark.asyncio
+async def test_leader_relays_named_request_with_existing_send_message_without_speech(
+    meeting, publication_host, native_factory,
+):
+    wakeups = []
+    scope = await _enable_host(publication_host, lambda: wakeups.append("speech"))
+    coordinator = scope.coordinator
+    await meeting.db.member.create_member("other", "publication-team", "Other", "{}", "ready", role="teammate")
+    await coordinator.for_member("other").post_message(
+        "Unrelated report", speech_text="Other summary", mentions=["user"],
+    )
+    current = await coordinator.grant_next()
+    original = await coordinator.post_human_message("Analyst, can you respond to me?", mentions=["leader"])
+    leader = await native_factory(participant=True)
+    leader.model.invoke.side_effect = [AssistantMessage(content="", tool_calls=[ToolCall(
+        type="function", id=uuid4().hex, name="meeting_set_addressed_members",
+        arguments=json.dumps({"member_names": ["analyst"]}),
+    )]), AssistantMessage(content="", tool_calls=[ToolCall(
+        type="function", id=uuid4().hex, name="send_message",
+        arguments=json.dumps({"to": "analyst", "content": original.message.content}),
+    )]), AssistantMessage(content="The message was delivered.")]
+    result = await leader.agent.invoke({"query": "Route the named human request"}, session=leader.session)
+    assert result == {"output": "", "result_type": "answer", "meeting_queued": False}
+    assert wakeups == []
+    assert {item.member_name for item in await coordinator.list_pending()} <= {"other"}
+    state = await coordinator.get_state()
+    assert state.addressed_members == ("analyst",)
+    assert state.lease_token == current.lease_token
+    forwarded = [item for item in await meeting.db.message.get_team_messages("publication-team")
+                 if item.from_member_name == "leader"]
+    assert len(forwarded) == 1
+    assert forwarded[0].content == original.message.content
+    assert forwarded[0].to_member_name == "analyst" and not forwarded[0].broadcast
+    assert "The message was delivered." not in meeting.conversation.history_path.read_text(encoding="utf-8")
+
+    analyst = await native_factory("analyst", participant=True)
+    analyst.model.invoke.side_effect = [_post_call(content="Here is my answer", mentions=["user", "leader"]), AssistantMessage(content="")]
+    await analyst.agent.invoke({"query": forwarded[0].content}, session=analyst.session)
+    assert wakeups == ["speech"]
+    assert await coordinator.complete_playback(current.lease_token)
+    grant = await coordinator.grant_next()
+    assert grant.member_name == "analyst" and grant.mentions == ("user", "leader")
+    assert await coordinator.complete_playback(grant.lease_token)
+    assert (await coordinator.get_state()).addressed_members == ("analyst",)
+    priority = leader.rail._policy._tools["meeting_set_addressed_members"]
+    replaced = await priority.invoke({"member_names": ["other"]})
+    assert replaced.success and (await coordinator.get_state()).addressed_members == ("other",)
+    cleared = await priority.invoke({"member_names": []})
+    assert cleared.success and (await coordinator.get_state()).addressed_members == ()
+    # Clearing priority also disables silent handoffs to the former recipient.
+    leader.model.invoke.side_effect = [AssistantMessage(content="", tool_calls=[ToolCall(
+        type="function", id=uuid4().hex, name="send_message",
+        arguments=json.dumps({"to": "analyst", "content": "Do not resend"}),
+    )]), AssistantMessage(content="")]
+    await leader.agent.invoke({"query": "Try a stale handoff"}, session=leader.session)
+    assert len([item for item in await meeting.db.message.get_team_messages("publication-team")
+                if item.from_member_name == "leader"]) == 1
+    assert wakeups == ["speech"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("member,to,selected", [
+    ("leader", "user", ["analyst"]), ("leader", "*", ["analyst"]), ("analyst", "leader", ["leader"]),
+])
+async def test_silent_send_rejects_user_broadcast_and_teammate_bypasses(
+    meeting, native_factory, member, to, selected,
+):
+    await meeting.coordinator.set_addressed_members(selected)
+    native = await native_factory(member)
+    native.model.invoke.side_effect = [AssistantMessage(content="", tool_calls=[ToolCall(
+        type="function", id=uuid4().hex, name="send_message",
+        arguments=json.dumps({"to": to, "content": "Should not be delivered"}),
+    )]), AssistantMessage(content="")]
+    await native.agent.invoke({"query": "Try to send"}, session=native.session)
+    assert await meeting.db.message.get_team_messages("publication-team") == []
+    assert await meeting.coordinator.list_pending() == ()
+    assert (await meeting.coordinator.get_state()).addressed_members == tuple(selected)
 
 
 @pytest.mark.asyncio
