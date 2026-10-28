@@ -1,5 +1,30 @@
 {
   "meeting": {
+    "panel": {
+      "title": "Meeting",
+      "addressedAgents": "Agents currently addressed by the meeting",
+      "noAddressedAgents": "No agents currently addressed",
+      "speechRoute": "Your speech goes to",
+      "microphone": "Microphone",
+      "pauseMicrophone": "Pause microphone",
+      "microphoneStates": {
+        "ready": "Paused",
+        "recording": "Listening",
+        "transcribing": "Transcribing…"
+      },
+      "playback": "Agent speech",
+      "noSpeaker": "No agent is speaking",
+      "transcript": "Latest recognized speech",
+      "waitingForSpeech": "Waiting for your speech…",
+      "empty": "No meeting is active in this conversation. Use Start Team meeting beside the chat input to begin.",
+      "states": {
+        "idle": "No active meeting",
+        "starting": "Starting",
+        "active": "Active",
+        "closing": "Ending meeting…",
+        "cleanup_failed": "Cleanup needs attention"
+      }
+    },
     "routing": {
       "title": "Meeting input routing",
       "description": "Leader addresses the meeting host; None sends without naming a recipient. Saved in this browser and applied when the next meeting starts.",

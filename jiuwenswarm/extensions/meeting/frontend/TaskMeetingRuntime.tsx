@@ -163,6 +163,7 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
         line: () => {}, // Task handlers already own the conversation timeline.
         draft: (text) => {
           if (!mounted.current || current.current?.meeting !== meeting || input.signal.aborted) return;
+          publishMeeting({ lastTranscript: text });
           void sendMeetingInput(
             webClient,
             send,
@@ -194,6 +195,10 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           const speaker = context(id).members.find((item) => item.member_name === member)?.display_name || member || '';
           publishMeeting({ playback, speaker, voice: voice || '' });
         },
+        addressedMembers: (names) => {
+          if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
+            publishMeeting({ addressedMembers: names });
+        },
         ended: () => {
           const active = current.current;
           if (active?.meeting === meeting) void endServer(active);
@@ -208,6 +213,9 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
         playback: 'idle',
         speaker: '',
         voice: '',
+        routingMode,
+        lastTranscript: '',
+        addressedMembers: [],
       });
       try {
         let initial = initialization.current.get(id);

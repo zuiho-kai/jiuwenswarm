@@ -77,6 +77,7 @@ export class MeetingSession {
       recording: (state: RecordingState) => void;
       ended: () => void;
       playback?: (state: PlaybackState, speaker?: string, voice?: string) => void;
+      addressedMembers?: (names: string[]) => void;
     },
     private readonly createCapture: MeetingCaptureFactory = (...args) => new MeetingPcmCapture(...args),
   ) {
@@ -114,6 +115,14 @@ export class MeetingSession {
       }),
     );
     this.off.push(this.transport.on('meeting.speech.ready', ({ payload }) => this.receiveSpeech(payload)));
+    this.off.push(
+      this.transport.on('meeting.addressed_members', ({ payload }) => {
+        if (!this.active || !this.matchesMeeting(payload) || !Array.isArray(payload.addressed_members)) return;
+        const names = payload.addressed_members;
+        if (!names.every((name) => typeof name === 'string' && name.trim())) return;
+        this.callbacks.addressedMembers?.(names);
+      }),
+    );
     this.off.push(
       this.transport.on('meeting.speech.error', ({ payload }) => {
         if (!this.matchesMeeting(payload) || !this.active) return;

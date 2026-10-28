@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +28,7 @@ class MeetingPublicationSession:
     def __init__(
         self, coordinator: MeetingCoordinator, on_queued: Callable[[], None], *,
         voices: MemberVoiceRegistry | None = None,
+        on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
     ) -> None:
         if not callable(on_queued):
             raise ValueError("A meeting publication consumer wake-up callback is required")
@@ -38,6 +39,7 @@ class MeetingPublicationSession:
         self.coordinator = coordinator
         self.on_queued = on_queued
         self.voices = voices
+        self.on_addressed_members = on_addressed_members
         self.closed = False
         self._members: set[MeetingPublicationRail] = set()
 
@@ -58,6 +60,7 @@ class MeetingPublicationSession:
             self.voices.assign_voice(member_name, language=language)
         policy = await create_meeting_publication_rail(
             self.coordinator, member_name, language=language, on_queued=self.on_queued,
+            on_addressed_members=self.on_addressed_members,
         )
         if self.closed:
             raise ValueError("Meeting publication scope has ended")

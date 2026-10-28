@@ -15,6 +15,7 @@ await require('esbuild').build({
   stdin: { contents: `
     export {TaskMeetingAction} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingAction.tsx', import.meta.url)))};
     export {TaskMeetingRuntime} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingRuntime.tsx', import.meta.url)))};
+    export {MeetingPanel} from ${JSON.stringify(fileURLToPath(new URL('../frontend/MeetingPanel.tsx', import.meta.url)))};
     export {setTeamMeetingEnabled} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/featureFlag.ts'))};
     export {setMeetingRoutingMode} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/routingMode.ts'))};
     export {requests,meetingServer,webClient,emit} from 'meeting-test-transport';
@@ -33,7 +34,7 @@ await require('esbuild').build({
     build.onLoad({filter:/.*/,namespace:'meeting-test'},({path})=>({loader:'js',contents: {
       capture: `export class MeetingPcmCapture {async start(){}stop(){}}`,
       i18n: `export const useTranslation=()=>({t:key=>key,i18n:{language:'en'}});`,
-      sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
+      sessions: `const runtime={mode:'team',teamLeaderMemberIds:['leader'],teamMembers:[{member_id:'analyst',name:'Analyst',role:'teammate',status:'ready'}]};const state={runtimes:{s:runtime},getRuntime:()=>runtime};export const useSessionStore=fn=>fn(state);useSessionStore.getState=()=>state;`,
       transport: `
         export const requests=[];
         export const meetingServer={state:'active',acceptInputs:true,failInput:false,failEnd:false,failReady:false};
@@ -61,7 +62,7 @@ await require('esbuild').build({
     }[path]}));
   }}],
 });
-const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,setMeetingRoutingMode,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner,isTaskInputBlocked}=require(output);
+const {TaskMeetingAction,TaskMeetingRuntime,MeetingPanel,setTeamMeetingEnabled,setMeetingRoutingMode,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner,isTaskInputBlocked}=require(output);
 
 async function mount(extra={}) {
   const dom=new JSDOM('<div id="root"></div>',{url:'http://localhost'});
@@ -81,7 +82,7 @@ async function mount(extra={}) {
   };
   const root=createRoot(document.getElementById('root'));
   const props={fallback:React.createElement('button',{'data-testid':'normal-send'},'Send'),eligible:false,teamEligible:true,sessionId:'s',ensureSession:async()=> 's',onTranscript:text=>drafts.push(text),onMicrophoneActiveChange:value=>capture.push(value),labels:{start:'',starting:'',stop:''},...extra};
-  const render=(key)=>root.render(React.createElement(React.Fragment,null,React.createElement(TaskMeetingRuntime,{sessionId:'s',key:'runtime',onSendMessage}),React.createElement(TaskMeetingAction,{...props,key})));
+  const render=(key)=>root.render(React.createElement(React.Fragment,null,React.createElement(TaskMeetingRuntime,{sessionId:'s',key:'runtime',onSendMessage}),React.createElement(TaskMeetingAction,{...props,key}),React.createElement(MeetingPanel,{sessionId:props.sessionId})));
   await act(async()=>render('welcome')); 
   return {dom,track,drafts,capture,messages,root,microphoneCalls:()=>microphoneCalls,
     rerenderComposer:async()=>{await act(async()=>render('conversation'));},
@@ -98,19 +99,30 @@ test('meeting initializes visibly and sends speech automatically through the nor
     const send=h.find('normal-send');
     await h.click('chat-panel-input-meeting');
     assert.equal(h.find('chat-panel-input-meeting').getAttribute('aria-pressed'),'true');
+    assert.equal(h.find('team-area-meeting-status').getAttribute('data-variant'),'active');
+    assert.equal(h.find('team-area-meeting-addressed-agents').textContent,'meeting.panel.noAddressedAgents');
+    assert.equal(h.find('team-area-meeting-speech-route').textContent,'@meeting.leader');
+    await act(async()=>emit('meeting.addressed_members',{session_id:'another',meeting_id:'meeting-one',addressed_members:['analyst']}));
+    assert.equal(h.find('team-area-meeting-addressed-agents').textContent,'meeting.panel.noAddressedAgents');
+    await act(async()=>emit('meeting.addressed_members',{session_id:'s',meeting_id:'meeting-one',addressed_members:['analyst']}));
+    assert.equal(h.find('team-area-meeting-addressed-agents').textContent,'@Analyst');
+    await act(async()=>emit('meeting.addressed_members',{session_id:'s',meeting_id:'meeting-one',addressed_members:[]}));
+    assert.equal(h.find('team-area-meeting-addressed-agents').textContent,'meeting.panel.noAddressedAgents');
     assert.equal(h.find('chat-panel-input-meeting-record').getAttribute('data-variant'),'recording');
     await h.click('chat-panel-input-meeting-record');
     assert.deepEqual(h.drafts,[]);
     assert.deepEqual(h.messages,['meeting.startMessage','Please review the layout.']);
+    assert.equal(h.find('team-area-meeting-transcript').textContent,'Please review the layout.');
     assert.equal(h.find('normal-send'),send);
     const inputs=requests.filter(request=>request.name==='chat.send');
     assert.equal(inputs.length,2);
     assert.deepEqual(inputs[0].params.mentions,[]);
     assert.deepEqual(inputs[1].params.mentions,['leader']);
     assert.ok(inputs.every(input=>input.params.meeting_mode===true));
-    await h.click('chat-panel-input-meeting');
+    await h.click('team-area-meeting-end-btn');
     assert.ok(h.track.stopped);assert.equal(h.capture.at(-1),false);
     assert.ok(requests.some(request=>request.name==='meeting.end'&&request.params.meeting_id==='meeting-one'));
+    assert.equal(h.find('team-area-meeting-end-btn'),null);
   } finally {await h.close();}
 });
 
@@ -125,6 +137,7 @@ test('None routing sends speech without mentions and stays fixed for the meeting
     assert.equal(inputs.length,2);
     assert.deepEqual(inputs[1].params.mentions,[]);
     assert.equal(inputs[1].params.content,'Please review the layout.');
+    assert.equal(h.find('team-area-meeting-speech-route').textContent,'meeting.routing.none');
   } finally {await h.close();}
 });
 
@@ -136,7 +149,9 @@ test('unconfirmed cleanup preserves End retry and prevents a replacement meeting
   assert.ok(h.find('chat-panel-meeting-cleanup-error'));
   assert.ok(hasMeetingAudioOwner('s'));
   assert.equal(h.find('chat-panel-input-meeting').disabled,false);
+  assert.equal(h.find('team-area-meeting-end-btn').disabled,false);
   await h.updateProps({sessionId:'another-session'});
+  assert.equal(h.find('team-area-meeting-end-btn'),null);
   assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'cleanup_failed');
   meetingServer.failEnd=false;await h.click('chat-panel-input-meeting');
   assert.equal(h.find('chat-panel-input-meeting').getAttribute('data-variant'),'idle');

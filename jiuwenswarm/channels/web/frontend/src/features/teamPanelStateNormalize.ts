@@ -1,5 +1,5 @@
 export type TeamPanelActiveTab = 'planning' | 'team' | 'artifacts' | 'review' | 'browser';
-export type TeamPanelDetailTab = 'members' | 'group';
+export type TeamPanelDetailTab = 'members' | 'group' | `app:${string}`;
 
 export interface TeamPanelState {
   expanded: boolean;
@@ -37,7 +37,8 @@ export function normalizeTeamPanelState(value: unknown): TeamPanelState {
       : DEFAULT_TEAM_PANEL_STATE.activeTab;
   const activeDetailTab =
     typeof raw.activeDetailTab === 'string' &&
-    VALID_DETAIL_TABS.has(raw.activeDetailTab as TeamPanelDetailTab)
+    (VALID_DETAIL_TABS.has(raw.activeDetailTab as TeamPanelDetailTab) ||
+      /^app:[a-z][a-z0-9_-]{0,63}$/.test(raw.activeDetailTab))
       ? (raw.activeDetailTab as TeamPanelDetailTab)
       : DEFAULT_TEAM_PANEL_STATE.activeDetailTab;
   const selectedMemberId =

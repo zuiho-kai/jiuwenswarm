@@ -167,6 +167,7 @@ class MeetingManager:
     async def _enable_publication_locked(
         self, session_id: str, meeting: _Meeting, on_queued: Callable[[], None],
         voices: MemberVoiceRegistry | None = None,
+        on_addressed_members=None,
     ) -> MeetingPublicationSession:
         from .participants import MeetingPublicationSession
 
@@ -194,7 +195,10 @@ class MeetingManager:
                 (member.member_name for member in members),
                 leader_id=meeting.state.leader_member_name,
             )
-        meeting.publication = MeetingPublicationSession(meeting.coordinator, on_queued, voices=voices)
+        meeting.publication = MeetingPublicationSession(
+            meeting.coordinator, on_queued, voices=voices,
+            on_addressed_members=on_addressed_members,
+        )
         return meeting.publication
 
     async def enable_grant_driver(
@@ -220,7 +224,10 @@ class MeetingManager:
                 meeting.coordinator, consumer,
                 is_current=lambda: self._driver_is_current(session_id, meeting),
             )
-            await self._enable_publication_locked(session_id, meeting, driver.wake, voices)
+            await self._enable_publication_locked(
+                session_id, meeting, driver.wake, voices,
+                on_addressed_members=getattr(consumer, "addressed_members_changed", None),
+            )
             meeting.driver = driver
             driver.start()
             return driver

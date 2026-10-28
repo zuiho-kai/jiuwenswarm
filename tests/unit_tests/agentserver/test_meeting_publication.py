@@ -24,7 +24,40 @@ from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.prompts import PromptSection, SystemPromptBuilder
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
-from jiuwenswarm.extensions.meeting.publication import create_meeting_publication_rail
+from jiuwenswarm.extensions.meeting.publication import MeetingSetAddressedMembersTool, create_meeting_publication_rail
+
+
+@pytest.mark.asyncio
+async def test_addressed_member_changes_notify_browser_after_success():
+    class Coordinator:
+        def __init__(self):
+            self.addressed = []
+
+        def for_member(self, name):
+            if name not in {"leader", "analyst"}:
+                raise ValueError("Unknown member")
+            return SimpleNamespace(member_name=name, get_state=self.get_state)
+
+        async def get_state(self):
+            return SimpleNamespace(closed=False, leader_member_name="leader")
+
+        async def set_addressed_members(self, names):
+            self.addressed = names
+            return True
+
+    coordinator = Coordinator()
+    updates = []
+
+    async def notify(names):
+        updates.append(names)
+
+    tool = MeetingSetAddressedMembersTool(coordinator, "leader", notify)
+    selected = await tool.invoke({"member_names": ["analyst"]})
+    assert selected.success and updates == [["analyst"]]
+    rejected = await tool.invoke({"member_names": ["missing"]})
+    assert not rejected.success and updates == [["analyst"]]
+    cleared = await tool.invoke({"member_names": []})
+    assert cleared.success and updates == [["analyst"], []]
 
 
 @pytest.fixture

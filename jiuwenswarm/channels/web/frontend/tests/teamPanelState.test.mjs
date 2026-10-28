@@ -52,3 +52,11 @@ test('normalizeTeamPanelState falls back for invalid enum fields', () => {
     },
   );
 });
+
+test('plugin detail panels survive storage restoration', () => {
+  assert.equal(
+    parseTeamPanelStateRaw(JSON.stringify({ activeDetailTab: 'app:meeting' })).activeDetailTab,
+    'app:meeting',
+  );
+  assert.equal(normalizeTeamPanelState({ activeDetailTab: 'app:../meeting' }).activeDetailTab, 'members');
+});

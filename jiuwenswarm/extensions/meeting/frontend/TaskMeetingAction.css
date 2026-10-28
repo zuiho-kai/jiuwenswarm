@@ -9,6 +9,12 @@
   color: var(--color-text-link);
   background: var(--color-surface-highlight);
 }
+.task-meeting-action:not(.is-idle) {
+  width: auto;
+  gap: 6px;
+  padding-inline: 10px;
+  white-space: nowrap;
+}
 .task-meeting-spinner {
   animation: task-meeting-spin 1s linear infinite;
 }

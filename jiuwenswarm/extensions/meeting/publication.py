@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -69,7 +69,10 @@ class _PublicationTurn:
 
 
 class MeetingSetAddressedMembersTool(TeamTool):
-    def __init__(self, coordinator: MeetingCoordinator, member_name: str) -> None:
+    def __init__(
+        self, coordinator: MeetingCoordinator, member_name: str,
+        on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
+    ) -> None:
         super().__init__(ToolCard(
             id=f"team.{_ADDRESSED}", name=_ADDRESSED,
             description=(
@@ -89,6 +92,7 @@ class MeetingSetAddressedMembersTool(TeamTool):
         ))
         self.coordinator = coordinator
         self.client = coordinator.for_member(member_name)
+        self.on_addressed_members = on_addressed_members
 
     async def invoke(self, inputs: dict, **kwargs) -> ToolOutput:
         if not isinstance(inputs, dict) or set(inputs) != {"member_names"}:
@@ -108,6 +112,11 @@ class MeetingSetAddressedMembersTool(TeamTool):
                 await self.coordinator.for_member(name).get_state()
             if not await self.coordinator.set_addressed_members(names):
                 raise ValueError("Meeting has ended")
+            if self.on_addressed_members is not None:
+                try:
+                    await self.on_addressed_members(names)
+                except Exception:
+                    logger.exception("Meeting addressed-member notification failed")
             return ToolOutput(success=True, data={"addressed_members": names})
         except ValueError as exc:
             return ToolOutput(success=False, error=str(exc))
@@ -354,6 +363,7 @@ class MeetingPublicationRail(DeepAgentRail):
 async def create_meeting_publication_rail(
     coordinator: MeetingCoordinator, member_name: str, *, language: str = "en",
     on_queued: Callable[[], None] | None = None,
+    on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> MeetingPublicationRail:
     """Prepare one trusted native member; caller owns installation and removal.
 
@@ -369,7 +379,7 @@ async def create_meeting_publication_rail(
     )
     tools = await create_meeting_tools(coordinator.for_member(member_name), language=language)
     if rail._leader:
-        tools[_ADDRESSED] = MeetingSetAddressedMembersTool(coordinator, member_name)
+        tools[_ADDRESSED] = MeetingSetAddressedMembersTool(coordinator, member_name, on_addressed_members)
     rail._tools = {
         name: _ScopedTool(tool, rail)
         for name, tool in tools.items()

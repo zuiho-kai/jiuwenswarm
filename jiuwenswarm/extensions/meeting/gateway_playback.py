@@ -100,6 +100,15 @@ class GatewayPlaybackRoute:
                 raise ValueError("Invalid playback stop identity")
             if stop_id not in self.stops:
                 self.stops[stop_id] = asyncio.create_task(self.stop_media())
+        elif event == "meeting.addressed_members":
+            if self.revoked:
+                return
+            names = payload.get("addressed_members")
+            if not isinstance(names, list) or len(names) > 100 or any(
+                not isinstance(name, str) or not name.strip() or len(name) > 255
+                for name in names
+            ):
+                raise ValueError("Invalid meeting addressed members")
         elif event != "meeting.speech.error":
             raise ValueError("Unknown meeting playback event")
         await self.channel.send_event(self.ws, event, {

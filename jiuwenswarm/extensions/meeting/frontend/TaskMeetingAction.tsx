@@ -158,6 +158,7 @@ export function TaskMeetingAction({
             ) : (
               <UsersRound className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
             )}
+            {status !== 'idle' && <span>{title}</span>}
           </button>
           {status === 'starting' && !creating && (
             <span className="task-meeting-waiting" data-testid="chat-panel-meeting-waiting">

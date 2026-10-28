@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { blockTaskInput } from '../../../channels/web/frontend/src/applicationPlugins/taskInputReadiness';
 import type { RecordingState, PlaybackState } from './meetingRuntime';
+import type { MeetingRoutingMode } from '../../../channels/web/frontend/src/features/teamMeeting/routingMode';
 
 export type MeetingSnapshot = {
   state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed';
@@ -9,6 +10,9 @@ export type MeetingSnapshot = {
   playback: PlaybackState;
   speaker: string;
   voice: string;
+  routingMode: MeetingRoutingMode;
+  lastTranscript: string;
+  addressedMembers: string[];
 };
 type Controller = {
   start: (sessionId: string) => Promise<void>;
@@ -24,6 +28,9 @@ let snapshot: MeetingSnapshot = {
   playback: 'idle',
   speaker: '',
   voice: '',
+  routingMode: 'leader',
+  lastTranscript: '',
+  addressedMembers: [],
 };
 const listeners = new Set<() => void>();
 let releaseInput: (() => void) | undefined;

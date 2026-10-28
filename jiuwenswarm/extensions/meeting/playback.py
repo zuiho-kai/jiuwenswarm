@@ -72,6 +72,10 @@ class BrowserPlaybackConsumer:
         }):
             raise RuntimeError("Meeting playback could not reach its owning browser")
 
+    async def addressed_members_changed(self, names: list[str]) -> None:
+        if not self._closing:
+            await self._push("meeting.addressed_members", {"addressed_members": names})
+
     async def speech_ready(self, request) -> None:
         if self._closing or request.scope != self.scope or not request.lease_token or request.source_message_id is None:
             raise ValueError("A matching granted speech request is required")

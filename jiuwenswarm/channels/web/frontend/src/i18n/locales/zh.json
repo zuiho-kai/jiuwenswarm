@@ -1,5 +1,30 @@
 {
   "meeting": {
+    "panel": {
+      "title": "会议",
+      "addressedAgents": "会议当前提及的智能体",
+      "noAddressedAgents": "当前未提及智能体",
+      "speechRoute": "您的语音发送给",
+      "microphone": "麦克风",
+      "pauseMicrophone": "暂停麦克风",
+      "microphoneStates": {
+        "ready": "已暂停",
+        "recording": "正在聆听",
+        "transcribing": "正在转写…"
+      },
+      "playback": "智能体发言",
+      "noSpeaker": "暂无智能体发言",
+      "transcript": "最近识别的语音",
+      "waitingForSpeech": "正在等待您的语音…",
+      "empty": "当前对话没有正在进行的会议。点击聊天输入框旁的「开始团队会议」即可开始。",
+      "states": {
+        "idle": "无进行中的会议",
+        "starting": "正在启动",
+        "active": "进行中",
+        "closing": "正在结束会议…",
+        "cleanup_failed": "需要重试清理"
+      }
+    },
     "routing": {
       "title": "会议输入路由",
       "description": "Leader 将消息发给会议主持人；None 不指定接收者。选项保存在当前浏览器，在下次启动会议时生效。",
