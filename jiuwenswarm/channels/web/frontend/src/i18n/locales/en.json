@@ -654,6 +654,16 @@
         "title": "Speech transcription",
         "description": "Enable microphone speech transcription in task conversations."
       },
+      "meeting_vad_start_threshold": {
+        "title": "Meeting speech-start confidence",
+        "description": "0–1 (default 0.5). Lower values accept less certain speech, but may pick up more noise. Applies to backend meeting detection after restarting the meeting. Clear to reset.",
+        "placeholder": "0.5"
+      },
+      "meeting_vad_start_frames": {
+        "title": "Meeting start confirmation frames",
+        "description": "1–10 whole frames (default 5). Confirm this many speech frames within the last 10; each frame is 32 ms. Fewer frames respond faster. Restart the meeting after saving. Clear to reset.",
+        "placeholder": "5"
+      },
       "skill_evolution": {
         "title": "Automatic evolution and retention of local skills",
         "description": "Control automatic evolution and retention of local skills."

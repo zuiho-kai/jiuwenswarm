@@ -10,6 +10,8 @@ import wave
 
 import numpy as np
 
+from jiuwenswarm.common.meeting_speech_detection import speech_start_settings
+
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 512
 MAX_UTTERANCE_FRAMES = 937  # Less than 30 seconds, including pre-roll.
@@ -48,7 +50,7 @@ class SileroProbability:
 
 
 class UtteranceSegmenter:
-    """Confirm speech for 8/10 frames; finish after 640 ms of silence.
+    """Confirm speech with configurable confidence/frames; finish after 640 ms silence.
 
     Keep one second of pre-roll to preserve onset while confirming speech.
     Inference and this mutable state run serially off the Gateway event loop.
@@ -56,6 +58,9 @@ class UtteranceSegmenter:
 
     def __init__(self, probability=None):
         self.probability = probability if probability is not None else SileroProbability()
+        settings = speech_start_settings()
+        self.start_threshold = settings["startThreshold"]
+        self.start_frames = settings["startFrames"]
         self.reset()
 
     def reset(self):
@@ -98,9 +103,9 @@ class UtteranceSegmenter:
                     utterances.append(self.finish())
             else:
                 self.pre_roll.append(frame)
-                speech = probability >= 0.8 and level >= 80
+                speech = probability >= self.start_threshold and level >= 80
                 self.evidence.append(speech)
-                if speech and sum(self.evidence) >= 8:
+                if speech and sum(self.evidence) >= self.start_frames:
                     self.frames = list(self.pre_roll)
                     self.pre_roll.clear()
                     self.silence = 0

@@ -34,6 +34,8 @@ export const experimentalModule: SettingsModuleDefinition = {
       items: [
         { id: 'team-meeting-enabled', component: 'switch', key: 'team_meeting_enabled' },
         { id: 'team-meeting-routing', component: 'custom', render: MeetingRoutingSetting },
+        { id: 'meeting-vad-start-threshold', component: 'input', key: 'meeting_vad_start_threshold' },
+        { id: 'meeting-vad-start-frames', component: 'input', key: 'meeting_vad_start_frames' },
       ],
     },
     {

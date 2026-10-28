@@ -83,6 +83,11 @@ from jiuwenswarm.common.config_panel.models_handlers import (
     build_models_defaults_from_frontend,
 )
 from jiuwenswarm.common.context_window import parse_positive_int
+from jiuwenswarm.common.meeting_speech_detection import (
+    SPEECH_START_ENV,
+    speech_start_settings,
+    validate_speech_start_setting,
+)
 from jiuwenswarm.common.kv_cache_affinity_config import (
     ASCEND_AFFINITY_PROVIDER,
     KVC_CONFIG_KEYS,
@@ -170,6 +175,7 @@ ASR_ENV_KEYS = {
     "ASR_API_BASE",
     "ASR_API_KEY",
     "ASR_MODEL_NAME",
+    *SPEECH_START_ENV.values(),
 }
 
 
@@ -330,6 +336,7 @@ CONFIG_SET_ENV_MAP = {
     "asr_api_base": "ASR_API_BASE",
     "asr_api_key": "ASR_API_KEY",
     "asr_model": "ASR_MODEL_NAME",
+    **SPEECH_START_ENV,
     # agents
     "skills": "SKILLS",
     "max_iterations": "MAX_ITERATIONS",
@@ -1213,6 +1220,11 @@ def apply_config_payload(
         if param_key not in params:
             continue
         val = params[param_key]
+        if param_key in SPEECH_START_ENV:
+            try:
+                val = validate_speech_start_setting(param_key, val)
+            except ValueError as exc:
+                raise ConfigPanelBadRequest(str(exc)) from exc
         if param_key.endswith("_context_window_tokens") and val not in (None, ""):
             parsed_context_window = parse_positive_int(val)
             if parsed_context_window is None:
@@ -1502,6 +1514,9 @@ async def config_get_handler(
         for param_key, env_key in CONFIG_SET_ENV_MAP.items()
     }
     payload["app_version"] = __version__
+    speech_start = speech_start_settings()
+    payload["meeting_vad_start_threshold"] = str(speech_start["startThreshold"])
+    payload["meeting_vad_start_frames"] = str(speech_start["startFrames"])
     runtime_platform = (os.getenv("JIUWENSWARM_RUNTIME_PLATFORM") or "").strip().lower() or "default"
     payload["runtime_platform"] = runtime_platform
     payload["external_cli_agents_supported"] = "false" if runtime_platform == "harmony" else "true"

@@ -647,6 +647,16 @@
         "title": "语音转写",
         "description": "开启后，任务对话可以使用麦克风进行语音转写。"
       },
+      "meeting_vad_start_threshold": {
+        "title": "会议语音起始置信度",
+        "description": "范围 0–1，默认 0.5。降低数值可接受置信度较低的语音，但也可能引入更多噪声。仅用于会议后端人声检测，重新开始会议后生效。清空可恢复默认值。",
+        "placeholder": "0.5"
+      },
+      "meeting_vad_start_frames": {
+        "title": "会议起始确认帧数",
+        "description": "范围 1–10 整数帧，默认 5。在最近 10 帧中达到此语音帧数后确认说话，每帧 32 毫秒。帧数越少响应越快。保存后请重新开始会议。清空可恢复默认值。",
+        "placeholder": "5"
+      },
       "skill_evolution": { "title": "本地技能自动演进与沉淀", "description": "控制本地技能的自动演进和沉淀" },
       "symphony_evolution_enabled": {
         "title": "发现技能包",

@@ -21,6 +21,7 @@ import yaml
 
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
+from jiuwenswarm.common.meeting_speech_detection import SPEECH_START_ENV, speech_start_settings
 from jiuwenswarm.common.utils import get_config_file
 from jiuwenswarm.common.version import __version__
 from jiuwenswarm.server.control.a2ui_config import get_a2ui_config
@@ -33,6 +34,7 @@ from jiuwenswarm.symphony.config import (
 logger = logging.getLogger(__name__)
 
 _CONFIG_SET_ENV_MAP = {
+    **SPEECH_START_ENV,
     "model_provider": "MODEL_PROVIDER",
     "model": "MODEL_NAME",
     "api_base": "API_BASE",
@@ -380,6 +382,9 @@ def get_panel() -> dict[str, Any]:
         for param_key, env_key in _CONFIG_SET_ENV_MAP.items()
     }
     payload["app_version"] = __version__
+    speech_start = speech_start_settings()
+    payload["meeting_vad_start_threshold"] = str(speech_start["startThreshold"])
+    payload["meeting_vad_start_frames"] = str(speech_start["startFrames"])
     runtime_platform = (
         (os.getenv("JIUWENSWARM_RUNTIME_PLATFORM") or "").strip().lower() or "default"
     )

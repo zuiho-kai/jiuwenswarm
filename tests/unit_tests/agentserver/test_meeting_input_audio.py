@@ -85,13 +85,19 @@ class Probability:
         return self.value
 
 
+@pytest.fixture(autouse=True)
+def isolate_speech_detection_settings(monkeypatch):
+    monkeypatch.delenv("MEETING_VAD_START_THRESHOLD", raising=False)
+    monkeypatch.delenv("MEETING_VAD_START_FRAMES", raising=False)
+
+
 def test_segmentation_confirms_speech_preserves_onset_and_waits_for_silence():
     probability = Probability()
     vad = UtteranceSegmenter(probability)
     probability.value = 0.1
     assert vad.feed(frame(20000) * 100) == []  # Loud noise is not speech.
-    probability.value = 0.99
-    vad.feed(frame() * 7)
+    probability.value = 0.5
+    vad.feed(frame() * 4)
     assert not vad.frames
     vad.feed(frame())
     assert len(vad.frames) == 31  # Confirmation retains the pre-roll.
@@ -101,6 +107,25 @@ def test_segmentation_confirms_speech_preserves_onset_and_waits_for_silence():
     probability.value = 0.99
     assert vad.feed(frame() * 8) == []
     assert vad.flush() == frame() * 8  # Ready for the next utterance.
+
+
+def test_segmentation_uses_saved_start_settings_for_new_streams(monkeypatch):
+    monkeypatch.setenv("MEETING_VAD_START_THRESHOLD", "0.7")
+    monkeypatch.setenv("MEETING_VAD_START_FRAMES", "3")
+    probability = Probability()
+    vad = UtteranceSegmenter(probability)
+    probability.value = 0.69
+    vad.feed(frame() * 20)
+    assert not vad.frames
+    probability.value = 0.7
+    vad.feed(frame() * 2)
+    assert not vad.frames
+    vad.feed(frame())
+    assert vad.frames
+    # A new setting does not alter segmentation in the middle of an utterance.
+    monkeypatch.setenv("MEETING_VAD_START_THRESHOLD", "0.9")
+    assert vad.start_threshold == 0.7
+    assert UtteranceSegmenter(probability).start_threshold == 0.9
 
 
 @pytest.fixture
