@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 import json
 import logging
@@ -60,22 +60,40 @@ class QwenOmniRealtimeConfig:
 
 
 @asynccontextmanager
-async def open_qwen_omni_connection(config: QwenOmniRealtimeConfig):
+async def open_qwen_omni_connection(
+    config: QwenOmniRealtimeConfig, *, closing_tasks: set[asyncio.Task] | None = None,
+):
     """Open an isolated provider connection using the shared credential boundary.
 
     Consumers supply their own session instructions, tools and media. Opening a
     connection does not enable microphones, select a feature, or create a reply.
+    A consumer may own successful connection cleanup via ``closing_tasks`` and
+    drain those tasks on shutdown. Failed/cancelled operations close inline.
     """
-    async with websockets.connect(
-        config.upstream_with_model(),
-        additional_headers={"Authorization": f"Bearer {config.api_key}"},
-        open_timeout=15,
-        close_timeout=5,
-        ping_interval=20,
-        ping_timeout=30,
-        max_size=8 * 1024 * 1024,
-    ) as upstream:
+    async with AsyncExitStack() as stack:
+        upstream = await stack.enter_async_context(websockets.connect(
+            config.upstream_with_model(),
+            additional_headers={"Authorization": f"Bearer {config.api_key}"},
+            open_timeout=15,
+            close_timeout=5,
+            ping_interval=20,
+            ping_timeout=30,
+            max_size=8 * 1024 * 1024,
+        ))
         yield upstream
+        if closing_tasks is not None:
+            # The operation has finished; the close handshake must not delay
+            # delivery of its result. Retain ownership until bounded close ends.
+            cleanup = stack.pop_all()
+            task = asyncio.create_task(cleanup.aclose())
+            closing_tasks.add(task)
+
+            def closed(done):
+                closing_tasks.discard(done)
+                if not done.cancelled() and (error := done.exception()) is not None:
+                    logger.warning("Qwen Omni connection cleanup failed: %s", _safe_upstream_error(error, config.api_key))
+
+            task.add_done_callback(closed)
 
 
 async def _send_gateway_error(websocket: WebSocket, code: str, message: str) -> None:

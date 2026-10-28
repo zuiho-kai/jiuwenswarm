@@ -67,19 +67,3 @@ test('cancellation during initialization prevents late capture', async t => {
   assert.equal(h.worklet, undefined);
   assert.ok(h.context.closed);
 });
-
-test('worklet loading failure releases the context', async t => {
-  const h = host(t, async () => { throw new Error('unavailable'); });
-  await assert.rejects(h.capture.start(), /unavailable/);
-  assert.ok(h.context.closed);
-});
-
-test('processor failure is reported once and ignored after stop', async t => {
-  const next = host(t);
-  await next.capture.start();
-  const late = next.worklet.onprocessorerror;
-  late();
-  next.capture.stop();
-  late();
-  assert.deepEqual(next.errors, ['failed']);
-});

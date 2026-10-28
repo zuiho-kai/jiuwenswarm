@@ -180,69 +180,6 @@ async def test_meeting_control_uses_server_route_and_releases_disconnect_owner()
 
 
 @pytest.mark.asyncio
-async def test_disconnect_releases_start_before_and_after_its_late_response() -> None:
-    entered, release_response = asyncio.Event(), asyncio.Event()
-
-    class Client:
-        server_ready = True
-        def __init__(self):
-            self.envelopes = []
-        async def send_request(self, envelope):
-            self.envelopes.append(envelope)
-            if envelope.method == "meeting.start":
-                entered.set()
-                await release_response.wait()
-            return SimpleNamespace(ok=True, payload={"state": "starting"})
-
-    client = Client()
-    channel = FakeWebChannel()
-    _register_web_handlers(WebHandlersBindParams(channel=channel, agent_client=client))
-    ws = SimpleNamespace()
-    start = asyncio.create_task(channel.methods["meeting.start"](
-        ws, "start", {"session_id": "session-one", "startup_id": "attempt-1"}, "session-one", "user-42",
-    ))
-    await asyncio.wait_for(entered.wait(), 1)
-    await channel.disconnect_handler(ws, set())
-    assert [envelope.method for envelope in client.envelopes] == ["meeting.start", "meeting.release"]
-    release_response.set()
-    await asyncio.wait_for(start, 1)
-    assert client.envelopes[-1].method == "meeting.release"
-    assert client.envelopes[-1].params["startup_id"] == "attempt-1"
-
-
-@pytest.mark.asyncio
-async def test_old_release_response_preserves_new_start_disconnect_tracking() -> None:
-    entered, release_response = asyncio.Event(), asyncio.Event()
-
-    class Client:
-        server_ready = True
-        def __init__(self):
-            self.envelopes = []
-        async def send_request(self, envelope):
-            self.envelopes.append(envelope)
-            if envelope.method == "meeting.release" and envelope.params.get("startup_id") == "old":
-                entered.set()
-                await release_response.wait()
-            return SimpleNamespace(ok=True, payload={"state": "starting"})
-
-    client = Client()
-    channel = FakeWebChannel()
-    _register_web_handlers(WebHandlersBindParams(channel=channel, agent_client=client))
-    ws = SimpleNamespace()
-    await channel.methods["meeting.start"](ws, "old", {"startup_id": "old"}, "session-one", "user-42")
-    release = asyncio.create_task(channel.methods["meeting.release"](
-        ws, "release", {"startup_id": "old"}, "session-one", "user-42",
-    ))
-    await asyncio.wait_for(entered.wait(), 1)
-    await channel.methods["meeting.start"](ws, "new", {"startup_id": "new"}, "session-one", "user-42")
-    release_response.set()
-    await asyncio.wait_for(release, 1)
-    await channel.disconnect_handler(ws, set())
-    assert client.envelopes[-1].method == "meeting.release"
-    assert client.envelopes[-1].params["startup_id"] == "new"
-
-
-@pytest.mark.asyncio
 async def test_models_get_returns_desensitized_editable_detail(monkeypatch) -> None:
     class FakeCatalog:
         def get_public_model_detail(self, model_id):

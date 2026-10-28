@@ -14,7 +14,7 @@ from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.common.voice_matching import load_qwen_voice_catalog
 from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
 from jiuwenswarm.gateway.voice.providers.qwen_omni import QwenOmniRealtimeConfig
-from jiuwenswarm.gateway.voice.tts import QwenOmniTts
+from jiuwenswarm.gateway.voice.tts import QwenOmniTtsSession
 from .gateway_input import MeetingInputStream, bind_input_handlers
 from .playback import IDENTITY_FIELDS
 
@@ -42,6 +42,7 @@ class GatewayPlaybackRoute:
         self.current_playback = None
         self.result_lock = asyncio.Lock()
         self.tasks: dict[tuple, asyncio.Task] = {}
+        self.tts = QwenOmniTtsSession(config)
         self.stops: dict[str, asyncio.Task] = {}
         _routes[self.id] = self
 
@@ -68,6 +69,7 @@ class GatewayPlaybackRoute:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.tts.aclose()
 
     async def stop_media(self):
         self.revoked = True
@@ -111,15 +113,14 @@ async def handle_playback_push(payload: dict) -> None:
         await route.push(payload)
 
 
-def forget_playback_routes(ws, session_id: str, meeting_id: str | None = None, *, startup_id=None):
+async def forget_playback_routes(ws, session_id: str, meeting_id: str | None = None, *, startup_id=None):
     routes = getattr(ws, "_meeting_playback_routes", {})
     for key, route in list(routes.items()):
         if (
             key[0] == session_id and (meeting_id is None or key[1] == meeting_id)
             and (startup_id is None or route.startup_id == startup_id)
         ):
-            route.revoked = True
-            route.input.revoke()
+            await route.stop_media()
             routes.pop(key, None)
             _routes.pop(route.id, None)
 
@@ -163,6 +164,9 @@ def bind_playback_handlers(channel, agent_client):
             if route.revoked or route.input.closed or route.startup_id != startup_id or route.revision != config_revision(config):
                 raise ValueError("Meeting playback configuration changed or has stopped")
             await route.input.start()
+            # Warm the meeting-owned connection before the driver can publish
+            # its first speech. Repeated readiness reuses the same session.
+            await route.tts.start()
             payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_READY, {
                 "meeting_id": meeting_id, "startup_id": startup_id,
                 "_meeting_route_id": route.id, "_qwen_model": config.model,
@@ -176,7 +180,7 @@ def bind_playback_handlers(channel, agent_client):
         except Exception as exc:
             if created:
                 await route.stop_media()
-                forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
+                await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
             await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
 
     async def synthesize(ws, req_id, params, session_id, user_id=None):
@@ -202,7 +206,7 @@ def bind_playback_handlers(channel, agent_client):
                 or chunk.get("config_revision") != route.revision or chunk.get("model") != config.model
             ):
                 raise ValueError("Meeting TTS configuration changed")
-            task = asyncio.create_task(QwenOmniTts(config).synthesize(chunk["text"], chunk["voice"]))
+            task = asyncio.create_task(route.tts.synthesize(chunk["text"], chunk["voice"]))
             route.tasks[key] = task
             audio = await task
             await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})

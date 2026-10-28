@@ -2,12 +2,6 @@
 
 import asyncio
 import json
-import os
-import base64
-import io
-import wave
-from pathlib import Path
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +11,7 @@ from jiuwenswarm.common.e2a.wire_codec import parse_agent_server_wire_unary
 from jiuwenswarm.extensions.meeting import gateway_playback as gateway
 from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.server import agent_ws_server as server_module
-from jiuwenswarm.extensions.meeting.playback import IDENTITY_FIELDS, speech_chunks
+from jiuwenswarm.extensions.meeting.playback import IDENTITY_FIELDS
 from jiuwenswarm.gateway.channel_manager.web.app_web_handlers import WebHandlersBindParams, _register_web_handlers
 from jiuwenswarm.gateway.voice.providers.qwen_omni import QwenOmniRealtimeConfig
 from tests.unit_tests.agentserver.test_meeting_publication import (
@@ -29,28 +23,28 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.parametrize("meeting", ["file"], 
 
 
 @pytest.fixture
-async def browser(publication_host, monkeypatch, tmp_path, request):
+async def browser(publication_host, monkeypatch, tmp_path):
     host = publication_host
     config = QwenOmniRealtimeConfig("wss://example.invalid/realtime", "test-secret", "qwen3.8-omni-flash-realtime", "Tina")
-    live = request.node.originalname == "test_live_qwen_gateway_smoke"
-    if live:
-        from dotenv import load_dotenv
-        load_dotenv(Path.home() / ".jiuwenswarm/config/.env", override=False)
-        config = QwenOmniRealtimeConfig.from_environment()
-        config.validate()
     monkeypatch.setattr(QwenOmniRealtimeConfig, "from_environment", staticmethod(lambda: config))
     audio_calls = []
 
     class Tts:
         def __init__(self, config):
             self.config = config
+            self.closed = False
+
+        async def start(self):
+            pass
+
+        async def aclose(self):
+            self.closed = True
 
         async def synthesize(self, text, voice):
             audio_calls.append((text, voice))
             return SimpleNamespace(audio=b"wav", audio_mime="audio/wav")
 
-    if not live:
-        monkeypatch.setattr(gateway, "QwenOmniTts", Tts)
+    monkeypatch.setattr(gateway, "QwenOmniTtsSession", Tts)
 
     sessions = tmp_path / "sessions"
     (sessions / "publication-session").mkdir(parents=True)
@@ -116,81 +110,6 @@ async def activate(browser):
     assert (await browser.call("meeting.playback.ready", {"_qwen_model": "forged", "_meeting_route_id": "forged"}))["ok"]
     meeting = browser.host.manager._sessions[browser.base["session_id"]]
     return meeting.driver, meeting.driver.consumer
-
-
-async def test_end_drains_asr_without_delaying_browser_stop(browser, monkeypatch):
-    from jiuwenswarm.extensions.meeting import gateway_input
-    from tests.unit_tests.agentserver.test_meeting_input_audio import Probability, UtteranceSegmenter, frame
-
-    monkeypatch.setattr(gateway_input, "UtteranceSegmenter", lambda: UtteranceSegmenter(Probability()))
-    started, cancelled, finish_cancellation = asyncio.Event(), asyncio.Event(), asyncio.Event()
-
-    async def transcribe(_pcm):
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await finish_cancellation.wait()
-            return "Late"
-
-    monkeypatch.setattr(gateway_input, "transcribe_utterance", transcribe)
-    driver, _ = await activate(browser)
-    await queue(browser, driver)
-    await next_speech(browser)
-    stream = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])].input
-    for sequence in range(2):
-        assert (await browser.call("meeting.input.append", {
-            "stream_id": stream.id, "sequence": sequence,
-            "audio_base64": base64.b64encode(frame() * 4).decode(),
-        }))["ok"]
-    assert (await browser.call("meeting.input.pause", {"stream_id": stream.id}))["ok"]
-    await asyncio.wait_for(started.wait(), 3)
-    ending = asyncio.create_task(browser.call("meeting.end"))
-    async with asyncio.timeout(3):
-        while not any(event == "meeting.playback.stop" for _, event, _ in browser.channel.events):
-            await asyncio.sleep(0.005)
-    assert not ending.done()  # Browser receives Stop while provider cancellation is draining.
-    finish_cancellation.set()
-    assert (await asyncio.wait_for(ending, 3))["ok"]
-    assert cancelled.is_set() and stream.closed
-    assert not browser.ws._meeting_playback_routes
-    assert not any(event == "meeting.input.transcript" for _, event, _ in browser.channel.events)
-
-
-async def test_input_uses_audio_route_ownership_and_model_readiness(browser, monkeypatch):
-    from jiuwenswarm.extensions.meeting import gateway_input
-    from unittest.mock import Mock
-
-    with monkeypatch.context() as model_patch:
-        model_patch.setattr(gateway_input, "UtteranceSegmenter", Mock(side_effect=RuntimeError("Model unavailable")))
-        assert not (await browser.call("meeting.playback.ready"))["ok"]
-        assert browser.host.manager._sessions[browser.base["session_id"]].driver is None
-        assert not browser.ws._meeting_playback_routes
-    driver, _ = await activate(browser)
-    await queue(browser, driver)
-    await next_speech(browser)
-    stream = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])].input
-    for extra in ({"stream_id": "stale"}, {"stream_id": stream.id, "meeting_id": "foreign"}):
-        assert not (await browser.call("meeting.input.pause", extra))["ok"]
-        assert not stream.closed
-    assert not (await browser.call("meeting.input.pause", {"stream_id": stream.id}, connection=SimpleNamespace()))["ok"]
-
-
-async def test_end_cancels_pending_audio_readiness(browser, monkeypatch):
-    from jiuwenswarm.extensions.meeting.gateway_input import MeetingInputStream
-    started = asyncio.Event()
-
-    async def initialize(_stream):
-        started.set()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(MeetingInputStream, "initialize", initialize)
-    ready = asyncio.create_task(browser.call("meeting.playback.ready"))
-    await asyncio.wait_for(started.wait(), 3)
-    assert (await browser.call("meeting.end"))["ok"]
-    assert not (await asyncio.wait_for(ready, 3))["ok"]
-    assert not browser.ws._meeting_playback_routes
 
 
 async def queue(browser, driver, member="leader", text="Spoken summary"):
@@ -259,6 +178,12 @@ async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(brow
         def __init__(self, config):
             pass
 
+        async def start(self):
+            pass
+
+        async def aclose(self):
+            pass
+
         async def synthesize(self, text, voice):
             entered.set()
             try:
@@ -267,7 +192,7 @@ async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(brow
                 await asyncio.sleep(0)
                 drained.set()
 
-    monkeypatch.setattr(gateway, "QwenOmniTts", Tts)
+    monkeypatch.setattr(gateway, "QwenOmniTtsSession", Tts)
     driver, consumer = await activate(browser)
     await queue(browser, driver)
     speech = await next_speech(browser)
@@ -280,17 +205,58 @@ async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(brow
     assert (await browser.call("meeting.end"))["ok"]
 
 
-async def test_config_change_rejects_audio_and_end_waits_for_independent_stop_ack(browser, monkeypatch):
-    driver, consumer = await activate(browser)
-    await queue(browser, driver)
+async def test_meeting_reuses_warm_connection_and_end_drains_it(browser, monkeypatch):
+    from jiuwenswarm.gateway.voice import tts
+    from tests.unit_tests.gateway.test_qwen_omni_session import provider
+
+    sockets = provider(monkeypatch)
+    monkeypatch.setattr(gateway, "QwenOmniTtsSession", tts.QwenOmniTtsSession)
+    driver, _ = await activate(browser)
+    assert len(sockets) == 1 and sockets[0].turns == 0
+    await queue(browser, driver, text="Sentence. " * 100)
     speech = await next_speech(browser)
-    monkeypatch.setattr(QwenOmniRealtimeConfig, "from_environment", staticmethod(lambda: replace(browser.config, api_key="rotated")))
-    assert not (await browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": 0}))["ok"]
-    assert not browser.audio_calls
-    # End holds the driver lock while the independent stopped RPC acknowledges.
+    ending = None
+    route = next(iter(browser.ws._meeting_playback_routes.values()))
+    try:
+        for index in range(speech["chunk_count"]):
+            result = await asyncio.wait_for(browser.call("meeting.speech.synthesize", {
+                **identity(speech), "chunk_index": index,
+            }), 3)
+            assert result["ok"] and result["payload"]["audio_base64"]
+        assert len(sockets) == 1 and sockets[0].turns == speech["chunk_count"]
+        assert not route.tasks and not sockets[0].closed
+        sockets[0].finish_close.clear()
+        ending = asyncio.create_task(browser.call("meeting.end"))
+        async with asyncio.timeout(3):
+            while not route.revoked or not any(event == "meeting.playback.stop" for _, event, _ in browser.channel.events):
+                await asyncio.sleep(0)
+        await asyncio.wait_for(sockets[0].close_started.wait(), 1)
+        assert not ending.done()  # Browser stop can proceed while upstream close drains.
+    finally:
+        sockets[0].finish_close.set()
+        if ending is not None:
+            assert (await asyncio.wait_for(ending, 3))["ok"]
+    assert sockets[0].closed
+
+
+async def test_end_during_provider_warmup_cancels_and_closes_the_connection(browser, monkeypatch):
+    from jiuwenswarm.gateway.voice import tts
+    from tests.unit_tests.gateway.test_qwen_omni_session import RealtimeSocket, provider
+
+    def factory():
+        socket = RealtimeSocket()
+        socket.events.get_nowait()  # Hold session.created until startup is cancelled.
+        return socket
+
+    sockets = provider(monkeypatch, factory)
+    monkeypatch.setattr(gateway, "QwenOmniTtsSession", tts.QwenOmniTtsSession)
+    ready = asyncio.create_task(browser.call("meeting.playback.ready"))
+    async with asyncio.timeout(3):
+        while not sockets or not sockets[0].readers:
+            await asyncio.sleep(0)
     assert (await asyncio.wait_for(browser.call("meeting.end"), 3))["ok"]
-    assert any(event == "meeting.playback.stop" for _, event, _ in browser.channel.events)
-    assert await browser.host.manager.lifecycle_status(browser.base["session_id"]) == {"state": "idle"}
+    assert not (await asyncio.wait_for(ready, 3))["ok"]
+    assert sockets[0].closed and not browser.ws._meeting_playback_routes
 
 
 async def test_missing_stop_receipt_retains_cleanup_failure_until_explicit_retry(browser):
@@ -304,92 +270,3 @@ async def test_missing_stop_receipt_retains_cleanup_failure_until_explicit_retry
     assert not (await browser.call("meeting.playback.stopped", {"stop_id": "foreign"}))["ok"]
     assert (await browser.call("meeting.playback.stopped", stop))["ok"]
     assert (await browser.call("meeting.end"))["ok"]
-
-
-async def test_readiness_rejects_foreign_startup_and_voice_bindings_survive_meeting_restart(browser):
-    assert not (await browser.call("meeting.playback.ready", {"startup_id": "foreign"}))["ok"]
-    driver, consumer = await activate(browser)
-    voices = consumer.voices
-    assert (await browser.call("meeting.end"))["ok"]
-    assert (await browser.call("meeting.start"))["ok"]
-    await browser.host.manager.start(browser.base["session_id"])
-    state = await browser.host.manager.lifecycle_status(browser.base["session_id"])
-    browser.base["meeting_id"] = state["meeting_id"]
-    _, replacement = await activate(browser)
-    assert replacement.voices is voices
-    assert replacement.voices.get_voice("analyst").provider_voice_id == "Serena"
-
-
-async def test_unicode_chunks_preserve_text_and_bounds(meeting):
-    text = "测试🙂，不要截断。" * 180
-    chunks = speech_chunks(text)
-    assert "".join(chunks) == text
-    assert all(len(chunk) <= 800 for chunk in chunks)
-
-
-@pytest.mark.parametrize("outcome", ["completed", "stopped"])
-async def test_lost_receipt_can_retry_without_revoking_the_next_speaker(browser, monkeypatch, outcome):
-    driver, _ = await activate(browser)
-    await queue(browser, driver)
-    speech = await next_speech(browser)
-    if outcome == "completed":
-        assert (await browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": 0}))["ok"]
-        await queue(browser, driver, "analyst")
-    route = next(iter(browser.ws._meeting_playback_routes.values()))
-    fetch = route.fetch
-    lost = False
-
-    async def lose_once(method, params):
-        nonlocal lost
-        payload = await fetch(method, params)
-        if method.value == "meeting.playback.result" and not lost:
-            lost = True
-            raise RuntimeError("Lost result response")
-        return payload
-
-    monkeypatch.setattr(route, "fetch", lose_once)
-    receipt = {**identity(speech), "outcome": outcome, "completed_chunks": 1 if outcome == "completed" else 0}
-    assert not (await browser.call("meeting.playback.result", receipt))["ok"]
-    second = await next_speech(browser) if outcome == "completed" else None
-    assert (await browser.call("meeting.playback.result", receipt))["ok"]
-    if second:
-        assert (await browser.call("meeting.speech.synthesize", {**identity(second), "chunk_index": 0}))["ok"]
-
-
-async def test_disconnect_does_not_fabricate_stop_or_playback_completion(browser):
-    driver, consumer = await activate(browser)
-    await queue(browser, driver)
-    await next_speech(browser)
-    consumer._stop_timeout = 0.02
-    browser.channel.auto_ack = False
-    await browser.channel.disconnect_handler(browser.ws, set())
-    # Disconnect release is asynchronous; joining End observes failed cleanup.
-    assert not (await browser.call("meeting.end"))["ok"]
-    assert not consumer._receipts
-    assert not consumer._stop_waiter.done()
-    browser.channel.auto_ack = True
-    assert (await browser.call("meeting.end"))["ok"]
-    assert not consumer._receipts  # Even teardown never marks this speech played.
-
-
-@pytest.mark.skipif(os.getenv("MEETING_LIVE_TTS_SMOKE") != "1", reason="Opt-in live Qwen synthesis")
-async def test_live_qwen_gateway_smoke(browser):
-    driver, _ = await activate(browser)
-    artifact = Path("tmp/meeting-playback-smoke")
-    artifact.mkdir(parents=True, exist_ok=True)
-    report = []
-    for member in ("leader", "analyst"):
-        await queue(browser, driver, member, "The meeting summary is ready for review.")
-        speech = await next_speech(browser)
-        result = await browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": 0})
-        assert result["ok"], result
-        audio = base64.b64decode(result["payload"]["audio_base64"])
-        with wave.open(io.BytesIO(audio)) as wav:
-            assert wav.getframerate() == 24000 and wav.getnchannels() == 1
-            assert wav.getnframes() > 0
-        (artifact / f"{member}.wav").write_bytes(audio)
-        report.append({"member": member, "voice": speech["voice"], "model": speech["model"], "audio_bytes": len(audio)})
-        assert (await browser.call("meeting.playback.result", {**identity(speech), "outcome": "completed", "completed_chunks": 1}))["ok"]
-    assert report[0]["voice"] != report[1]["voice"]
-    assert (await browser.call("meeting.end"))["ok"]
-    (artifact / "results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

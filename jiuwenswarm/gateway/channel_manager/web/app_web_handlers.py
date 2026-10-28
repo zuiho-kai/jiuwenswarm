@@ -5123,7 +5123,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                     await _release_meeting(ws, target_session, user_id, startup_id)
             elif ok:
                 owned.pop(ownership_key, None)
-                forget_playback_routes(
+                await forget_playback_routes(
                     ws, target_session, params.get("meeting_id") if method == ReqMethod.MEETING_END else None,
                     startup_id=startup_id,
                 )
