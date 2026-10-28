@@ -183,6 +183,25 @@ Deferred work includes semantic turn completion, server-side Silero VAD,
 upstream microphone streaming, supervisor recipient selection, seamless speech resume, voice selection UI, a recorded full meeting
 demonstration, and recovery after process restart.
 
+### Ordered transcription batches
+
+Three ASR workers transcribe concurrently with a
+60-second timeout per request while listening continues. A result map restores
+utterance order, with IDs starting at one per stream. At most seven utterances
+can be queued, transcribing, or awaiting publication in total; overload stops
+input explicitly rather than growing the buffer.
+
+Consecutive results form one message after four utterances or 1.5 seconds from
+the first consecutive ready result, whichever comes first. Later results do not
+reset that deadline. An earlier pending ID waits for its ASR result or timeout;
+the batch timer never skips it. Failed requests emit ordered errors, and empty
+or filler-only transcripts advance the sequence without adding text. Errors
+split a batch so earlier text is delivered before the error ID. Each transcript
+event uses the last included utterance ID, preserving the browser's existing
+ordering and admission checks. Interruption preparation runs once per message,
+separately from the ASR workers. The shared Speech transcription adapter
+receives WAV audio.
+
 Agent-side publication uses the host-consumer readiness gate. The shared native
 member provider installs scoped meeting guidance and the
 SDK's `meeting_post_message`, `meeting_read_history`, and `meeting_get_speaker`

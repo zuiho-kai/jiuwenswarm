@@ -11,7 +11,11 @@ from uuid import uuid4
 from .input_audio import UtteranceSegmenter, pcm_wav
 
 MAX_CHUNK_BYTES = 6_400  # Up to 200 ms of signed little-endian PCM16.
-MAX_PENDING_UTTERANCES = 4
+MAX_PENDING_UTTERANCES = 7  # Includes queued audio, running ASR, and unpublished results.
+ASR_CONCURRENCY = 3
+ASR_TIMEOUT_SECONDS = 60
+BATCH_SIZE = 4
+BATCH_WAIT_SECONDS = 1.5
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +51,11 @@ class MeetingInputStream:
         self.utterance = 0
         self.segmenter = None
         self.queue = asyncio.Queue(maxsize=MAX_PENDING_UTTERANCES)
-        self.worker = None
+        self.workers = []
+        self.publisher = None
+        self.results: dict[int, str | None] = {}
+        self.results_ready = asyncio.Event()
+        self.next_utterance = 1
         self.initializing = None
         self.prepare_transcript = None
         self.admit_transcript = None
@@ -62,7 +70,8 @@ class MeetingInputStream:
         self.segmenter = await asyncio.to_thread(UtteranceSegmenter)
         if self.closed:
             raise ValueError("Meeting microphone stream has closed")
-        self.worker = asyncio.create_task(self.transcribe())
+        self.workers = [asyncio.create_task(self.transcribe()) for _ in range(ASR_CONCURRENCY)]
+        self.publisher = asyncio.create_task(self.publish_results())
 
     def envelope(self):
         return {"session_id": self.session_id, "meeting_id": self.meeting_id, "stream_id": self.id}
@@ -104,7 +113,8 @@ class MeetingInputStream:
 
     def enqueue(self, utterances):
         for pcm in utterances:
-            if self.queue.full():
+            # Include running ASR, out-of-order results, and the publishing batch.
+            if self.utterance - self.next_utterance + 1 >= MAX_PENDING_UTTERANCES:
                 raise ValueError("Meeting transcription backlog is full")
             self.utterance += 1
             self.queue.put_nowait((self.utterance, pcm))
@@ -126,42 +136,99 @@ class MeetingInputStream:
             utterance_id, pcm = await self.queue.get()
             try:
                 await self.emit("meeting.input.transcribing", utterance_id=utterance_id)
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(ASR_TIMEOUT_SECONDS):
                     text = await transcribe_utterance(pcm)
-                prepared = {}
-                if text and not self.closed and self.prepare_transcript is not None:
-                    try:
-                        prepared = await self.prepare_transcript(text)
-                    except Exception:
-                        # ASR already succeeded. An unavailable interruption
-                        # control must not discard the human's actual message.
-                        logger.warning("Meeting interruption preparation failed; delivering transcript", exc_info=True)
-                    if prepared.get("interruption_id"):
-                        self.admissions[utterance_id] = prepared["interruption_id"]
-                await self.emit("meeting.input.transcript", utterance_id=utterance_id, transcript=text, **prepared)
             except asyncio.CancelledError:
+                self.queue.task_done()
                 raise
             except Exception:
-                await self.emit("meeting.input.error", utterance_id=utterance_id, code="transcriptionFailed")
-            finally:
+                text = None  # A terminal failure advances ordering just like an empty result.
+            if self.closed:
                 self.queue.task_done()
+                continue
+            self.results[utterance_id] = text
+            self.results_ready.set()
+            # The publisher owns task_done from here, including buffered results.
+
+    async def publish_results(self):
+        deadline = None
+        loop = asyncio.get_running_loop()
+        while not self.closed:
+            self.results_ready.clear()
+            batch = []
+            for utterance_id in range(self.next_utterance, self.next_utterance + BATCH_SIZE):
+                if utterance_id not in self.results:
+                    break
+                batch.append((utterance_id, self.results[utterance_id]))
+            if batch:
+                if deadline is None:
+                    deadline = loop.time() + BATCH_WAIT_SECONDS
+                if len(batch) == BATCH_SIZE or loop.time() >= deadline:
+                    try:
+                        await self.deliver_results(batch)
+                    except Exception:
+                        logger.exception("Meeting transcript batch delivery failed")
+                        await self.emit("meeting.input.error", utterance_id=batch[-1][0], code="transcriptionFailed")
+                    finally:
+                        for utterance_id, _ in batch:
+                            self.results.pop(utterance_id)
+                            self.queue.task_done()
+                        self.next_utterance = batch[-1][0] + 1
+                    deadline = None
+                    continue
+            try:
+                # Keep the first deadline: later arrivals must not postpone a batch.
+                async with asyncio.timeout(None if deadline is None else max(0, deadline - loop.time())):
+                    await self.results_ready.wait()
+            except TimeoutError:
+                pass
+
+    async def deliver_results(self, batch):
+        group = []
+        for utterance_id, text in batch:
+            if text is None:
+                # Emit failures in order, flushing earlier text before their IDs.
+                await self.deliver_transcript(group)
+                group = []
+                await self.emit("meeting.input.error", utterance_id=utterance_id, code="transcriptionFailed")
+            else:
+                group.append((utterance_id, text))
+        await self.deliver_transcript(group)
+
+    async def deliver_transcript(self, group):
+        if not group or self.closed:
+            return
+        utterance_id = group[-1][0]
+        text = " ".join(text for _, text in group if text)
+        prepared = {}
+        if text and self.prepare_transcript is not None:
+            try:
+                prepared = await self.prepare_transcript(text)
+            except Exception:
+                logger.warning("Meeting interruption preparation failed; delivering transcript", exc_info=True)
+            if not self.closed and prepared.get("interruption_id"):
+                self.admissions[utterance_id] = prepared["interruption_id"]
+        await self.emit("meeting.input.transcript", utterance_id=utterance_id, transcript=text, **prepared)
 
     def revoke(self):
         if self.closed:
             return
         self.closed = True
-        for task in (self.worker, self.initializing):
+        for task in (*self.workers, self.publisher, self.initializing):
             if task is not None:
                 task.cancel()
 
     async def close(self):
         self.revoke()
-        tasks = [task for task in (self.worker, self.initializing) if task is not None]
+        tasks = [task for task in (*self.workers, self.publisher, self.initializing) if task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         while not self.queue.empty():
             self.queue.get_nowait()
             self.queue.task_done()
+        for _ in self.results:
+            self.queue.task_done()
+        self.results.clear()
 
     async def admitted(self, params):
         utterance_id, interruption_id = params.get("utterance_id"), params.get("interruption_id")
