@@ -10,6 +10,7 @@ import {
   TrajectoryUiSetting,
 } from './ExperimentalSettings';
 import { A4PSettings } from './A4PSettings';
+import { MeetingRoutingSetting } from './MeetingRoutingSetting';
 
 export const experimentalModule: SettingsModuleDefinition = {
   id: 'experimental',
@@ -30,7 +31,14 @@ export const experimentalModule: SettingsModuleDefinition = {
     {
       id: 'team-meeting',
       titleKey: 'meeting.title',
-      items: [{ id: 'team-meeting-enabled', component: 'switch', key: 'team_meeting_enabled' }],
+      items: [
+        { id: 'team-meeting-enabled', component: 'switch', key: 'team_meeting_enabled' },
+        { id: 'team-meeting-routing', component: 'custom', render: MeetingRoutingSetting },
+      ],
+    },
+    {
+      id: 'team-jev-routing',
+      items: [{ id: 'team-jev-routing-enabled', component: 'switch', key: 'team_jev_routing_enabled' }],
     },
     {
       id: 'external-cli-agents',

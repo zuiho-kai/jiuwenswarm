@@ -427,6 +427,11 @@ def get_panel() -> dict[str, Any]:
         payload["team_scheduled_dispatch_enabled"] = (
             "true" if str(_nested(raw, _TEAM_DISPATCH_MODE_PATH, "autonomous")).strip() == "scheduled" else "false"
         )
+        duplex = _nested(raw, ("modes", "team", "jiuwen_team", "duplex"), {})
+        payload["team_jev_routing_enabled"] = "true" if (
+            _bool_text(duplex.get("enabled")) == "true"
+            and duplex.get("mode", "off") == "active" and duplex.get("format", "openai") == "jev"
+        ) else "false"
         payload["team_task_verification_enabled"] = _bool_text(
             _nested(raw, _TEAM_TASK_VERIFICATION_PATH, False)
         )
@@ -467,6 +472,7 @@ def get_panel() -> dict[str, Any]:
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("team_organization_ui_enabled", "false")
         payload.setdefault("team_meeting_enabled", "false")
+        payload.setdefault("team_jev_routing_enabled", "false")
         payload.setdefault("swarmflow_enabled", "false")
         payload.setdefault("team_scheduled_dispatch_enabled", "false")
         payload.setdefault("team_task_verification_enabled", "false")

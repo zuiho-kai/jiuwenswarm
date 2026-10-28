@@ -1,5 +1,11 @@
 {
   "meeting": {
+    "routing": {
+      "title": "会议输入路由",
+      "description": "Leader 将消息发给会议主持人；None 不指定接收者。选项保存在当前浏览器，在下次启动会议时生效。",
+      "leader": "Leader",
+      "none": "None"
+    },
     "startMessage": "开始会议",
     "playback": {
       "loading": "正在准备 {{speaker}}（{{voice}}）…",
@@ -550,6 +556,10 @@
       "deleteConfirm": "删除后将清除已保存的全双工模型地址、模型和密钥。"
     },
     "fields": {
+      "team_jev_routing_enabled": {
+        "title": "子 Agent JEV 路由",
+        "description": "在新建的默认团队会话中判断队友广播的相关性和打断需求。使用团队 JEV 地址和密钥（默认 TYPESAFE_API_KEY）。不改变用户语音的路由方式。"
+      },
       "team_meeting_enabled": {
         "title": "团队会议",
         "description": "在团队任务会话中显示会议控件，录音转写到消息输入框，并使用已配置的默认音色播放回复。"

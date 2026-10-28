@@ -1,5 +1,11 @@
 {
   "meeting": {
+    "routing": {
+      "title": "Meeting input routing",
+      "description": "Leader addresses the meeting host; None sends without naming a recipient. Saved in this browser and applied when the next meeting starts.",
+      "leader": "Leader",
+      "none": "None"
+    },
     "startMessage": "Start meeting",
     "playback": {
       "loading": "Preparing {{speaker}} ({{voice}})…",
@@ -557,6 +563,10 @@
       "deleteConfirm": "This clears the saved full-duplex endpoint, model, and API key."
     },
     "fields": {
+      "team_jev_routing_enabled": {
+        "title": "JEV routing for teammates",
+        "description": "Evaluate teammate broadcasts for relevance and interruptions in new default Team conversations. Uses the Team JEV endpoint and credentials (TYPESAFE_API_KEY by default). User speech routing is unchanged."
+      },
       "team_meeting_enabled": {
         "title": "Team meetings",
         "description": "Show meeting controls in Team task conversations. Record into the message editor and hear replies using the configured default voice."

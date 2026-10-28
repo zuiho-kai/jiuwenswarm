@@ -4,6 +4,7 @@ import type { ApplicationPluginTaskRuntimeProps } from '../../../channels/web/fr
 import { isTeamAgentMode } from '../../../channels/web/frontend/src/features/planMode/wireMode';
 import { resolveTeamLeaderDisplayName } from '../../../channels/web/frontend/src/features/teamLeaderIdentity';
 import { useTeamMeetingEnabled } from '../../../channels/web/frontend/src/features/teamMeeting/featureFlag';
+import { getMeetingRoutingMode } from '../../../channels/web/frontend/src/features/teamMeeting/routingMode';
 import { webClient } from '../../../channels/web/frontend/src/services/webClient';
 import { rememberGroupChatInput } from '../../../channels/web/frontend/src/features/groupChatInput';
 import { useSessionStore } from '../../../channels/web/frontend/src/stores/sessionStore';
@@ -157,6 +158,7 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
       if (!send) throw new Error('disconnected');
       const startupId = crypto.randomUUID();
       const input = new AbortController();
+      const routingMode = getMeetingRoutingMode();
       const meeting: MeetingSession = new MeetingSession(webClient, id, context(id), {
         line: () => {}, // Task handlers already own the conversation timeline.
         draft: (text) => {
@@ -167,7 +169,7 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
             id,
             text,
             crypto.randomUUID(),
-            [context(id).leader],
+            routingMode === 'leader' ? [context(id).leader] : [],
             input.signal,
           ).catch(() => {
             if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)

@@ -4,6 +4,21 @@ Enable **Team meetings** under **Settings → Experimental**. The switch persist
 `experimental.team_meeting_enabled` in the existing configuration system and
 updates the Task controls immediately. The feature is off by default.
 
+**Meeting input routing** offers **Leader** (default) and **None**. The choice is
+saved in this browser and captured when the next meeting starts. Voice transcripts
+mention only the Leader or have no mentions, respectively. Startup remains an
+unmentioned message. This selector leaves SDK delivery and evaluation unchanged;
+under the current SDK, unmentioned group messages are retained as context.
+
+**JEV routing for teammates** is a separate Experimental switch for the default
+Team. It sets `modes.team.jiuwen_team.duplex` to agent-core's native JEV router
+(`enabled: true`, `mode: active`, `format: jev`). Existing Team endpoint, model,
+key-environment and timeout settings are retained; absent settings use the SDK's
+TypeSafe defaults and `TYPESAFE_API_KEY`. Start a new Team conversation to use
+the setting. It evaluates teammate broadcasts and busy-member delivery, and does
+not enable relevance evaluation of meeting user speech. Browser JEV settings are
+independent. No live JEV request is made when saving the switch.
+
 In **Tasks**, a compact meeting icon appears beside the voice controls in Team
 conversations and on `/chat/new`. One click switches a new Agent task to Cluster
 (Team) mode and creates the conversation. Start sends a visible **Start meeting**

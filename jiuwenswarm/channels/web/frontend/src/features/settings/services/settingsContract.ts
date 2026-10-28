@@ -143,6 +143,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   ),
   yamlField('task_full_duplex_enabled', 'experimental', 'boolean', 'experimental.task_full_duplex_enabled'),
   yamlField('team_meeting_enabled', 'experimental', 'boolean', 'experimental.team_meeting_enabled'),
+  yamlField('team_jev_routing_enabled', 'experimental', 'boolean', 'modes.team.jiuwen_team.duplex.enabled'),
   yamlField('task_asr_enabled', 'experimental', 'boolean', 'experimental.task_asr_enabled'),
   yamlField('symphony_evolution_enabled', 'experimental', 'boolean', 'symphony.evolution.flow.enabled'),
   envField('asr_api_base', 'experimental', 'text', 'ASR_API_BASE'),

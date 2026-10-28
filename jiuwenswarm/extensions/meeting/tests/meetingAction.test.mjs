@@ -16,6 +16,7 @@ await require('esbuild').build({
     export {TaskMeetingAction} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingAction.tsx', import.meta.url)))};
     export {TaskMeetingRuntime} from ${JSON.stringify(fileURLToPath(new URL('../frontend/TaskMeetingRuntime.tsx', import.meta.url)))};
     export {setTeamMeetingEnabled} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/featureFlag.ts'))};
+    export {setMeetingRoutingMode} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/routingMode.ts'))};
     export {requests,meetingServer,webClient,emit} from 'meeting-test-transport';
     export {hasMeetingAudioOwner} from ${JSON.stringify(path.join(frontend, 'src/features/teamMeeting/playbackOwnership.ts'))};
     export {isTaskInputBlocked} from ${JSON.stringify(path.join(frontend, 'src/applicationPlugins/taskInputReadiness.ts'))};
@@ -60,11 +61,12 @@ await require('esbuild').build({
     }[path]}));
   }}],
 });
-const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner,isTaskInputBlocked}=require(output);
+const {TaskMeetingAction,TaskMeetingRuntime,setTeamMeetingEnabled,setMeetingRoutingMode,requests,meetingServer,webClient,emit,rememberGroupChatInput,defaultGroupChatInput,hasMeetingAudioOwner,isTaskInputBlocked}=require(output);
 
 async function mount(extra={}) {
   const dom=new JSDOM('<div id="root"></div>',{url:'http://localhost'});
   Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});
+  setMeetingRoutingMode('leader');
   const track={stopped:false,stop(){this.stopped=true;},onended:null};let microphoneCalls=0;
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>{microphoneCalls++;return{getTracks:()=>[track],getAudioTracks:()=>[track]};}}}});
   setTeamMeetingEnabled(false);requests.length=0;meetingServer.state='active';meetingServer.acceptInputs=true;meetingServer.failInput=false;meetingServer.failEnd=false;meetingServer.failReady=false;
@@ -109,6 +111,20 @@ test('meeting initializes visibly and sends speech automatically through the nor
     await h.click('chat-panel-input-meeting');
     assert.ok(h.track.stopped);assert.equal(h.capture.at(-1),false);
     assert.ok(requests.some(request=>request.name==='meeting.end'&&request.params.meeting_id==='meeting-one'));
+  } finally {await h.close();}
+});
+
+test('None routing sends speech without mentions and stays fixed for the meeting',async()=>{
+  const h=await mount();
+  try {
+    setMeetingRoutingMode('none');
+    await h.click('chat-panel-input-meeting');
+    setMeetingRoutingMode('leader');
+    await h.click('chat-panel-input-meeting-record');
+    const inputs=requests.filter(request=>request.name==='chat.send');
+    assert.equal(inputs.length,2);
+    assert.deepEqual(inputs[1].params.mentions,[]);
+    assert.equal(inputs[1].params.content,'Please review the layout.');
   } finally {await h.close();}
 });
 

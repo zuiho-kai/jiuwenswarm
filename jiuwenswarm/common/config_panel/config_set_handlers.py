@@ -68,6 +68,7 @@ from jiuwenswarm.common.config import (
     update_symphony_in_config,
     update_task_full_duplex_in_config,
     update_team_meeting_in_config,
+    update_team_jev_routing_in_config,
     update_team_organization_ui_in_config,
     update_task_asr_in_config,
     update_team_scheduled_dispatch_in_config,
@@ -201,7 +202,7 @@ class ConfigChangeSet:
             key_text = str(key)
             if key_text in {"models.defaults"} or key_text.startswith("models."):
                 scopes.add("model")
-            elif key_text in {"modes.team", "agents", "team", *TEAM_DISPATCH_CONFIG_KEYS}:
+            elif key_text in {"modes.team", "agents", "team", "team_jev_routing_enabled", *TEAM_DISPATCH_CONFIG_KEYS}:
                 scopes.add("team")
             elif key_text.startswith("permissions"):
                 scopes.add("permissions")
@@ -360,6 +361,7 @@ CONFIG_YAML_KEYS = frozenset({
     "trajectory_ui_enabled",
     "task_full_duplex_enabled",
     "team_meeting_enabled",
+    "team_jev_routing_enabled",
     "team_organization_ui_enabled",
     "task_asr_enabled",
     "proactive_recommendation_enabled",
@@ -576,7 +578,12 @@ def flatten_team_dispatch_for_config_panel(raw: dict[str, Any]) -> dict[str, str
         TEAM_TASK_VERIFICATION_CONFIG_PATH,
         DEFAULT_TEAM_TASK_VERIFICATION_ENABLED,
     )
+    duplex = get_nested_config_value(raw, ("modes", "team", "jiuwen_team", "duplex"), {})
     return {
+        "team_jev_routing_enabled": "true" if (
+            parse_config_switch_bool(duplex.get("enabled", False))
+            and duplex.get("mode", "off") == "active" and duplex.get("format", "openai") == "jev"
+        ) else "false",
         "team_scheduled_dispatch_enabled": "true" if str(dispatch_mode).strip() == "scheduled" else "false",
         "team_task_verification_enabled": "true" if parse_config_switch_bool(verification) else "false",
     }
@@ -1279,6 +1286,8 @@ def apply_config_payload(
                     # 验证者只在调度模式下生效，关闭调度模式时一并关闭。
                     update_team_task_verification_in_config(False)
                     yaml_updated.append("team_task_verification_enabled")
+            elif param_key == "team_jev_routing_enabled":
+                update_team_jev_routing_in_config(parsed)
             elif param_key == "team_task_verification_enabled":
                 scheduled = (
                     parse_config_bool(params["team_scheduled_dispatch_enabled"])
@@ -1351,6 +1360,8 @@ def apply_config_payload(
             logger.warning("[config.set] 写回 config.yaml 失败 %s: %s", param_key, e)
             if param_key == "swarmflow_enabled":
                 raise ConfigPanelInternalError("failed to update enable_swarmflow") from e
+            if param_key == "team_jev_routing_enabled":
+                raise ConfigPanelInternalError("failed to update Team JEV routing") from e
             if param_key in EXTERNAL_CLI_AGENT_CONFIG_KEYS:
                 raise ConfigPanelInternalError("failed to update external_cli_agents") from e
 
@@ -1585,6 +1596,7 @@ async def config_get_handler(
         payload.setdefault("task_full_duplex_enabled", "false")
         payload.setdefault("team_organization_ui_enabled", "false")
         payload.setdefault("team_meeting_enabled", "false")
+        payload.setdefault("team_jev_routing_enabled", "false")
         payload.setdefault("task_asr_enabled", "false")
         for key, (_, value_type, default) in {
             **SYMPHONY_CONFIG_SPECS,

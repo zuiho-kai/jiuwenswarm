@@ -2594,6 +2594,20 @@ def update_team_scheduled_dispatch_in_config(enabled: bool) -> None:
     _set_config_path(TEAM_DISPATCH_MODE_CONFIG_PATH, "scheduled" if enabled else "autonomous")
 
 
+def update_team_jev_routing_in_config(enabled: bool) -> None:
+    """Configure agent-core's native per-member Team duplex router."""
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    current = data
+    path = ("modes", "team", "jiuwen_team", "duplex")
+    for index, segment in enumerate(path):
+        current = _ensure_config_object(current, segment, ".".join(path[:index + 1]))
+    current["enabled"] = bool(enabled)
+    current["mode"] = "active" if enabled else DoubleQuotedScalarString("off")
+    if enabled:
+        current["format"] = "jev"
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
 def update_team_task_verification_in_config(enabled: bool) -> None:
     """Update ``modes.team.jiuwen_team.enable_task_verification`` in config.yaml."""
     _set_config_path(TEAM_TASK_VERIFICATION_CONFIG_PATH, bool(enabled))
