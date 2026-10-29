@@ -385,6 +385,7 @@ class FeishuChannel(BaseChannel):
             lark.Client.builder()
             .app_id(self.config.app_id)
             .app_secret(self.config.app_secret)
+            .domain(self.config.api_base.rstrip("/") or lark.FEISHU_DOMAIN)
             .log_level(lark.LogLevel.INFO)
             .build()
         )
@@ -490,6 +491,7 @@ class FeishuChannel(BaseChannel):
             "app_secret": self.config.app_secret,
             "encrypt_key": self.config.encrypt_key or "",
             "verification_token": self.config.verification_token or "",
+            "api_base": self.config.api_base.rstrip("/") or lark.FEISHU_DOMAIN,
         }
 
         self._websocket_thread = threading.Thread(
@@ -534,6 +536,7 @@ class FeishuChannel(BaseChannel):
                 config["app_secret"],
                 event_handler=event_handler,
                 log_level=lark.LogLevel.INFO,
+                domain=config["api_base"],
             )
             self._patch_ws_client_shutdown(ws_client)
             self._websocket_client = ws_client

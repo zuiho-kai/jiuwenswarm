@@ -2,7 +2,7 @@
   "meeting": {
     "feishu": {
       "title": "Feishu settings",
-      "description": "Save the app credentials, then connect manually. Connect again after restarting the backend. Voice meeting delivery is not connected yet.",
+      "description": "Save the app credentials and API URL, then connect manually. Use https://open.feishu.cn for Feishu or https://open.larksuite.com for Lark. Connect again after restarting the backend. Voice meeting delivery is not connected yet.",
       "connect": "Connect",
       "disconnect": "Disconnect",
       "working": "Please wait…",
@@ -668,6 +668,9 @@
       },
       "meeting_feishu_app_secret": {
         "title": "App Secret"
+      },
+      "meeting_feishu_api_base": {
+        "title": "API URL"
       },
       "tts_provider": {
         "title": "TTS provider",

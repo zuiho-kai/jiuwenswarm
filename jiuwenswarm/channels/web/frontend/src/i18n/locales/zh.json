@@ -2,7 +2,7 @@
   "meeting": {
     "feishu": {
       "title": "飞书设置",
-      "description": "保存应用凭据后，点击连接。后端重启后需重新连接。会议语音收发暂未接入。",
+      "description": "保存应用凭据和 API 地址后，点击连接。飞书使用 https://open.feishu.cn，Lark 使用 https://open.larksuite.com。后端重启后需重新连接。会议语音收发暂未接入。",
       "connect": "连接",
       "disconnect": "断开连接",
       "working": "请稍候…",
@@ -661,6 +661,9 @@
       },
       "meeting_feishu_app_secret": {
         "title": "App Secret"
+      },
+      "meeting_feishu_api_base": {
+        "title": "API 地址"
       },
       "tts_provider": {
         "title": "语音合成服务",

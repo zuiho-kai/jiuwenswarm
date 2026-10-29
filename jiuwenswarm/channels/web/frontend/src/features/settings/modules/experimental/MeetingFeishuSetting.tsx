@@ -8,7 +8,7 @@ import { useSettingsServices } from '../../services/SettingsServicesProvider';
 import { useSettingsSource } from '../../services/SettingsSourceProvider';
 import { AgentConfigDialog } from '../agent/AgentSettings';
 
-const fields = ['meeting_feishu_app_id', 'meeting_feishu_app_secret'] as const;
+const fields = ['meeting_feishu_app_id', 'meeting_feishu_app_secret', 'meeting_feishu_api_base'] as const;
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'failed';
 
 export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
@@ -77,7 +77,10 @@ export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
   const clearCredentials = async () => {
     setClearError('');
     try {
-      await saveCredentials({ meeting_feishu_app_id: '', meeting_feishu_app_secret: '' }, 'meeting-feishu-clear');
+      await saveCredentials(
+        { meeting_feishu_app_id: '', meeting_feishu_app_secret: '', meeting_feishu_api_base: '' },
+        'meeting-feishu-clear',
+      );
       setClearing(false);
     } catch (error) {
       setClearError(error instanceof Error ? error.message : t('settingsPanel.feedback.saveFailed'));
@@ -140,7 +143,7 @@ export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
         <AgentConfigDialog
           titleKey="meeting.feishu.title"
           fields={fields}
-          config={values}
+          config={{ ...values, meeting_feishu_api_base: values.meeting_feishu_api_base || 'https://open.feishu.cn' }}
           save={saveCredentials}
           onClose={() => setConfiguring(false)}
         />

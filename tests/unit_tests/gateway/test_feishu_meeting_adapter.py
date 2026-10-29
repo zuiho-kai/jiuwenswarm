@@ -165,11 +165,88 @@ def manual_connection(monkeypatch):
 
     monkeypatch.setenv("MEETING_FEISHU_APP_ID", "meeting-app")
     monkeypatch.setenv("MEETING_FEISHU_APP_SECRET", "test-secret")
+    monkeypatch.delenv("MEETING_FEISHU_API_BASE", raising=False)
     monkeypatch.setattr(feishu_connect, "FEISHU_AVAILABLE", True)
     monkeypatch.setattr(feishu_connect, "FeishuChannel", Channel)
     manager = ChannelManager(SimpleNamespace())
     manager.set_conf = AsyncMock()
     return MeetingFeishuConnection(), manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_base, expected", [
+    ("", "https://open.feishu.cn"),
+    (" https://open.larksuite.com/ ", "https://open.larksuite.com"),
+])
+async def test_manual_connection_uses_saved_api_url(manual_connection, monkeypatch, api_base, expected):
+    connection, manager = manual_connection
+    monkeypatch.setenv("MEETING_FEISHU_API_BASE", api_base)
+    pending = asyncio.create_task(connection.connect(manager))
+    await asyncio.sleep(0)
+    assert connection.channel.config.api_base == expected
+    connection.channel.ready.set()
+    assert await pending == {"state": "connected"}
+    await connection.disconnect(manager)
+
+
+@pytest.mark.asyncio
+async def test_manual_connection_replaces_socket_when_api_url_changes(manual_connection, monkeypatch):
+    connection, manager = manual_connection
+    pending = asyncio.create_task(connection.connect(manager))
+    await asyncio.sleep(0)
+    original = connection.channel
+    original.ready.set()
+    await pending
+    monkeypatch.setenv("MEETING_FEISHU_API_BASE", "https://open.larksuite.com")
+    pending = asyncio.create_task(connection.connect(manager))
+    while connection.channel is original or connection.channel is None:
+        await asyncio.sleep(0)
+    original.stop.assert_awaited_once()
+    connection.channel.ready.set()
+    assert await pending == {"state": "connected"}
+    await connection.disconnect(manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_base", [
+    "open.larksuite.com", "https://open.larksuite.com/open-apis",
+    "https://open.larksuite.com?token=test", "https://user:secret@open.larksuite.com",
+])
+async def test_manual_connection_rejects_invalid_api_url(manual_connection, monkeypatch, api_base):
+    connection, manager = manual_connection
+    monkeypatch.setenv("MEETING_FEISHU_API_BASE", api_base)
+    with pytest.raises(ValueError, match="API base URL"):
+        await connection.connect(manager)
+    assert manager.get_channels_by_id("feishu") == []
+
+
+@pytest.mark.parametrize("api_base, expected", [
+    ("", "https://open.feishu.cn"),
+    ("https://open.larksuite.com/", "https://open.larksuite.com"),
+])
+def test_rest_and_websocket_clients_use_same_api_url(tmp_path, monkeypatch, api_base, expected):
+    from jiuwenswarm.gateway.channel_manager.base import RobotMessageRouter
+    from jiuwenswarm.gateway.channel_manager.im_platforms.feishu import feishu_connect
+
+    channel = feishu_connect.FeishuChannel(
+        feishu_connect.FeishuConfig(
+            app_id="test-app", app_secret="test-secret", api_base=api_base, temp_file_dir=str(tmp_path),
+        ),
+        RobotMessageRouter(),
+    )
+    channel._initialize_api_client()
+    assert channel._api_client._config.domain == expected
+    thread = Mock()
+    monkeypatch.setattr(feishu_connect.threading, "Thread", thread)
+    monkeypatch.setattr(channel, "_wait_for_websocket_client_ready", Mock())
+    channel._start_websocket_in_thread()
+    config = thread.call_args.kwargs["args"][0]
+    socket = Mock()
+    monkeypatch.setattr(feishu_connect.lark.ws, "Client", socket)
+    monkeypatch.setattr(channel, "_ensure_thread_local_ws_loop_proxy", Mock())
+    monkeypatch.setattr(feishu_connect.asyncio, "set_event_loop", Mock())
+    channel._run_websocket_client(config)
+    assert socket.call_args.kwargs["domain"] == expected
 
 
 @pytest.mark.asyncio
@@ -321,6 +398,7 @@ async def test_saved_secret_is_returned_for_editing_after_reload(monkeypatch, tm
         handlers.apply_config_payload({
             "meeting_feishu_app_id": "meeting-app" if secret else "",
             "meeting_feishu_app_secret": secret,
+            "meeting_feishu_api_base": "https://open.larksuite.com" if secret else "",
         })
         # Read persisted values as a restarted process would.
         stored = dotenv_values(env_file)
@@ -332,4 +410,5 @@ async def test_saved_secret_is_returned_for_editing_after_reload(monkeypatch, tm
         await handlers.config_get_handler(web, None, "read", {}, None)
         for panel in (web.send_response.call_args.kwargs["payload"], config_service.get_panel()):
             assert panel["meeting_feishu_app_secret"] == secret
+            assert panel["meeting_feishu_api_base"] == ("https://open.larksuite.com" if secret else "")
             assert panel["meeting_feishu_configured"] == ("true" if secret else "false")

@@ -8,6 +8,7 @@ import asyncio
 from contextlib import suppress
 from functools import partial
 import os
+from urllib.parse import urlsplit
 
 from jiuwenswarm.gateway.routing.keys import ChannelKey
 
@@ -40,6 +41,13 @@ class MeetingFeishuConnection:
     async def connect(self, manager):
         app_id = os.getenv("MEETING_FEISHU_APP_ID", "").strip()
         secret = os.getenv("MEETING_FEISHU_APP_SECRET", "").strip()
+        api_base = os.getenv("MEETING_FEISHU_API_BASE", "").strip().rstrip("/") or "https://open.feishu.cn"
+        parsed = urlsplit(api_base)
+        if (
+            parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password
+        ):
+            raise ValueError("Use an HTTP(S) API base URL without a path, such as https://open.larksuite.com.")
         from jiuwenswarm.common.security.base_crypto import get_crypto_provider
 
         crypto = get_crypto_provider()
@@ -51,6 +59,7 @@ class MeetingFeishuConnection:
             self.status(manager)["state"] == "connected"
             and self.channel.app_id == app_id
             and self.channel.config.app_secret == secret
+            and self.channel.config.api_base == api_base
         ):
             return self.status(manager)
         existing = manager.get_by_key(ChannelKey("feishu", app_id))
@@ -66,7 +75,7 @@ class MeetingFeishuConnection:
         if not FEISHU_AVAILABLE:
             raise ValueError("The Feishu SDK is not installed on the Gateway.")
         channel = FeishuChannel(
-            FeishuConfig(enabled=True, app_id=app_id, app_secret=secret, api_base="https://open.feishu.cn"),
+            FeishuConfig(enabled=True, app_id=app_id, app_secret=secret, api_base=api_base),
             RobotMessageRouter(),
         )
         manager.register_channel(channel)

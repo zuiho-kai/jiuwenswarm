@@ -156,6 +156,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   envField('tts_provider', 'experimental', 'text', 'TTS_PROVIDER'),
   envField('meeting_feishu_app_id', 'experimental', 'text', 'MEETING_FEISHU_APP_ID'),
   envField('meeting_feishu_app_secret', 'experimental', 'text', 'MEETING_FEISHU_APP_SECRET'),
+  envField('meeting_feishu_api_base', 'experimental', 'text', 'MEETING_FEISHU_API_BASE'),
   envField('meeting_vad_start_threshold', 'experimental', 'text', 'MEETING_VAD_START_THRESHOLD'),
   envField('meeting_vad_start_frames', 'experimental', 'text', 'MEETING_VAD_START_FRAMES'),
   yamlField(

@@ -88,6 +88,7 @@ _CONFIG_SET_ENV_MAP = {
     "github_token": "GITHUB_TOKEN",
     "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
     "meeting_feishu_app_secret": "MEETING_FEISHU_APP_SECRET",
+    "meeting_feishu_api_base": "MEETING_FEISHU_API_BASE",
     "tts_api_key": "TTS_API_KEY",
     "teamskills_market_url": "TEAM_SKILLS_HUB_BASE_URL",
     "teamskills_user_token": "TEAM_SKILLS_HUB_USER_TOKEN",

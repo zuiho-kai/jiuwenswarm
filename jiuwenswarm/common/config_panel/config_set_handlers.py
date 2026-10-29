@@ -347,6 +347,7 @@ CONFIG_SET_ENV_MAP = {
     "tts_provider": "TTS_PROVIDER",
     "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
     "meeting_feishu_app_secret": "MEETING_FEISHU_APP_SECRET",
+    "meeting_feishu_api_base": "MEETING_FEISHU_API_BASE",
     **SPEECH_START_ENV,
     # agents
     "skills": "SKILLS",
