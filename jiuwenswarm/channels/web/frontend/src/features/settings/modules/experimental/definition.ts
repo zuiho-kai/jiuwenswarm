@@ -11,6 +11,7 @@ import {
 } from './ExperimentalSettings';
 import { A4PSettings } from './A4PSettings';
 import { MeetingRoutingSetting } from './MeetingRoutingSetting';
+import { MeetingFeishuSetting } from './MeetingFeishuSetting';
 
 export const experimentalModule: SettingsModuleDefinition = {
   id: 'experimental',
@@ -34,6 +35,7 @@ export const experimentalModule: SettingsModuleDefinition = {
       items: [
         { id: 'team-meeting-enabled', component: 'switch', key: 'team_meeting_enabled' },
         { id: 'team-meeting-routing', component: 'custom', render: MeetingRoutingSetting },
+        { id: 'team-meeting-feishu', component: 'custom', render: MeetingFeishuSetting },
         { id: 'meeting-vad-start-threshold', component: 'input', key: 'meeting_vad_start_threshold' },
         { id: 'meeting-vad-start-frames', component: 'input', key: 'meeting_vad_start_frames' },
       ],

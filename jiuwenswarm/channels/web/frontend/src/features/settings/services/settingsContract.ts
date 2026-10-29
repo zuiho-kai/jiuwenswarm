@@ -149,6 +149,8 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   envField('asr_api_base', 'experimental', 'text', 'ASR_API_BASE'),
   envField('asr_api_key', 'experimental', 'text', 'ASR_API_KEY'),
   envField('asr_model', 'experimental', 'text', 'ASR_MODEL_NAME'),
+  envField('meeting_feishu_app_id', 'experimental', 'text', 'MEETING_FEISHU_APP_ID'),
+  envField('meeting_feishu_app_secret', 'experimental', 'text', 'MEETING_FEISHU_APP_SECRET'),
   envField('meeting_vad_start_threshold', 'experimental', 'text', 'MEETING_VAD_START_THRESHOLD'),
   envField('meeting_vad_start_frames', 'experimental', 'text', 'MEETING_VAD_START_FRAMES'),
   yamlField(

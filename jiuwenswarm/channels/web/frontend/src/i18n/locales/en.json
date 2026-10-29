@@ -1,5 +1,9 @@
 {
   "meeting": {
+    "feishu": {
+      "title": "Feishu settings",
+      "description": "App credentials for Feishu voice messages."
+    },
     "panel": {
       "title": "Meeting",
       "addressedAgents": "Agents currently addressed by the meeting",
@@ -27,7 +31,7 @@
     },
     "routing": {
       "title": "Meeting input routing",
-      "description": "Leader addresses the meeting host; None sends without naming a recipient. Saved in this browser and applied when the next meeting starts.",
+      "description": "Leader: meeting host. None: no recipient. Applies to the next meeting.",
       "leader": "Leader",
       "none": "None"
     },
@@ -591,11 +595,11 @@
     "fields": {
       "team_jev_routing_enabled": {
         "title": "JEV routing for teammates",
-        "description": "Evaluate teammate broadcasts for relevance and interruptions in new default Team conversations. Uses the Team JEV endpoint and credentials (TYPESAFE_API_KEY by default). User speech routing is unchanged."
+        "description": "Filter teammate broadcasts and allow interruptions in new Team conversations."
       },
       "team_meeting_enabled": {
         "title": "Team meetings",
-        "description": "Show meeting controls in Team task conversations. Record into the message editor and hear replies using the configured default voice."
+        "description": "Enable voice input and spoken replies in Team conversations."
       },
       "preferred_language": {
         "title": "Language",
@@ -636,6 +640,12 @@
       "embed_api_base": { "title": "API URL" },
       "embed_api_key": { "title": "API key" },
       "embed_model": { "title": "Model name" },
+      "meeting_feishu_app_id": {
+        "title": "App ID"
+      },
+      "meeting_feishu_app_secret": {
+        "title": "App Secret"
+      },
       "asr_api_base": {
         "title": "Speech transcription API URL",
         "description": "Enter an OpenAI-compatible base URL or the full /audio/transcriptions URL.",
@@ -657,12 +667,12 @@
       },
       "meeting_vad_start_threshold": {
         "title": "Meeting speech-start confidence",
-        "description": "0–1 (default 0.5). Lower values accept less certain speech, but may pick up more noise. Applies to backend meeting detection after restarting the meeting. Clear to reset.",
+        "description": "0–1, default 0.5. Lower is more sensitive. Restart the meeting to apply.",
         "placeholder": "0.5"
       },
       "meeting_vad_start_frames": {
         "title": "Meeting start confirmation frames",
-        "description": "1–10 whole frames (default 5). Confirm this many speech frames within the last 10; each frame is 32 ms. Fewer frames respond faster. Restart the meeting after saving. Clear to reset.",
+        "description": "1–10, default 5. Fewer frames respond faster. Restart the meeting to apply.",
         "placeholder": "5"
       },
       "skill_evolution": {

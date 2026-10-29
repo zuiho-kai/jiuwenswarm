@@ -78,7 +78,7 @@ export function AgentConfigDialog({
   });
   const items = useMemo(() => {
     const nextItems: FormItem<Record<string, unknown>>[] = fields.map((name) => {
-      const key = name.includes('key');
+      const key = name.includes('key') || name.includes('secret');
       return {
         name,
         label: t(`settingsPanel.fields.${name}.title`),

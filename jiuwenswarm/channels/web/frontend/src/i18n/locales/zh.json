@@ -1,5 +1,9 @@
 {
   "meeting": {
+    "feishu": {
+      "title": "飞书设置",
+      "description": "飞书语音消息的应用凭证。"
+    },
     "panel": {
       "title": "会议",
       "addressedAgents": "会议当前提及的智能体",
@@ -27,7 +31,7 @@
     },
     "routing": {
       "title": "会议输入路由",
-      "description": "Leader 将消息发给会议主持人；None 不指定接收者。选项保存在当前浏览器，在下次启动会议时生效。",
+      "description": "Leader：会议主持人；None：不指定接收者。下次会议生效。",
       "leader": "Leader",
       "none": "None"
     },
@@ -584,11 +588,11 @@
     "fields": {
       "team_jev_routing_enabled": {
         "title": "子 Agent JEV 路由",
-        "description": "在新建的默认团队会话中判断队友广播的相关性和打断需求。使用团队 JEV 地址和密钥（默认 TYPESAFE_API_KEY）。不改变用户语音的路由方式。"
+        "description": "在新团队会话中过滤队友广播并允许打断。"
       },
       "team_meeting_enabled": {
         "title": "团队会议",
-        "description": "在团队任务会话中显示会议控件，录音转写到消息输入框，并使用已配置的默认音色播放回复。"
+        "description": "在团队会话中启用语音输入和语音回复。"
       },
       "preferred_language": {
         "title": "Language",
@@ -629,6 +633,12 @@
       "embed_api_base": { "title": "API 地址" },
       "embed_api_key": { "title": "API 密钥" },
       "embed_model": { "title": "模型名称" },
+      "meeting_feishu_app_id": {
+        "title": "App ID"
+      },
+      "meeting_feishu_app_secret": {
+        "title": "App Secret"
+      },
       "asr_api_base": {
         "title": "语音转写 API 地址",
         "description": "填写 OpenAI 兼容 Base URL 或完整的 /audio/transcriptions 地址。",
@@ -650,12 +660,12 @@
       },
       "meeting_vad_start_threshold": {
         "title": "会议语音起始置信度",
-        "description": "范围 0–1，默认 0.5。降低数值可接受置信度较低的语音，但也可能引入更多噪声。仅用于会议后端人声检测，重新开始会议后生效。清空可恢复默认值。",
+        "description": "范围 0–1，默认 0.5。越低越灵敏，重启会议生效。",
         "placeholder": "0.5"
       },
       "meeting_vad_start_frames": {
         "title": "会议起始确认帧数",
-        "description": "范围 1–10 整数帧，默认 5。在最近 10 帧中达到此语音帧数后确认说话，每帧 32 毫秒。帧数越少响应越快。保存后请重新开始会议。清空可恢复默认值。",
+        "description": "范围 1–10，默认 5。帧数越少响应越快，重启会议生效。",
         "placeholder": "5"
       },
       "skill_evolution": { "title": "本地技能自动演进与沉淀", "description": "控制本地技能的自动演进和沉淀" },

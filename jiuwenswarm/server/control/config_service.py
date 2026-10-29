@@ -86,6 +86,7 @@ _CONFIG_SET_ENV_MAP = {
     "serper_api_key": "SERPER_API_KEY",
     "perplexity_api_key": "PERPLEXITY_API_KEY",
     "github_token": "GITHUB_TOKEN",
+    "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
     "teamskills_market_url": "TEAM_SKILLS_HUB_BASE_URL",
     "teamskills_user_token": "TEAM_SKILLS_HUB_USER_TOKEN",
     "teamskills_system_token": "TEAM_SKILLS_HUB_SYSTEM_TOKEN",
@@ -381,6 +382,10 @@ def get_panel() -> dict[str, Any]:
         param_key: (os.getenv(env_key) or "")
         for param_key, env_key in _CONFIG_SET_ENV_MAP.items()
     }
+    payload["meeting_feishu_app_secret"] = ""
+    payload["meeting_feishu_configured"] = "true" if (
+        os.getenv("MEETING_FEISHU_APP_ID") and os.getenv("MEETING_FEISHU_APP_SECRET")
+    ) else "false"
     payload["app_version"] = __version__
     speech_start = speech_start_settings()
     payload["meeting_vad_start_threshold"] = str(speech_start["startThreshold"])

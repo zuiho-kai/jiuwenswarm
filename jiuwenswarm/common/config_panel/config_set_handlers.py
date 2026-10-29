@@ -124,7 +124,9 @@ class ConfigPanelInternalError(RuntimeError):
 # --------------------------------------------------------------------------- #
 WEB_CONFIG_RELOAD_CHANNEL_ID = "web"
 # Saved through config.save_all but never sent back to clients.
-WRITE_ONLY_CONFIG_KEYS = frozenset({"jev_openrouter_api_key", "jev_typesafe_api_key"})
+WRITE_ONLY_CONFIG_KEYS = frozenset({
+    "jev_openrouter_api_key", "jev_typesafe_api_key", "meeting_feishu_app_secret",
+})
 SEARCH_RELOAD_ENV_KEYS = {
     "BOCHA_API_KEY", "PERPLEXITY_API_KEY", "SERPER_API_KEY", "JINA_API_KEY",
 }
@@ -336,6 +338,8 @@ CONFIG_SET_ENV_MAP = {
     "asr_api_base": "ASR_API_BASE",
     "asr_api_key": "ASR_API_KEY",
     "asr_model": "ASR_MODEL_NAME",
+    "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
+    "meeting_feishu_app_secret": "MEETING_FEISHU_APP_SECRET",
     **SPEECH_START_ENV,
     # agents
     "skills": "SKILLS",
@@ -1119,7 +1123,9 @@ def encrypt_config_params(params: dict[str, Any]) -> dict[str, Any]:
     for key, val in list(encrypted.items()):
         if key.endswith("_context_window_tokens"):
             continue
-        if "api_key" in key.lower() or "token" in key.lower():
+        if key == "meeting_feishu_app_secret":
+            encrypted[key] = crypto.encrypt(val) if val else val
+        elif "api_key" in key.lower() or "token" in key.lower():
             encrypted[key] = crypto.encrypt(val)
     return encrypted
 
@@ -1513,6 +1519,9 @@ async def config_get_handler(
         param_key: "" if param_key in WRITE_ONLY_CONFIG_KEYS else (os.getenv(env_key) or "")
         for param_key, env_key in CONFIG_SET_ENV_MAP.items()
     }
+    payload["meeting_feishu_configured"] = "true" if (
+        os.getenv("MEETING_FEISHU_APP_ID") and os.getenv("MEETING_FEISHU_APP_SECRET")
+    ) else "false"
     payload["app_version"] = __version__
     speech_start = speech_start_settings()
     payload["meeting_vad_start_threshold"] = str(speech_start["startThreshold"])
