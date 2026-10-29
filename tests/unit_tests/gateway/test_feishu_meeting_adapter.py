@@ -2,6 +2,7 @@
 
 """Focused checks for the Feishu meeting receiver and publisher."""
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -12,6 +13,8 @@ import pytest
 
 from jiuwenswarm.extensions.meeting import feishu_receiver
 from jiuwenswarm.extensions.meeting.feishu_publisher import FeishuMeetingPublisher
+from jiuwenswarm.extensions.meeting.gateway_feishu import MeetingFeishuConnection
+from jiuwenswarm.gateway.routing.keys import ChannelKey
 from jiuwenswarm.gateway.channel_manager.web.task_asr import TaskAsrError
 
 
@@ -138,3 +141,149 @@ async def test_upload_and_message_failures_reach_caller():
     )
     with pytest.raises(RuntimeError, match="230002"):
         await publisher.send_text("oc_group", "Complete report")
+
+
+@pytest.fixture
+def manual_connection(monkeypatch):
+    from jiuwenswarm.gateway.channel_manager.im_platforms.feishu import feishu_connect
+    from jiuwenswarm.gateway.channel_manager.channel_manager import ChannelManager
+
+    class Channel:
+        def __init__(self, config, bus):
+            self.config = config
+            self.app_id = config.app_id
+            self.channel_id = "feishu"
+            self.connection_state = "connecting"
+            self.ready = asyncio.Event()
+            self.stop = AsyncMock()
+            self.on_message = Mock()
+
+        async def start(self):
+            await self.ready.wait()
+            self.connection_state = "connected"
+            await asyncio.Event().wait()
+
+    monkeypatch.setenv("MEETING_FEISHU_APP_ID", "meeting-app")
+    monkeypatch.setenv("MEETING_FEISHU_APP_SECRET", "test-secret")
+    monkeypatch.setattr(feishu_connect, "FEISHU_AVAILABLE", True)
+    monkeypatch.setattr(feishu_connect, "FeishuChannel", Channel)
+    manager = ChannelManager(SimpleNamespace())
+    manager.set_conf = AsyncMock()
+    return MeetingFeishuConnection(), manager
+
+
+@pytest.mark.asyncio
+async def test_manual_connection_waits_for_socket_and_disconnects_only_its_app(manual_connection):
+    connection, manager = manual_connection
+    other = SimpleNamespace(channel_id="feishu", app_id="other-app", on_message=Mock())
+    manager.register_channel(other)
+    pending = asyncio.create_task(connection.connect(manager))
+    await asyncio.sleep(0)
+    channel = connection.channel
+    assert connection.status(manager) == {"state": "connecting"}
+    assert not pending.done()
+    channel.ready.set()
+    assert await pending == {"state": "connected"}
+    assert await connection.connect(manager) == {"state": "connected"}
+    assert connection.channel is channel
+    assert await connection.disconnect(manager) == {"state": "disconnected"}
+    channel.stop.assert_awaited_once()
+    assert manager.get_by_key(ChannelKey("feishu", "other-app")) is other
+    manager.set_conf.assert_not_called()  # No persisted channel/automatic startup change.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["failed", "timeout"])
+async def test_manual_connection_failure_cleans_up_and_can_retry(manual_connection, monkeypatch, failure):
+    from jiuwenswarm.extensions.meeting import gateway_feishu
+
+    if failure == "timeout":
+        monkeypatch.setattr(gateway_feishu, "CONNECT_TIMEOUT_SECONDS", 0.01)
+    connection, manager = manual_connection
+    pending = asyncio.create_task(connection.connect(manager))
+    await asyncio.sleep(0)
+    channel = connection.channel
+    if failure == "failed":
+        channel.connection_state = "failed"
+    with pytest.raises(ValueError if failure == "failed" else TimeoutError):
+        await pending
+    channel.stop.assert_awaited_once()
+    assert manager.get_channels_by_id("feishu") == []
+    assert channel.start_task.cancelled()
+    monkeypatch.setattr(gateway_feishu, "CONNECT_TIMEOUT_SECONDS", 20)
+    retry = asyncio.create_task(connection.connect(manager))
+    await asyncio.sleep(0)
+    connection.channel.ready.set()
+    assert await retry == {"state": "connected"}
+    await connection.disconnect(manager)
+
+
+@pytest.mark.asyncio
+async def test_manual_connection_refuses_missing_credentials_and_existing_channel(manual_connection, monkeypatch):
+    connection, manager = manual_connection
+    monkeypatch.delenv("MEETING_FEISHU_APP_SECRET")
+    with pytest.raises(ValueError, match="Configure"):
+        await connection.connect(manager)
+    assert manager.get_channels_by_id("feishu") == []
+    monkeypatch.setenv("MEETING_FEISHU_APP_SECRET", "test-secret")
+    existing = SimpleNamespace(channel_id="feishu", app_id="meeting-app", on_message=Mock())
+    manager.register_channel(existing)
+    with pytest.raises(ValueError, match="already running"):
+        await connection.connect(manager)
+    await connection.disconnect(manager)
+    assert manager.get_by_key(ChannelKey("feishu", "meeting-app")) is existing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["cancelled", "replaced"])
+async def test_manual_connection_interruption_stops_socket(manual_connection, reason):
+    connection, manager = manual_connection
+    pending = asyncio.create_task(connection.connect(manager))
+    await asyncio.sleep(0)
+    channel = connection.channel
+    if reason == "cancelled":
+        pending.cancel()
+    else:
+        replacement = SimpleNamespace(channel_id="feishu", app_id="meeting-app", on_message=Mock())
+        manager.register_channel(replacement)
+        assert connection.status(manager) == {"state": "disconnected"}
+    with pytest.raises(asyncio.CancelledError if reason == "cancelled" else ValueError):
+        await pending
+    channel.stop.assert_awaited_once()
+    assert manager.get_channels_by_id("feishu") == ([] if reason == "cancelled" else [replacement])
+
+
+def test_connection_state_requires_live_socket():
+    from jiuwenswarm.gateway.channel_manager.im_platforms.feishu.feishu_connect import FeishuChannel
+
+    channel = SimpleNamespace(_running=True, _websocket_client=None, _websocket_thread=None)
+    assert FeishuChannel.connection_state.fget(channel) == "connecting"
+    channel._websocket_client = SimpleNamespace(_conn=SimpleNamespace(closed=False))
+    assert FeishuChannel.connection_state.fget(channel) == "connected"
+    channel._websocket_client._conn.closed = True
+    channel._websocket_thread = SimpleNamespace(is_alive=lambda: False)
+    assert FeishuChannel.connection_state.fget(channel) == "failed"
+    channel._running = False
+    assert FeishuChannel.connection_state.fget(channel) == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_manual_rpc_does_not_auto_connect_or_expose_sdk_errors(manual_connection, monkeypatch):
+    from jiuwenswarm.extensions.meeting.gateway_feishu import bind_feishu_handlers
+
+    _, manager = manual_connection
+    methods = {}
+    web = SimpleNamespace(
+        register_method=lambda name, handler, **kwargs: methods.update({name: handler}),
+        send_response=AsyncMock(),
+    )
+    bind_feishu_handlers(web, lambda: manager)
+    await methods["meeting.feishu.status"](None, "status", {}, None)
+    assert web.send_response.call_args.kwargs["payload"] == {"state": "disconnected"}
+    assert manager.get_channels_by_id("feishu") == []
+    monkeypatch.setattr(MeetingFeishuConnection, "connect", AsyncMock(side_effect=RuntimeError("test-secret")))
+    await methods["meeting.feishu.connect"](None, "connect", {}, None)
+    response = web.send_response.call_args.kwargs
+    assert response["ok"] is False
+    assert response["code"] == "FEISHU_CONNECTION_ERROR"
+    assert "test-secret" not in str(response)

@@ -4,6 +4,16 @@ Enable **Team meetings** under **Settings → Experimental**. The switch persist
 `experimental.team_meeting_enabled` in the existing configuration system and
 updates the Task controls immediately. The feature is off by default.
 
+For Feishu, save the App ID and App Secret under **Settings → Experimental →
+Team meetings → Feishu settings**, then click **Connect**. The Gateway reuses the
+existing Feishu channel for incoming messages and replies. **Connected** means
+the SDK has established its WebSocket; failures and timeouts are shown inline.
+Use **Disconnect** before changing or clearing credentials. This connection is
+runtime-only: after a backend restart, click Connect again. An app already
+running under **Settings → Channels → Feishu** must be managed there.
+Feishu voice-note routing into Team meetings and synthesized voice replies are
+not wired by this connection control.
+
 **Meeting input routing** offers **Leader** (default) and **None**. The choice is
 saved in this browser and captured when the next meeting starts. Voice transcripts
 mention only the Leader or have no mentions, respectively. Startup remains an

@@ -2,7 +2,17 @@
   "meeting": {
     "feishu": {
       "title": "飞书设置",
-      "description": "飞书语音消息的应用凭证。"
+      "description": "保存应用凭据后，点击连接。后端重启后需重新连接。会议语音收发暂未接入。",
+      "connect": "连接",
+      "disconnect": "断开连接",
+      "working": "请稍候…",
+      "connection": "飞书连接",
+      "states": {
+        "disconnected": "未连接",
+        "connecting": "连接中…",
+        "connected": "已连接",
+        "failed": "连接失败"
+      }
     },
     "panel": {
       "title": "会议",

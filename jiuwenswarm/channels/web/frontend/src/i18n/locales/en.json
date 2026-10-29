@@ -2,7 +2,17 @@
   "meeting": {
     "feishu": {
       "title": "Feishu settings",
-      "description": "App credentials for Feishu voice messages."
+      "description": "Save the app credentials, then connect manually. Connect again after restarting the backend. Voice meeting delivery is not connected yet.",
+      "connect": "Connect",
+      "disconnect": "Disconnect",
+      "working": "Please wait…",
+      "connection": "Feishu connection",
+      "states": {
+        "disconnected": "Disconnected",
+        "connecting": "Connecting…",
+        "connected": "Connected",
+        "failed": "Connection failed"
+      }
     },
     "panel": {
       "title": "Meeting",

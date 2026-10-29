@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '../../../../components/ui';
 import { SettingRow, SettingsConfirmDialog } from '../../components';
@@ -9,17 +9,62 @@ import { useSettingsSource } from '../../services/SettingsSourceProvider';
 import { AgentConfigDialog } from '../agent/AgentSettings';
 
 const fields = ['meeting_feishu_app_id', 'meeting_feishu_app_secret'] as const;
+type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'failed';
 
 export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
   const { t } = useTranslation();
-  const { isConnected } = useSettingsServices();
+  const { isConnected, request } = useSettingsServices();
   const { values, savingKeys, save, patchLocal } = useSettingsSource();
   const [configuring, setConfiguring] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [clearError, setClearError] = useState('');
-  const busy = fields.some((field) => savingKeys.has(field));
+  const [connection, setConnection] = useState<ConnectionState>('disconnected');
+  const [connecting, setConnecting] = useState(false);
+  const [connectionError, setConnectionError] = useState('');
+  const busy = connecting || fields.some((field) => savingKeys.has(field));
   const configured = parseConfigBoolean(values.meeting_feishu_configured);
   const title = t('meeting.feishu.title');
+  const active = connection === 'connected' || connection === 'connecting';
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isConnected || connecting) {
+      if (!isConnected) setConnection('disconnected');
+      return;
+    }
+    const refresh = async () => {
+      try {
+        const result = await request<{ state: ConnectionState }>('meeting.feishu.status');
+        if (!cancelled) setConnection(result.state);
+      } catch (error) {
+        if (!cancelled) setConnectionError(error instanceof Error ? error.message : String(error));
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isConnected, request, connecting]);
+
+  const changeConnection = async () => {
+    setConnecting(true);
+    setConnectionError('');
+    try {
+      const result = await request<{ state: ConnectionState }>(
+        active ? 'meeting.feishu.disconnect' : 'meeting.feishu.connect',
+        {},
+        { timeoutMs: 35_000 },
+      );
+      setConnection(result.state);
+    } catch (error) {
+      setConnection('failed');
+      setConnectionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   const saveCredentials = async (updates: Record<string, string>, operation: string) => {
     const result = await save(updates, operation);
@@ -53,15 +98,23 @@ export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
         }
       >
         <Button
-          disabled={disabled || !isConnected || busy}
+          disabled={disabled || !isConnected || busy || active}
           onClick={() => setConfiguring(true)}
           data-testid="settings-meeting-feishu-configure-btn"
         >
           {t(configured ? 'common.modify' : 'settingsPanel.common.configure')}
         </Button>
+        <Button
+          disabled={disabled || !isConnected || busy || (!configured && !active)}
+          onClick={() => void changeConnection()}
+          data-testid="settings-meeting-feishu-connect-btn"
+          data-variant={active ? 'disconnect' : 'connect'}
+        >
+          {t(connecting ? 'meeting.feishu.working' : active ? 'meeting.feishu.disconnect' : 'meeting.feishu.connect')}
+        </Button>
         {configured ? (
           <Button
-            disabled={disabled || !isConnected || busy}
+            disabled={disabled || !isConnected || busy || active}
             onClick={() => {
               setClearError('');
               setClearing(true);
@@ -72,6 +125,19 @@ export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
           </Button>
         ) : null}
       </SettingRow>
+      <SettingRow
+        title={<span data-testid="settings-meeting-feishu-connection-title">{t('meeting.feishu.connection')}</span>}
+        description={
+          <span data-testid="settings-meeting-feishu-connection-status" role="status">
+            {t(`meeting.feishu.states.${connecting ? 'connecting' : connection}`)}
+          </span>
+        }
+      />
+      {connectionError ? (
+        <div className="settings-page__error" role="alert" data-testid="settings-meeting-feishu-connection-error">
+          {connectionError}
+        </div>
+      ) : null}
       {configuring ? (
         <AgentConfigDialog
           titleKey="meeting.feishu.title"

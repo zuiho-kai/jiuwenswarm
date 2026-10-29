@@ -230,6 +230,18 @@ class FeishuChannel(BaseChannel):
         """返回飞书应用ID，用于ChannelManager索引（ChannelKey.app_id）。"""
         return self.config.app_id or "default"
 
+    @property
+    def connection_state(self) -> str:
+        """Report the SDK socket state, rather than merely the start task state."""
+        if not self._running:
+            return "disconnected"
+        conn = getattr(self._websocket_client, "_conn", None)
+        if conn is not None and not conn.closed:
+            return "connected"
+        if self._websocket_thread is not None and not self._websocket_thread.is_alive():
+            return "failed"
+        return "connecting"
+
     def on_message(self, callback: Callable[[Message], None]) -> None:
         """
         注册消息回调函数，用于Gateway模式。

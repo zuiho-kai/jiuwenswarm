@@ -5083,6 +5083,10 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
     bind_playback_handlers(channel, lambda: _resolve(agent_client))
 
+    from jiuwenswarm.extensions.meeting.gateway_feishu import bind_feishu_handlers
+
+    bind_feishu_handlers(channel, lambda: _resolve(channel_manager))
+
     async def _meeting_control(ws, req_id, params, session_id, user_id, method):
         """Forward meeting control to the AgentServer that owns the Team."""
         from secrets import token_hex
