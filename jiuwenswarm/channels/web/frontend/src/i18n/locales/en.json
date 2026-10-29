@@ -71,6 +71,7 @@
       "emptyTranscript": "No clear speech was detected. Please record again.",
       "deliveryFailed": "Your message could not be delivered. Please try again.",
       "playbackFailed": "Could not play the agent reply. The full text is still available.",
+      "playbackSkipped": "Audio failed. Skipping this speech and continuing the queue; the full text is still available.",
       "playbackOverloaded": "Too much speech is queued. Read the full reply in the transcript."
     }
   },

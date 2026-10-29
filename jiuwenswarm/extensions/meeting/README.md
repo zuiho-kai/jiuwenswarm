@@ -117,9 +117,10 @@ input uses Settings > Speech transcription (`ASR_API_BASE`, `ASR_API_KEY`, and
 
 Only natural playback completion of every chunk reports `meeting.playback.result`
 as completed and releases the SDK speaking lease. Synthesized audio alone never
-advances it. Stop audio, taking the microphone, or synthesis/playback failure holds
-the queue and displays a persistent paused/failed state. End this meeting to start
-again; seamless resume is deferred. Duplicate result receipts are idempotent,
+advances it as completed. A synthesis/playback error shows its failure, drains the
+failed synthesis, and marks that speech interrupted before continuing to the next
+queued item. Published full text remains available. Stop audio still holds the
+queue in a paused state; end the meeting to start again. Duplicate result receipts are idempotent,
 including after the next grant. Foreign identities and stale leases are rejected.
 
 End revokes synthesis, sends `meeting.playback.stop`, and waits for the browser's
@@ -225,9 +226,11 @@ workspace metadata, or history files. Additional history is read only to fill
 specific missing context needed by the user's request.
 
 The host grant driver is implemented with a controlled consumer boundary. Queue
-admission wakes SDK grant scheduling; only an explicit matching owner playback
-completion releases the lease. Publication retry preserves the original token
-and message identity. Delivery/playback failures hold the turn. Meeting cleanup
+admission wakes SDK grant scheduling; matching owner playback completion releases
+the lease as completed. An owner-confirmed audio failure revokes that speech as
+interrupted and advances after synthesis has drained. Publication retry preserves
+the original token and message identity. Delivery failures and explicit audio
+stops hold the turn. Meeting cleanup
 drains the worker and confirms consumer stop before closing the SDK coordinator.
 
 Publication and grant scheduling accept an optional

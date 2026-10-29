@@ -45,6 +45,7 @@ class GatewayPlaybackRoute:
         self.produced = {}
         self.receipts = {}
         self.pending_receipts = {}
+        self.drained_playbacks: set[str] = set()
         self.current_playback = None
         self.result_lock = asyncio.Lock()
         self.tasks: dict[tuple, asyncio.Task] = {}
@@ -232,12 +233,16 @@ def bind_playback_handlers(channel, agent_client):
             if type(index) is not int:
                 raise ValueError("Invalid speech chunk index")
             key = (identity["playback_id"], index)
-            if route.revoked or route.tasks or identity["playback_id"] in route.interrupted:
+            if (
+                route.revoked or route.tasks or identity["playback_id"] in route.interrupted
+                or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
+            ):
                 raise ValueError("Meeting synthesis has stopped or is already active")
             chunk = await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
             config = QwenOmniRealtimeConfig.from_environment()
             if (
                 route.revoked or route.tasks or identity["playback_id"] in route.interrupted or config_revision(config) != route.revision
+                or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
                 or chunk.get("config_revision") != route.revision or chunk.get("model") != config.model
             ):
                 raise ValueError("Meeting TTS configuration changed")
@@ -245,7 +250,11 @@ def bind_playback_handlers(channel, agent_client):
             route.tasks[key] = task
             audio = await task
             await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
-            if route.revoked or identity["playback_id"] in route.interrupted or config_revision(QwenOmniRealtimeConfig.from_environment()) != route.revision:
+            if (
+                route.revoked or identity["playback_id"] in route.interrupted
+                or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
+                or config_revision(QwenOmniRealtimeConfig.from_environment()) != route.revision
+            ):
                 raise ValueError("Meeting playback stopped or its configuration changed")
             route.produced[identity["playback_id"]].add(index)
             await channel.send_response(ws, req_id, ok=True, payload={
@@ -281,8 +290,15 @@ def bind_playback_handlers(channel, agent_client):
                     raise ValueError("Speech is no longer current")
                 if outcome in {"failed", "stopped"}:
                     route.pending_receipts[identity["playback_id"]] = (outcome, count)
-                    route.revoked = True
-                    await route.cancel_synthesis()
+                    if identity["playback_id"] not in route.drained_playbacks:
+                        if outcome == "stopped":
+                            route.revoked = True
+                            await route.cancel_synthesis()
+                        else:
+                            # A failed reading must not poison later speakers.
+                            # Drain first; then allow the server to release its lease.
+                            await route.interrupt_synthesis()
+                        route.drained_playbacks.add(identity["playback_id"])
                 elif outcome == "completed":
                     record = route.records[identity["playback_id"]]
                     if len(route.produced[identity["playback_id"]]) != record["chunk_count"]:

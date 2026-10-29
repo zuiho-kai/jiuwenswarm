@@ -178,10 +178,10 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
             input.signal,
           );
         },
-        error: (code) => {
+        error: (code, detail) => {
           if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
             toast.open({
-              content: t(`meeting.errors.${code}`),
+              content: [t(`meeting.errors.${code}`), detail].filter(Boolean).join(' '),
               variant: 'error',
             });
         },

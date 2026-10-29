@@ -74,7 +74,7 @@ export class MeetingSession {
     private callbacks: {
       line: (line: MeetingLine) => void;
       draft: (text: string) => void | Promise<void>;
-      error: (code: string) => void;
+      error: (code: string, detail?: string) => void;
       recording: (state: RecordingState) => void;
       ended: () => void;
       playback?: (state: PlaybackState, speaker?: string, voice?: string) => void;
@@ -411,12 +411,21 @@ export class MeetingSession {
           if (this.currentSpeech === attempt) this.currentSpeech = null;
           await this.report(attempt, 'completed');
           if (!this.paused && this.active) this.callbacks.playback?.('idle');
-        } catch {
+        } catch (error) {
           if (epoch !== this.playbackEpoch || !this.active) return;
-          this.paused = true;
+          // A failed completion acknowledgement is a coordination error, not
+          // failed audio. Do not claim it was skipped or send a conflicting receipt.
+          if (attempt.reported) throw error;
           this.callbacks.playback?.('failed', speech.speaker_id, speech.voice);
-          this.callbacks.error('playbackFailed');
-          await this.report(attempt, 'failed').catch(() => this.callbacks.error('playbackFailed'));
+          const detail =
+            error && typeof error === 'object' && 'message' in error && typeof error.message === 'string'
+              ? error.message.slice(0, 500)
+              : undefined;
+          this.callbacks.error('playbackSkipped', detail);
+          // The next ready event may arrive before the result RPC response.
+          if (this.currentSpeech === attempt) this.currentSpeech = null;
+          await this.report(attempt, 'failed');
+          if (!this.paused && this.active) this.callbacks.playback?.('idle');
         } finally {
           if (this.currentSpeech === attempt) this.currentSpeech = null;
         }

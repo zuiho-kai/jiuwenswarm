@@ -12,14 +12,14 @@ const tick = () => new Promise(resolve=>setImmediate(resolve));
 function harness({startCapture = async()=>{}} = {}) {
   const handlers = new Map();
   const requests = [], lines=[], errors=[], drafts=[], states=[];
-  const resolvers = {};
+  const resolvers = {}, rejectors = {};
   let onState;
   const transport = {
     on:(name,fn)=>{handlers.set(name,fn); return ()=>handlers.delete(name);},
     onStateChange:fn=>{onState=fn;return ()=>{onState=null;};},
     request:async(name,params)=>{
       requests.push({name,params});
-      if(name === 'meeting.speech.synthesize') return new Promise(resolve=>{resolvers[name]=resolve;});
+      if(name === 'meeting.speech.synthesize') return new Promise((resolve,reject)=>{resolvers[name]=resolve;rejectors[name]=reject;});
       return name === 'meeting.playback.ready' ? {ready:true,stream_id:'input'} : {accepted:true};
     },
   };
@@ -29,7 +29,7 @@ function harness({startCapture = async()=>{}} = {}) {
   const meeting=new MeetingSession(transport,'s',context,callbacks,(_stream,pcm,error)=>{onPcm=pcm;captureError=error;return capture;});
   const track={stop(){this.stopped=true;},onended:null};
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[track],getAudioTracks:()=>[track]})}}});
-  return {meeting,requests,handlers,track,lines,errors,drafts,states,resolvers,capture,callbacks,
+  return {meeting,requests,handlers,track,lines,errors,drafts,states,resolvers,rejectors,capture,callbacks,
     pcm:(samples=new Int16Array(1600).fill(1000))=>onPcm(samples), captureError:()=>captureError(),
     disconnect:()=>onState?.('closed')};
 }
@@ -68,6 +68,31 @@ test('only natural completion of every chunk reports completed',async()=>{
  assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.outcome,'completed');
  h.meeting.stop();h.meeting.finishCleanup();
 });
+
+for (const failure of ['synthesis', 'audio']) {
+ test(`${failure} error is shown and the next queued speech still plays`,async()=>{
+  const h=harness(),audios=audioHarness(),details=[];await ready(h);
+  h.callbacks.error=(code,detail)=>{h.errors.push(code);details.push(detail);};
+  emitSpeech(h);await tick();
+  if(failure==='synthesis') {
+   h.rejectors['meeting.speech.synthesize']({message:'Qwen did not read the supplied text faithfully'});
+  } else {
+   h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+   await tick();audios[0].onerror();
+  }
+  await tick();
+  assert.deepEqual(h.errors,['playbackSkipped']);assert.ok(details[0]);
+  const failed=h.requests.find(r=>r.name==='meeting.playback.result');
+  assert.equal(failed.params.outcome,'failed');assert.equal(failed.params.completed_chunks,0);
+  emitSpeech(h,{playback_id:'next',request_id:'next-request',lease_token:'next-lease'});await tick();
+  h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'next',chunk_index:0});
+  await tick();audios.at(-1).onended();await tick();
+  const results=h.requests.filter(r=>r.name==='meeting.playback.result');
+  assert.equal(results.length,2);assert.equal(results[1].params.playback_id,'next');
+  assert.equal(results[1].params.outcome,'completed');assert.ok(!h.capture.stopped);
+  h.meeting.stop();h.meeting.finishCleanup();
+ });
+}
 
 const inputEvent=(h,event,payload={})=>h.handlers.get(event)?.({payload:{session_id:'s',meeting_id:'meeting',stream_id:'input',utterance_id:1,...payload}});
 

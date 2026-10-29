@@ -46,7 +46,8 @@ class MeetingGrantDriver:
 
     SDK methods alone choose the next speaker and publish full text. No timer,
     synthesis result, or consumer callback return can release a speaking lease.
-    Failures hold coordination. Interruption revokes the observed lease, waits
+    Publication failures and explicit audio stops hold coordination. Confirmed
+    failed audio revokes its lease and advances. Interruption waits
     for audio stop and human input acceptance, then resumes the SDK queue.
     """
 
@@ -131,12 +132,26 @@ class MeetingGrantDriver:
                 self.wake()
             return True
 
-    async def fail_playback(self, scope: MeetingScope, request_id: str, lease_token: str) -> bool:
+    async def fail_playback(
+        self, scope: MeetingScope, request_id: str, lease_token: str, *, advance: bool = False,
+    ) -> bool:
         if not await self._is_current():
             return False
         async with self._lock:
             if not self._matches(scope, request_id, lease_token) or self._state.phase != "awaiting_playback":
                 return False
+            if advance:
+                # The owner reported failed audio and Gateway drained synthesis.
+                # Revoke as interrupted, never falsely acknowledge it as played.
+                interruption = await self.coordinator.interrupt_speech(expected_token=lease_token)
+                if interruption is None:
+                    return False
+                if not await self.coordinator.resume_after_interruption(interruption.interruption_id):
+                    raise RuntimeError("Failed speech interruption could not be released")
+                logger.warning("Skipping failed meeting audio request=%s", request_id)
+                self._state = GrantDriverState()
+                self.wake()
+                return True
             self._state = GrantDriverState("playback_failed", self._state.request, "playback_failed")
         # No complete_playback call: failed/stopped audio is never reported as played.
         await self._report_error()

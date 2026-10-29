@@ -149,8 +149,13 @@ class BrowserPlaybackConsumer:
                 return {"accepted": True}
             if self._closing or self._current != record.playback_id:
                 raise ValueError("Playback result is no longer current")
-            method = self.driver.complete_playback if outcome == "completed" else self.driver.fail_playback
-            if not await method(self.scope, record.request_id, record.lease_token):
+            if outcome == "completed":
+                accepted = await self.driver.complete_playback(self.scope, record.request_id, record.lease_token)
+            else:
+                accepted = await self.driver.fail_playback(
+                    self.scope, record.request_id, record.lease_token, advance=outcome == "failed",
+                )
+            if not accepted:
                 raise ValueError("Playback lease is no longer current")
             self._receipts[record.playback_id] = (outcome, count)
         return {"accepted": True}
@@ -196,8 +201,7 @@ class BrowserPlaybackConsumer:
             self._stop_waiter = asyncio.get_running_loop().create_future()
         if self._stop_waiter.done():
             return
-        # A locally confirmed stop/failure leaves the driver held and prevents
-        # another grant. Gateway drained matching synthesis before forwarding it.
+        # Gateway drained matching synthesis before forwarding these receipts.
         receipt = self._receipts.get(self._current)
         if receipt is not None and receipt[0] in {"stopped", "failed"}:
             self._stop_waiter.set_result(True)

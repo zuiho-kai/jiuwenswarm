@@ -172,7 +172,8 @@ async def test_foreign_controls_overrides_and_stale_lease_are_rejected(browser):
     assert (await driver.coordinator.get_speaker()).lease_token == speech["lease_token"]
 
 
-async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(browser, monkeypatch):
+@pytest.mark.parametrize("outcome", ["stopped", "failed"])
+async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(browser, monkeypatch, outcome):
     entered, drained = asyncio.Event(), asyncio.Event()
 
     class Tts:
@@ -199,11 +200,98 @@ async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(brow
     speech = await next_speech(browser)
     task = asyncio.create_task(browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": 0}))
     await asyncio.wait_for(entered.wait(), 3)
-    assert (await browser.call("meeting.playback.result", {**identity(speech), "outcome": "stopped", "completed_chunks": 0}))["ok"]
+    assert (await browser.call("meeting.playback.result", {**identity(speech), "outcome": outcome, "completed_chunks": 0}))["ok"]
     assert drained.is_set()
     assert not (await task)["ok"]
-    assert driver.state.phase == "playback_failed"
+    if outcome == "stopped":
+        assert driver.state.phase == "playback_failed"
+    else:
+        assert await driver.coordinator.get_speaker() is None
+        await queue(browser, driver, "analyst")
+        assert (await next_speech(browser))["speaker_id"] == "analyst"
     assert (await browser.call("meeting.end"))["ok"]
+
+
+async def test_failed_audio_skips_only_that_speech_and_reuses_the_meeting(browser, monkeypatch):
+    from jiuwenswarm.gateway.voice.tts import TtsError
+
+    driver, _ = await activate(browser)
+    await queue(browser, driver)
+    first = await next_speech(browser)
+    await queue(browser, driver, "analyst", "Next reading")
+    route = next(iter(browser.ws._meeting_playback_routes.values()))
+    failed_tts = route.tts
+
+    async def fail_synthesis(*args):
+        raise TtsError("TEXT_MISMATCH", "Qwen did not read the supplied text faithfully")
+
+    monkeypatch.setattr(failed_tts, "synthesize", fail_synthesis)
+    error = await browser.call("meeting.speech.synthesize", {**identity(first), "chunk_index": 0})
+    assert not error["ok"] and error["code"] == "TEXT_MISMATCH"
+    receipt = {**identity(first), "outcome": "failed", "completed_chunks": 0}
+    assert (await browser.call("meeting.playback.result", receipt))["ok"]
+    second = await next_speech(browser)
+    assert second["request_id"] != first["request_id"]
+    assert second["speaker_id"] == "analyst"
+    assert failed_tts.closed and route.tts is not failed_tts and not route.revoked
+    skipped = await driver.coordinator.get_request(first["request_id"])
+    assert skipped.status == "interrupted" and skipped.source_message_id == first["source_message_id"]
+
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def next_synthesis(*args):
+        entered.set()
+        await finish.wait()
+        return SimpleNamespace(audio=b"wav", audio_mime="audio/wav")
+
+    monkeypatch.setattr(route.tts, "synthesize", next_synthesis)
+    task = asyncio.create_task(browser.call("meeting.speech.synthesize", {**identity(second), "chunk_index": 0}))
+    await asyncio.wait_for(entered.wait(), 3)
+    try:
+        # An acknowledgement retry for the failed reading cannot cancel its successor.
+        assert (await browser.call("meeting.playback.result", receipt))["ok"]
+        assert not task.done() and not route.tts.closed
+    finally:
+        finish.set()
+    assert (await task)["ok"]
+    assert (await browser.call("meeting.playback.result", {
+        **identity(second), "outcome": "completed", "completed_chunks": 1,
+    }))["ok"]
+    assert await driver.coordinator.get_speaker() is None
+    assert len(await driver.coordinator.for_member("leader").get_history()) == 2
+
+
+async def test_failed_audio_discards_a_late_speech_text_fetch(browser, monkeypatch):
+    from jiuwenswarm.common.schema.message import ReqMethod
+
+    driver, _ = await activate(browser)
+    await queue(browser, driver)
+    first = await next_speech(browser)
+    await queue(browser, driver, "analyst")
+    route = next(iter(browser.ws._meeting_playback_routes.values()))
+    fetch = route.fetch
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_fetch(method, params):
+        payload = await fetch(method, params)
+        if method == ReqMethod.MEETING_SPEECH_GET and params.get("playback_id") == first["playback_id"]:
+            entered.set()
+            await release.wait()
+        return payload
+
+    monkeypatch.setattr(route, "fetch", delayed_fetch)
+    late = asyncio.create_task(browser.call("meeting.speech.synthesize", {**identity(first), "chunk_index": 0}))
+    await asyncio.wait_for(entered.wait(), 3)
+    try:
+        assert (await browser.call("meeting.playback.result", {
+            **identity(first), "outcome": "failed", "completed_chunks": 0,
+        }))["ok"]
+        second = await next_speech(browser)
+    finally:
+        release.set()
+    assert not (await late)["ok"]
+    assert not browser.audio_calls
+    assert (await browser.call("meeting.speech.synthesize", {**identity(second), "chunk_index": 0}))["ok"]
 
 
 async def test_meeting_reuses_warm_connection_and_end_drains_it(browser, monkeypatch):

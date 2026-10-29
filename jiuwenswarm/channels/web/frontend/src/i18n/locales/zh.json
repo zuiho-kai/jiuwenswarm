@@ -71,6 +71,7 @@
       "emptyTranscript": "未检测到清晰语音，请重新录制。",
       "deliveryFailed": "消息投递失败，请重试。",
       "playbackFailed": "无法播放智能体回复，完整文字仍然可用。",
+      "playbackSkipped": "语音播放失败。已跳过本段语音并继续处理队列，完整文字仍然可用。",
       "playbackOverloaded": "待播放语音过多，请在会议记录中阅读完整回复。"
     }
   },
