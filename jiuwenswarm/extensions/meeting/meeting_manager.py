@@ -91,7 +91,10 @@ class MeetingManager:
                         raise ValueError("Meeting already has a different playback consumer")
                     return {"ready": True, "meeting_id": meeting_id}
                 cached = self._voice_registries.get(session_id)
-                if cached is not None and cached[0] is meeting.backend and cached[1].model == model:
+                if (
+                    cached is not None and cached[0] is meeting.backend and cached[1].model == model
+                    and cached[1].get_voice(meeting.state.leader_member_name).provider_voice_id == default_voice
+                ):
                     voices = cached[1]
                 else:
                     voices = MemberVoiceRegistry(session_id, meeting.state.scope.team_name, model)

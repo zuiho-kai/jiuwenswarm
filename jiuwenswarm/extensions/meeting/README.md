@@ -108,21 +108,49 @@ request errors and connection-state notifications without periodic meeting statu
 requests or automatic reconnection/resume.
 
 After local media and listeners are ready, `meeting.playback.ready` prepares
-server input and warms one owner-specific Qwen TTS connection on Gateway, then
-activates publication/grant scheduling. The connection is reused across speech
-chunks and member voice changes. The shared provider session serializes input
-and its single event reader; the TTS adapter waits for voice acknowledgements,
-verifies the complete transcript, and deletes completed conversation items.
-Deletion acknowledgements are drained before the next reading, so previous
-speech does not accumulate as conversation context. A failed or cancelled turn
-discards its connection without replay; Stop, End, release and disconnect drain
-the persistent session. Ordinary one-shot TTS consumers retain their behavior.
+server input and prepares one owner-specific TTS session on Gateway,
+then activates publication/grant scheduling. The session is reused across speech
+chunks and member voice changes. Every synthesis request supplies the exact text
+and a model-qualified voice ID; no conversational history accumulates. Responses
+use the general `gateway.voice.tts.TtsSession` interface. CosyVoice2 uses HTTP
+and returns MP3; Qwen Omni uses its existing persistent WebSocket adapter,
+verifies the generated transcript against the supplied text, and returns WAV.
+CosyVoice2 does not supply an independently verified transcript. A failed or cancelled turn
+discards its session without replay; Stop, End, release and disconnect drain active
+requests before closing it.
 AgentServer freezes each granted spoken summary, member voice, source message,
 lease and playback identity. The browser calls `meeting.speech.synthesize` with
 that identity and a chunk index; it cannot override text, model or voice. Gateway
-resolves the canonical chunk on AgentServer, synthesizes it using the shared Qwen
-Omni component, then rechecks the lease/configuration before returning WAV audio.
-Credentials stay on Gateway. Qwen must be configured through `QWEN_OMNI_*`;
+resolves the canonical chunk on AgentServer, synthesizes it using the selected TTS provider,
+then rechecks the lease/configuration before returning audio.
+Credentials stay on Gateway. Configure **Settings > Experimental > Speech synthesis**:
+
+```dotenv
+TTS_PROVIDER=cosyvoice
+TTS_API_BASE=https://api.siliconflow.cn/v1
+TTS_API_KEY=your-siliconflow-key
+TTS_MODEL_NAME=FunAudioLLM/CosyVoice2-0.5B
+TTS_VOICE=FunAudioLLM/CosyVoice2-0.5B:anna
+
+# To use Qwen, replace the values in the same five fields:
+# TTS_PROVIDER=qwen_omni
+# TTS_API_BASE=wss://your-workspace.example.com/api-ws/v1/realtime
+# TTS_API_KEY=your-qwen-tts-key
+# TTS_MODEL_NAME=qwen3.8-omni-flash-realtime
+# TTS_VOICE=Tina
+```
+
+Choose CosyVoice2 or Qwen Omni in the provider selector and configure its URL,
+key, model and default voice. Both providers read the same `TTS_API_BASE`,
+`TTS_API_KEY`, `TTS_MODEL_NAME` and `TTS_VOICE` settings; the provider selects the
+request protocol. Switching replaces these values together, with no additional
+provider-specific configuration fields. CosyVoice2 accepts a base URL or full
+`/audio/speech` endpoint; Qwen requires a WebSocket URL. The shared TTS API key
+is never returned by the settings APIs. Missing or invalid
+settings fail explicitly without falling back to another provider.
+Restart the meeting after changing settings. Existing `QWEN_OMNI_*` configuration,
+catalog and adapter remain available for other consumers. Meeting TTS never
+inherits the normal Qwen/video credentials. Video-duplex implementation is unchanged;
 input uses Settings > Speech transcription (`ASR_API_BASE`, `ASR_API_KEY`, and
 `ASR_MODEL_NAME`), independently of the video-duplex provider and voice settings.
 
@@ -167,7 +195,7 @@ audio only; published full text and the remaining queued requests are preserved.
 Both paths revoke the matching SDK lease and send `meeting.speech.stop` with its
 complete playback identity. The browser stops only that speech and keeps its
 microphone active. Gateway drains synthesis cancellation before forwarding the
-browser's `meeting.playback.stopped` acknowledgement. Cancelled Qwen sessions
+browser's `meeting.playback.stopped` acknowledgement. Cancelled TTS clients
 are replaced before the next speaker. Late synthesis, duplicate speech events
 and late completion receipts cannot replay or complete an interrupted speech.
 
@@ -257,16 +285,20 @@ drains the worker and confirms consumer stop before closing the SDK coordinator.
 
 Publication and grant scheduling accept an optional
 `MemberVoiceRegistry` from `jiuwenswarm.common.voice_matching`. The host supplies
-the exact Qwen Omni model and a registry scoped to the native Team/session; no
+the exact configured TTS model and a registry scoped to the native Team/session; no
 Gateway credentials are read by the meeting runtime. Existing roster bindings
 are initialized with the Leader first. The common member rail attaches an
 immutable `VoiceAssignment` for later native members and refreshes existing
 members before their next model call.
 
 Matching uses explicit preference, then an unused compatible voice, then the
-least-used voice with catalog order breaking ties. The packaged catalog is a
-curated Mandarin/English subset in `resources/voices/qwen_omni.yaml`. Reuse the
-same registry for the same native runtime to retain assignments across meetings;
+least-used voice with catalog order breaking ties. CosyVoice2 uses eight preset
+voices (Anna, Bella, Claire, Diana, Alex, Benjamin, Charles and David) from the
+[SiliconFlow catalog](https://docs.siliconflow.cn/docs/userguide/capabilities/text-to-speech).
+The Leader uses `TTS_VOICE`; members
+receive distinct voices until the catalog is exhausted, then share the least-used
+voice. Both providers use catalog files in `resources/voices/`.
+Reuse the same registry for the same native runtime and model to retain assignments across meetings;
 create a new one when that runtime is replaced. Catalog updates affect future
 assignments while retained bindings keep queued speech reproducible.
 `publication.voice_for_speech(request).provider_voice_id` supplies the voice

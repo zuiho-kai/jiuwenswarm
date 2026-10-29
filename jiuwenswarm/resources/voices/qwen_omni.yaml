@@ -4,6 +4,9 @@
 # Keep existing entries first: catalog order breaks ties for new member assignments.
 # This is not the separate Qwen TTS or JoyAI voice catalog.
 version: qwen-omni-2026-10-26-expanded
+default_model: qwen3.8-omni-flash-realtime
+default_voice: Tina
+default_url: ""
 source: https://www.alibabacloud.com/help/en/model-studio/omni-voice-list
 voices:
   - id: tina

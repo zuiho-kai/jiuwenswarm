@@ -47,6 +47,9 @@ class VoiceCatalog:
     version: str
     source: str
     voices: tuple[VoiceDefinition, ...]
+    default_model: str = ""
+    default_voice: str = ""
+    default_url: str = ""
 
     def __post_init__(self) -> None:
         _nonblank(self.version, "Catalog version")
@@ -80,8 +83,7 @@ class VoiceCatalog:
         return voices
 
 
-def load_qwen_voice_catalog(path: Path | None = None) -> VoiceCatalog:
-    resource = path if path is not None else files("jiuwenswarm").joinpath("resources/voices/qwen_omni.yaml")
+def _load_voice_catalog(resource) -> VoiceCatalog:
     try:
         data = yaml.safe_load(resource.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
@@ -103,7 +105,28 @@ def load_qwen_voice_catalog(path: Path | None = None) -> VoiceCatalog:
             tuple(_language(value) for value in entry["languages"]),
             entry.get("description", ""),
         ))
-    return VoiceCatalog(data.get("version"), data.get("source"), tuple(voices))
+    return VoiceCatalog(
+        data.get("version"), data.get("source"), tuple(voices),
+        data.get("default_model", ""), data.get("default_voice", ""), data.get("default_url", ""),
+    )
+
+
+def load_qwen_voice_catalog(path: Path | None = None) -> VoiceCatalog:
+    return _load_voice_catalog(path if path is not None else files("jiuwenswarm").joinpath("resources/voices/qwen_omni.yaml"))
+
+
+def load_tts_voice_catalog(provider: str) -> VoiceCatalog:
+    if provider not in {"cosyvoice", "qwen_omni"}:
+        raise ValueError(f"Unsupported TTS provider: {provider}")
+    return _load_voice_catalog(files("jiuwenswarm").joinpath(f"resources/voices/{provider}.yaml"))
+
+
+def load_voice_catalog(model: str) -> VoiceCatalog:
+    for provider in ("cosyvoice", "qwen_omni"):
+        catalog = load_tts_voice_catalog(provider)
+        if any(model in voice.models for voice in catalog.voices):
+            return catalog
+    raise ValueError(f"Unsupported voice model: {model}")
 
 
 @dataclass(frozen=True)
@@ -134,7 +157,7 @@ class MemberVoiceRegistry:
         self._session_id = _nonblank(session_id, "Session ID")
         self._team_name = _nonblank(team_name, "Team name")
         self._model = _nonblank(model, "Model")
-        self._catalog = catalog or load_qwen_voice_catalog()
+        self._catalog = catalog or load_voice_catalog(model)
         self._catalog.compatible(self.model)
         self._bindings: dict[str, VoiceAssignment] = {}
         self._lock = RLock()

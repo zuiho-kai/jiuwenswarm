@@ -125,7 +125,7 @@ class ConfigPanelInternalError(RuntimeError):
 WEB_CONFIG_RELOAD_CHANNEL_ID = "web"
 # Saved through config.save_all but never sent back to clients.
 WRITE_ONLY_CONFIG_KEYS = frozenset({
-    "jev_openrouter_api_key", "jev_typesafe_api_key", "meeting_feishu_app_secret",
+    "jev_openrouter_api_key", "jev_typesafe_api_key", "meeting_feishu_app_secret", "tts_api_key",
 })
 SEARCH_RELOAD_ENV_KEYS = {
     "BOCHA_API_KEY", "PERPLEXITY_API_KEY", "SERPER_API_KEY", "JINA_API_KEY",
@@ -178,6 +178,8 @@ ASR_ENV_KEYS = {
     "ASR_API_KEY",
     "ASR_MODEL_NAME",
     *SPEECH_START_ENV.values(),
+    "TTS_API_BASE", "TTS_API_KEY", "TTS_MODEL_NAME", "TTS_VOICE",
+    "TTS_PROVIDER",
 }
 
 
@@ -338,6 +340,11 @@ CONFIG_SET_ENV_MAP = {
     "asr_api_base": "ASR_API_BASE",
     "asr_api_key": "ASR_API_KEY",
     "asr_model": "ASR_MODEL_NAME",
+    "tts_api_base": "TTS_API_BASE",
+    "tts_api_key": "TTS_API_KEY",
+    "tts_model": "TTS_MODEL_NAME",
+    "tts_voice": "TTS_VOICE",
+    "tts_provider": "TTS_PROVIDER",
     "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
     "meeting_feishu_app_secret": "MEETING_FEISHU_APP_SECRET",
     **SPEECH_START_ENV,
@@ -1195,6 +1202,13 @@ def apply_config_payload(
         raise ConfigPanelBadRequest(
             "permissions_profile and permissions_enabled are mutually exclusive"
         )
+    if any(key.startswith("tts_") for key in params):
+        from jiuwenswarm.gateway.voice.config import validate_tts_update
+
+        try:
+            validate_tts_update(params)
+        except ValueError as exc:
+            raise ConfigPanelBadRequest(str(exc)) from exc
     params = encrypt_config_params(params)
     env_updates: dict[str, str] = {}
     yaml_updated: list[str] = []
@@ -1238,7 +1252,7 @@ def apply_config_payload(
                     f"{param_key} must be a positive integer or a value such as 256K or 1M"
                 )
             val = str(parsed_context_window)
-        if param_key.endswith("_provider") and val and val not in available_model_providers:
+        if param_key.endswith("_provider") and param_key != "tts_provider" and val and val not in available_model_providers:
             raise ConfigPanelBadRequest(f"Model provider must in: {available_model_providers} ")
         if val is None:
             env_updates[env_key] = ""
@@ -1519,6 +1533,9 @@ async def config_get_handler(
         param_key: "" if param_key in WRITE_ONLY_CONFIG_KEYS else (os.getenv(env_key) or "")
         for param_key, env_key in CONFIG_SET_ENV_MAP.items()
     }
+    from jiuwenswarm.gateway.voice.config import tts_panel_defaults
+
+    payload.update(tts_panel_defaults())
     payload["meeting_feishu_configured"] = "true" if (
         os.getenv("MEETING_FEISHU_APP_ID") and os.getenv("MEETING_FEISHU_APP_SECRET")
     ) else "false"

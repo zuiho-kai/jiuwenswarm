@@ -1,4 +1,8 @@
-"""Qwen Omni supplied-text synthesis over the shared provider connection.
+"""Provider-independent supplied-text TTS and the retained Qwen Omni adapter.
+
+``TtsSession`` selects a provider from the dedicated TTS settings and exposes
+``start``, ``synthesize(text, voice)`` and ``aclose`` to consumers. Protocol
+details and credentials never belong to meeting playback.
 
 Use ``await QwenOmniTts().synthesize(text, voice="Tina")``. Each call owns an
 isolated session and returns complete 24 kHz, mono, 16-bit PCM WAV audio. Cancel
@@ -48,13 +52,13 @@ class TtsError(RuntimeError):
 @dataclass(frozen=True)
 class TtsAudio:
     audio: bytes
-    transcript: str
+    transcript: str | None
     voice: str
     model: str
     first_audio_ms: float
     synthesis_ms: float
     audio_mime: str = "audio/wav"
-    sample_rate: int = SAMPLE_RATE
+    sample_rate: int | None = SAMPLE_RATE
 
 
 def _normalized_text(text: str) -> str:
@@ -379,3 +383,31 @@ class QwenOmniTtsSession(QwenOmniTts):
                     except Exception:
                         pass
                 raise
+
+
+class TtsSession:
+    """One consumer-owned session, with explicit per-utterance voice selection."""
+
+    def __init__(self, config=None):
+        from .config import TtsConfig
+
+        self.config = config if config is not None else TtsConfig.from_environment()
+        self.config.validate()
+        if self.config.provider == "qwen_omni":
+            self._provider = QwenOmniTtsSession(qwen_omni.QwenOmniRealtimeConfig(
+                self.config.upstream_url, self.config.api_key, self.config.model, self.config.voice,
+            ))
+        else:
+            from .providers.cosyvoice import CosyVoiceTtsSession
+
+            self._provider = CosyVoiceTtsSession(self.config)
+
+    async def start(self) -> None:
+        await self._provider.start()
+
+    async def synthesize(self, text: str, voice: str) -> TtsAudio:
+        self.config.validate_voice(voice)
+        return await self._provider.synthesize(text, voice)
+
+    async def aclose(self) -> None:
+        await self._provider.aclose()

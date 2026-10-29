@@ -5376,9 +5376,9 @@ class AgentWebSocketServer:
                 playback_payload = await manager.prepare_browser_playback(
                     session_id, str(params.get("meeting_id") or ""), owner_id=owner_id,
                     startup_id=startup_id or "", route_id=str(params.get("_meeting_route_id") or ""),
-                    model=str(params.get("_qwen_model") or ""),
-                    config_revision=str(params.get("_qwen_revision") or ""),
-                    default_voice=str(params.get("_qwen_default_voice") or ""), emit=emit,
+                    model=str(params.get("_tts_model") or ""),
+                    config_revision=str(params.get("_tts_revision") or ""),
+                    default_voice=str(params.get("_tts_default_voice") or ""), emit=emit,
                 )
             elif request.req_method == ReqMethod.MEETING_INPUT_PREPARE:
                 playback_payload = await manager.prepare_human_input(

@@ -383,6 +383,10 @@ def get_panel() -> dict[str, Any]:
         for param_key, env_key in _CONFIG_SET_ENV_MAP.items()
     }
     payload["meeting_feishu_app_secret"] = ""
+    from jiuwenswarm.gateway.voice.config import tts_panel_defaults
+
+    payload.update(tts_panel_defaults())
+    payload["tts_api_key"] = ""
     payload["meeting_feishu_configured"] = "true" if (
         os.getenv("MEETING_FEISHU_APP_ID") and os.getenv("MEETING_FEISHU_APP_SECRET")
     ) else "false"

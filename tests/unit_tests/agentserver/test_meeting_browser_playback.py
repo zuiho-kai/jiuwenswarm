@@ -1,4 +1,4 @@
-"""Real SDK/SQLite grants through Gateway routing, with controlled Qwen audio."""
+"""Real SDK/SQLite grants through Gateway routing, with controlled CosyVoice audio."""
 
 import asyncio
 import json
@@ -13,20 +13,21 @@ from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.server import agent_ws_server as server_module
 from jiuwenswarm.extensions.meeting.playback import IDENTITY_FIELDS
 from jiuwenswarm.gateway.channel_manager.web.app_web_handlers import WebHandlersBindParams, _register_web_handlers
-from jiuwenswarm.gateway.voice.providers.qwen_omni import QwenOmniRealtimeConfig
+from jiuwenswarm.gateway.voice.config import TtsConfig
 from tests.unit_tests.agentserver.test_meeting_publication import (
     meeting as meeting, publication_host as publication_host,
 )
 from tests.unit_tests.gateway.test_app_web_handlers import FakeWebChannel
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.parametrize("meeting", ["file"], indirect=True)]
+COSYVOICE_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
 
 
 @pytest.fixture
 async def browser(publication_host, monkeypatch, tmp_path):
     host = publication_host
-    config = QwenOmniRealtimeConfig("wss://example.invalid/realtime", "test-secret", "qwen3.8-omni-flash-realtime", "Tina")
-    monkeypatch.setattr(QwenOmniRealtimeConfig, "from_environment", staticmethod(lambda: config))
+    config = TtsConfig("https://example.invalid/v1", "test-secret", COSYVOICE_MODEL, f"{COSYVOICE_MODEL}:anna")
+    monkeypatch.setattr(TtsConfig, "from_environment", staticmethod(lambda: config))
     audio_calls = []
 
     class Tts:
@@ -45,7 +46,7 @@ async def browser(publication_host, monkeypatch, tmp_path):
             audio_calls.append((text, voice))
             return SimpleNamespace(audio=b"wav", audio_mime="audio/wav")
 
-    monkeypatch.setattr(gateway, "QwenOmniTtsSession", Tts)
+    monkeypatch.setattr(gateway, "TtsSession", Tts)
 
     sessions = tmp_path / "sessions"
     (sessions / "publication-session").mkdir(parents=True)
@@ -108,7 +109,7 @@ async def browser(publication_host, monkeypatch, tmp_path):
 
 
 async def activate(browser):
-    assert (await browser.call("meeting.playback.ready", {"_qwen_model": "forged", "_meeting_route_id": "forged"}))["ok"]
+    assert (await browser.call("meeting.playback.ready", {"_tts_model": "forged", "_meeting_route_id": "forged"}))["ok"]
     meeting = browser.host.manager._sessions[browser.base["session_id"]]
     return meeting.driver, meeting.driver.consumer
 
@@ -134,19 +135,19 @@ async def test_ready_gate_server_summary_and_per_member_voices(browser):
     assert (await browser.call("meeting.playback.ready"))["ok"]
     await queue(browser, driver, text="Sentence. " * 100)
     speech = await next_speech(browser)
-    assert speech["voice"] == "Tina" and speech["chunk_count"] == 2
+    assert speech["voice"] == f"{COSYVOICE_MODEL}:anna" and speech["chunk_count"] == 2
     assert "".join(speech["chunks"]) == ("Sentence. " * 100).strip()
     for index in range(speech["chunk_count"]):
         assert (await browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": index}))["ok"]
     assert (await driver.coordinator.get_speaker()).request_id == speech["request_id"]
     assert [call[0] for call in browser.audio_calls] == speech["chunks"]
-    assert all(call[1] == "Tina" for call in browser.audio_calls)
+    assert all(call[1] == f"{COSYVOICE_MODEL}:anna" for call in browser.audio_calls)
     await queue(browser, driver, "analyst")
     assert not (await browser.call("meeting.playback.result", {**identity(speech), "outcome": "completed", "completed_chunks": 1}))["ok"]
     receipt = {**identity(speech), "outcome": "completed", "completed_chunks": speech["chunk_count"]}
     assert (await browser.call("meeting.playback.result", receipt))["ok"]
     second = await next_speech(browser)
-    assert second["voice"] == "Serena"
+    assert second["voice"] == f"{COSYVOICE_MODEL}:bella"
     assert (await browser.call("meeting.playback.result", receipt))["ok"]
     assert not (await browser.call("meeting.playback.result", {**receipt, "outcome": "stopped"}))["ok"]
     assert (await browser.call("meeting.speech.synthesize", {**identity(second), "chunk_index": 0}))["ok"]
@@ -194,7 +195,7 @@ async def test_stop_drains_synthesis_before_receipt_and_discards_late_audio(brow
                 await asyncio.sleep(0)
                 drained.set()
 
-    monkeypatch.setattr(gateway, "QwenOmniTtsSession", Tts)
+    monkeypatch.setattr(gateway, "TtsSession", Tts)
     driver, consumer = await activate(browser)
     await queue(browser, driver)
     speech = await next_speech(browser)
@@ -223,11 +224,11 @@ async def test_failed_audio_skips_only_that_speech_and_reuses_the_meeting(browse
     failed_tts = route.tts
 
     async def fail_synthesis(*args):
-        raise TtsError("TEXT_MISMATCH", "Qwen did not read the supplied text faithfully")
+        raise TtsError("INVALID_AUDIO", "CosyVoice2 returned incomplete WAV audio")
 
     monkeypatch.setattr(failed_tts, "synthesize", fail_synthesis)
     error = await browser.call("meeting.speech.synthesize", {**identity(first), "chunk_index": 0})
-    assert not error["ok"] and error["code"] == "TEXT_MISMATCH"
+    assert not error["ok"] and error["code"] == "INVALID_AUDIO"
     receipt = {**identity(first), "outcome": "failed", "completed_chunks": 0}
     assert (await browser.call("meeting.playback.result", receipt))["ok"]
     second = await next_speech(browser)
@@ -294,58 +295,32 @@ async def test_failed_audio_discards_a_late_speech_text_fetch(browser, monkeypat
     assert (await browser.call("meeting.speech.synthesize", {**identity(second), "chunk_index": 0}))["ok"]
 
 
-async def test_meeting_reuses_warm_connection_and_end_drains_it(browser, monkeypatch):
+async def test_end_during_http_synthesis_cancels_and_closes_the_response(browser, monkeypatch):
+    import httpx
     from jiuwenswarm.gateway.voice import tts
-    from tests.unit_tests.gateway.test_qwen_omni_session import provider
+    from tests.unit_tests.gateway.test_cosyvoice_tts import mock_provider
 
-    sockets = provider(monkeypatch)
-    monkeypatch.setattr(gateway, "QwenOmniTtsSession", tts.QwenOmniTtsSession)
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            entered.set()
+            await asyncio.Future()
+            yield b""
+
+        async def aclose(self):
+            closed.set()
+
+    clients = mock_provider(monkeypatch, lambda _: httpx.Response(200, stream=Stream()))
+    monkeypatch.setattr(gateway, "TtsSession", tts.TtsSession)
     driver, _ = await activate(browser)
-    assert len(sockets) == 1 and sockets[0].turns == 0
-    await queue(browser, driver, text="Sentence. " * 100)
+    await queue(browser, driver)
     speech = await next_speech(browser)
-    ending = None
-    route = next(iter(browser.ws._meeting_playback_routes.values()))
-    try:
-        for index in range(speech["chunk_count"]):
-            result = await asyncio.wait_for(browser.call("meeting.speech.synthesize", {
-                **identity(speech), "chunk_index": index,
-            }), 3)
-            assert result["ok"] and result["payload"]["audio_base64"]
-        assert len(sockets) == 1 and sockets[0].turns == speech["chunk_count"]
-        assert not route.tasks and not sockets[0].closed
-        sockets[0].finish_close.clear()
-        ending = asyncio.create_task(browser.call("meeting.end"))
-        async with asyncio.timeout(3):
-            while not route.revoked or not any(event == "meeting.playback.stop" for _, event, _ in browser.channel.events):
-                await asyncio.sleep(0)
-        await asyncio.wait_for(sockets[0].close_started.wait(), 1)
-        assert not ending.done()  # Browser stop can proceed while upstream close drains.
-    finally:
-        sockets[0].finish_close.set()
-        if ending is not None:
-            assert (await asyncio.wait_for(ending, 3))["ok"]
-    assert sockets[0].closed
-
-
-async def test_end_during_provider_warmup_cancels_and_closes_the_connection(browser, monkeypatch):
-    from jiuwenswarm.gateway.voice import tts
-    from tests.unit_tests.gateway.test_qwen_omni_session import RealtimeSocket, provider
-
-    def factory():
-        socket = RealtimeSocket()
-        socket.events.get_nowait()  # Hold session.created until startup is cancelled.
-        return socket
-
-    sockets = provider(monkeypatch, factory)
-    monkeypatch.setattr(gateway, "QwenOmniTtsSession", tts.QwenOmniTtsSession)
-    ready = asyncio.create_task(browser.call("meeting.playback.ready"))
-    async with asyncio.timeout(3):
-        while not sockets or not sockets[0].readers:
-            await asyncio.sleep(0)
+    synthesis = asyncio.create_task(browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": 0}))
+    await asyncio.wait_for(entered.wait(), 3)
     assert (await asyncio.wait_for(browser.call("meeting.end"), 3))["ok"]
-    assert not (await asyncio.wait_for(ready, 3))["ok"]
-    assert sockets[0].closed and not browser.ws._meeting_playback_routes
+    assert not (await asyncio.wait_for(synthesis, 3))["ok"]
+    assert closed.is_set() and clients[0].is_closed and not browser.ws._meeting_playback_routes
 
 
 async def test_missing_stop_receipt_retains_cleanup_failure_until_explicit_retry(browser):
@@ -359,3 +334,24 @@ async def test_missing_stop_receipt_retains_cleanup_failure_until_explicit_retry
     assert not (await browser.call("meeting.playback.stopped", {"stop_id": "foreign"}))["ok"]
     assert (await browser.call("meeting.playback.stopped", stop))["ok"]
     assert (await browser.call("meeting.end"))["ok"]
+
+
+async def test_meeting_uses_qwen_through_the_same_tts_interface(browser, monkeypatch):
+    from jiuwenswarm.gateway.voice.tts import TtsSession
+    from tests.unit_tests.gateway.test_qwen_tts import provider
+
+    config = TtsConfig("wss://tts.example/realtime", "tts-key", "qwen3.8-omni-flash-realtime", "Tina", "qwen_omni")
+    monkeypatch.setattr(TtsConfig, "from_environment", staticmethod(lambda: config))
+    sockets = provider(monkeypatch)
+    monkeypatch.setattr(gateway, "TtsSession", TtsSession)
+    driver, _ = await activate(browser)
+    await queue(browser, driver)
+    speech = await next_speech(browser)
+    assert speech["voice"] == "Tina"
+    response = await browser.call("meeting.speech.synthesize", {**identity(speech), "chunk_index": 0})
+    assert response["ok"] and response["payload"]["audio_mime"] == "audio/wav"
+    assert (await browser.call("meeting.playback.result", {
+        **identity(speech), "outcome": "completed", "completed_chunks": 1,
+    }))["ok"]
+    assert (await browser.call("meeting.end"))["ok"]
+    assert len(sockets) == 1 and sockets[0].closed
