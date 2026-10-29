@@ -173,13 +173,20 @@ def manual_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_manual_connection_waits_for_socket_and_disconnects_only_its_app(manual_connection):
+async def test_manual_connection_waits_for_socket_and_disconnects_only_its_app(manual_connection, monkeypatch):
+    from jiuwenswarm.common.security import base_crypto
+
+    monkeypatch.setenv("MEETING_FEISHU_APP_SECRET", "encoded:test-secret")
+    monkeypatch.setattr(base_crypto, "get_crypto_provider", lambda: SimpleNamespace(
+        decrypt=lambda value: value.removeprefix("encoded:"),
+    ))
     connection, manager = manual_connection
     other = SimpleNamespace(channel_id="feishu", app_id="other-app", on_message=Mock())
     manager.register_channel(other)
     pending = asyncio.create_task(connection.connect(manager))
     await asyncio.sleep(0)
     channel = connection.channel
+    assert channel.config.app_secret == "test-secret"
     assert connection.status(manager) == {"state": "connecting"}
     assert not pending.done()
     channel.ready.set()
@@ -287,3 +294,42 @@ async def test_manual_rpc_does_not_auto_connect_or_expose_sdk_errors(manual_conn
     assert response["ok"] is False
     assert response["code"] == "FEISHU_CONNECTION_ERROR"
     assert "test-secret" not in str(response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", [False, True])
+async def test_saved_secret_is_returned_for_editing_after_reload(monkeypatch, tmp_path, encrypted):
+    from dotenv import dotenv_values
+    from jiuwenswarm.common.config_panel import config_set_handlers as handlers
+    from jiuwenswarm.common.security import base_crypto
+    from jiuwenswarm.server.control import config_service
+
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(handlers, "ENV_FILE", env_file)
+    monkeypatch.setattr(handlers, "get_config_raw", lambda: {})
+    monkeypatch.setattr(handlers, "get_config", lambda: {})
+    monkeypatch.setattr(config_service, "_read_raw_config", lambda: {})
+    crypto = SimpleNamespace(
+        encrypt=lambda value: "encoded:" + value,
+        decrypt=lambda value: value.removeprefix("encoded:"),
+    ) if encrypted else None
+    monkeypatch.setattr(handlers, "_get_crypto_provider", lambda: crypto)
+    monkeypatch.setattr(base_crypto, "get_crypto_provider", lambda: crypto)
+    for key in ("MEETING_FEISHU_APP_ID", "MEETING_FEISHU_APP_SECRET"):
+        monkeypatch.setenv(key, "")
+    for secret in ("first-secret", "replacement-secret", ""):
+        handlers.apply_config_payload({
+            "meeting_feishu_app_id": "meeting-app" if secret else "",
+            "meeting_feishu_app_secret": secret,
+        })
+        # Read persisted values as a restarted process would.
+        stored = dotenv_values(env_file)
+        for key, value in stored.items():
+            monkeypatch.setenv(key, value or "")
+        if encrypted and secret:
+            assert stored["MEETING_FEISHU_APP_SECRET"] == "encoded:" + secret
+        web = SimpleNamespace(send_response=AsyncMock())
+        await handlers.config_get_handler(web, None, "read", {}, None)
+        for panel in (web.send_response.call_args.kwargs["payload"], config_service.get_panel()):
+            assert panel["meeting_feishu_app_secret"] == secret
+            assert panel["meeting_feishu_configured"] == ("true" if secret else "false")

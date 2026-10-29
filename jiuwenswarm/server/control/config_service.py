@@ -87,6 +87,7 @@ _CONFIG_SET_ENV_MAP = {
     "perplexity_api_key": "PERPLEXITY_API_KEY",
     "github_token": "GITHUB_TOKEN",
     "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
+    "meeting_feishu_app_secret": "MEETING_FEISHU_APP_SECRET",
     "teamskills_market_url": "TEAM_SKILLS_HUB_BASE_URL",
     "teamskills_user_token": "TEAM_SKILLS_HUB_USER_TOKEN",
     "teamskills_system_token": "TEAM_SKILLS_HUB_SYSTEM_TOKEN",
@@ -382,7 +383,11 @@ def get_panel() -> dict[str, Any]:
         param_key: (os.getenv(env_key) or "")
         for param_key, env_key in _CONFIG_SET_ENV_MAP.items()
     }
-    payload["meeting_feishu_app_secret"] = ""
+    from jiuwenswarm.common.security.base_crypto import get_crypto_provider
+
+    crypto = get_crypto_provider()
+    if crypto is not None and payload["meeting_feishu_app_secret"]:
+        payload["meeting_feishu_app_secret"] = crypto.decrypt(payload["meeting_feishu_app_secret"])
     from jiuwenswarm.gateway.voice.config import tts_panel_defaults
 
     payload.update(tts_panel_defaults())

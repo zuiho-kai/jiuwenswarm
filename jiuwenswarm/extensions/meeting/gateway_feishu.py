@@ -40,6 +40,11 @@ class MeetingFeishuConnection:
     async def connect(self, manager):
         app_id = os.getenv("MEETING_FEISHU_APP_ID", "").strip()
         secret = os.getenv("MEETING_FEISHU_APP_SECRET", "").strip()
+        from jiuwenswarm.common.security.base_crypto import get_crypto_provider
+
+        crypto = get_crypto_provider()
+        if secret and crypto is not None:
+            secret = crypto.decrypt(secret)
         if not app_id or not secret:
             raise ValueError("Configure the meeting Feishu App ID and App Secret first.")
         if (

@@ -68,9 +68,7 @@ export function MeetingFeishuSetting({ disabled }: SettingsCustomItemProps) {
 
   const saveCredentials = async (updates: Record<string, string>, operation: string) => {
     const result = await save(updates, operation);
-    // Config reads return only status, never the saved App Secret.
     patchLocal({
-      meeting_feishu_app_secret: '',
       meeting_feishu_configured: Boolean(updates.meeting_feishu_app_id && updates.meeting_feishu_app_secret),
     });
     return result;
