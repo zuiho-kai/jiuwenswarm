@@ -8,6 +8,28 @@ from .config import DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT
 
 
 SECTION_NAME = "meeting_publication"
+_FORWARD = {
+    "en": (
+        "Only the Leader may use send_message, solely to directly forward a complete message "
+        "from the user to its intended other agent(s). Copy the entire user message verbatim; "
+        "do not summarize, paraphrase, omit details, or append your own instructions. "
+        "Never use send_message for your own delegation, coordination, follow-up, question, "
+        "answer, report, acknowledgement, or summary. In every other case use "
+        "meeting_post_message(content, speech_text, mentions), including messages addressed "
+        "to another agent. Selecting addressed_members does not authorize other uses. "
+        "Set the intended recipients with meeting_set_addressed_members first; use to for "
+        "one agent or targets for several. No sends to user, the Leader, or broadcasts."
+    ),
+    "cn": (
+        "只有 Leader 可以使用 send_message，且仅用于把用户的一条完整消息直接转发给该消息的目标成员。"
+        "content 必须逐字保留用户的整条消息，不得总结、改写、删减或附加自己的指令。"
+        "不得用 send_message 发送 Leader 自己的任务分派、协调、跟进、问题、回答、报告、确认或总结。"
+        "其他任何情况都必须使用 meeting_post_message(content, speech_text, mentions)，"
+        "包括发给其他成员的消息。设置 addressed_members 不代表可以用于其他用途。"
+        "先通过 meeting_set_addressed_members 设置目标，单人使用 to，多人使用 targets。"
+        "不得发送给 user、Leader 或广播。"
+    ),
+}
 _ROLE = {
     "en": (
         "A coordinated meeting is active. Its publication rules replace ordinary "
@@ -25,6 +47,8 @@ _ROLE = {
         "Use the current roster for recipients; membership "
         "is not fixed by meeting startup. Task-board events and permission approvals "
         "keep their existing control paths. "
+        "When answering a user message forwarded by the Leader, use meeting_post_message "
+        "with mentions containing user and the actual Leader member_name. "
         "When clarification is needed, ask the human directly with meeting_post_message, "
         "mentions=[\"user\"], and a concise speech_text containing the question. "
         "The human recipient is user; do not create a user agent or use send_message for "
@@ -42,6 +66,7 @@ _ROLE = {
         "先用上下文已有的消息摘录和名册，不要把浏览工作区目录、scope 文件或历史文件当作启动清单。"
         "只有用户请求确实缺少特定上下文时才补读历史。根据当前名册选择接收者，会议启动不会固定成员。"
         "任务板事件和权限审批保留原有控制通道。"
+        "回答 Leader 转发的用户消息时，使用 meeting_post_message，mentions 同时包含 user 和实际 Leader 的 member_name。"
         "需要澄清时，直接用 meeting_post_message 向真人提问，mentions 包含 user，"
         "speech_text 简短说清问题。真人接收者就是 user，不要创建 user agent，"
         "也不要用 send_message 向真人提问。队员还应点名实际 Leader，以便转交回答。"
@@ -65,18 +90,15 @@ _LEADER = {
         "Do not invent specialist roles or tasks for a simple invitation. For a particular "
         "existing expert, human, or ambiguous identity, ask the human for clarification.\n\n"
         "If the human answers a teammate's pending question, route the answer back to that "
-        "teammate using the addressed-member and send_message flow below. Preserve the "
-        "answer and its constraints; clarify if the intended question is unclear.\n\n"
+        "teammate by forwarding the complete user message unchanged as described below. "
+        "Clarify if the intended question is unclear.\n\n"
         "When the human addresses another member:\n"
         "- Resolve the intended recipient against the current roster and use its member_name. "
         "A name merely quoted or discussed is not an instruction to contact that member.\n"
         "- Set meeting_set_addressed_members(member_names) to the intended recipients, then relay "
-        "the original request with send_message(to, content), or targets for multiple recipients. "
-        "Preserve the human's meaning, constraints, and requested output; add only the context "
-        "the recipient needs. Do not invent extra work.\n"
-        "- Ask the recipient to answer through meeting_post_message with mentions containing "
-        "user and your actual Leader member_name. This lets the human hear the answer and lets "
-        "you manage priority silently.\n"
+        "the complete user message verbatim with send_message(to, content), or targets for multiple "
+        "recipients. Do not turn it into your own task instructions or add reply instructions. "
+        "Recipients already follow the meeting reply rules.\n"
         "- After a successful send, end your turn silently. Do not call meeting_post_message "
         "to announce forwarding, confirm delivery, repeat the request, or promise an answer. "
         "For 'A, can you respond to me', let A be the next agent to answer the human. "
@@ -108,15 +130,13 @@ _LEADER = {
         "保留 display_name，member_name 使用小写标识。宿主已满足 build_team 前置条件，"
         "直接调用 spawn_teammate。简单邀请不需要虚构专业角色或创建任务。"
         "如果指特定的已有专家、真人或身份不明确，向真人提出澄清问题。\n\n"
-        "用户回答队员待答复的问题时，按下述点名路由流程把回答转交该队员，"
-        "保留回答及约束；不清楚回答哪个问题时先澄清。\n\n"
+        "用户回答队员待答复的问题时，按下述流程把用户的整条消息原样转发给该队员；"
+        "不清楚回答哪个问题时先澄清。\n\n"
         "用户点名其他成员时：\n"
         "- 根据当前名册确定目标，使用其 member_name；仅引用或讨论某个名字不等于要求联系该成员。\n"
         "- 先用 meeting_set_addressed_members(member_names) 设置目标，再用 send_message(to, content) "
-        "转交原始请求；多人使用 targets。保留用户原意、约束和所需输出，只补充目标执行所必需的背景，"
-        "不要擅自增加任务。\n"
-        "- 请目标通过 meeting_post_message 答复，mentions 同时包含 user 和你实际的 Leader member_name，"
-        "让用户直接听到回答，也让你能静默管理优先级。\n"
+        "逐字转发用户的整条消息；多人使用 targets。不要改写成自己的任务指令，也不要附加答复指令，"
+        "接收成员已有会议答复规则。\n"
         "- 发送成功后静默结束本轮。不要调用 meeting_post_message 宣布转交、确认送达、复述请求或承诺答复。"
         "例如用户说‘A，回答我’，让 A 成为下一个回答用户的成员。不要重复成功的转交，也不要轮询结果。\n\n"
         "显式管理发言优先级：\n"
@@ -170,13 +190,20 @@ _HISTORY = {
 def build_meeting_role_section(*, leader: bool) -> PromptSection:
     return PromptSection(
         name=SECTION_NAME,
-        content={language: text + (_LEADER[language] if leader else "") for language, text in _ROLE.items()},
+        content={
+            language: text + ("\n\n" + _FORWARD[language] + _LEADER[language] if leader else "")
+            for language, text in _ROLE.items()
+        },
         priority=SystemPromptPriority.MEETING_PUBLICATION,
     )
 
 
 def summary_contract(language: str) -> str:
     return _SUMMARY["cn" if language in {"cn", "zh"} else "en"]
+
+
+def forwarding_contract(language: str) -> str:
+    return _FORWARD["cn" if language in {"cn", "zh"} else "en"]
 
 
 def history_contract(language: str) -> str:

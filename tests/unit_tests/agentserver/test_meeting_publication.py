@@ -101,13 +101,15 @@ class _OrdinarySend(TeamTool):
         return ToolOutput(success=True, data={"sent": True})
 
 
-async def _native(meeting, monkeypatch, member="leader", *, max_iterations=8, participant=False, progressive=False):
+async def _native(
+    meeting, monkeypatch, member="leader", *, max_iterations=8, participant=False, progressive=False, language="en",
+):
     agent = ReActAgent(card=AgentCard(id=uuid4().hex, name="meeting-native"))
     agent.configure(ReActAgentConfig(model_name="fake", max_iterations=max_iterations))
     if progressive:
         # Mirror native DeepAgent registration and the production disclosure rail.
         agent.ability_manager.set_tool_exposure_policy(True, direct_tool_names={"read_file"})
-    agent.system_prompt_builder = SystemPromptBuilder(language="en")
+    agent.system_prompt_builder = SystemPromptBuilder(language=language)
     agent.prompt_builder = agent.system_prompt_builder
     agent.system_prompt_builder.add_section(PromptSection("existing", {"en": "Keep existing role guidance."}))
     if member == "leader":
@@ -138,7 +140,7 @@ async def _native(meeting, monkeypatch, member="leader", *, max_iterations=8, pa
         ))
         rail = build_meeting_participant({}, context)
     else:
-        rail = await create_meeting_publication_rail(meeting.coordinator, member)
+        rail = await create_meeting_publication_rail(meeting.coordinator, member, language=language)
     await agent.register_rail(rail)
     if progressive:
         from jiuwenswarm.agents.harness.common.rails.tool_retrieval_prompt_rail import ToolRetrievalPromptRail
@@ -314,6 +316,33 @@ async def test_production_provider_mounts_meeting_tools_and_leader_only_routing(
     assert wakeups == ["queued", "queued"]
     assert not meeting.conversation.history_path.exists()
     assert await meeting.db.message.get_team_messages("publication-team") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["en", "cn"])
+async def test_leader_prompt_and_send_schema_share_complete_user_forwarding_rule(native_factory, language):
+    from jiuwenswarm.extensions.meeting.prompts import forwarding_contract
+
+    native = await native_factory(language=language)
+    native.model.invoke.return_value = AssistantMessage(content="")
+    await native.agent.invoke({"query": "Assess the proposal"}, session=native.session)
+    prompt = native.agent.system_prompt_builder.build()
+    tools = {tool.name: tool for tool in native.model.invoke.call_args.kwargs["tools"]}
+    contract = forwarding_contract(language)
+    assert contract in prompt and tools["send_message"].description == contract
+    if language == "en":
+        assert "Copy the entire user message verbatim" in contract
+        assert "Never use send_message for your own delegation" in contract
+        assert "In every other case use meeting_post_message" in contract
+        assert "For 'A, can you respond to me'" in prompt
+        assert "add only the context" not in prompt
+    else:
+        assert "content 必须逐字保留用户的整条消息" in contract
+        assert "其他任何情况都必须使用 meeting_post_message" in contract
+        assert "只补充目标执行所必需的背景" not in prompt
+    original_description = native.rail._send_settings[2]
+    native.rail.uninit(native.agent)
+    assert native.ordinary["send_message"].card.description == original_description
 
 
 @pytest.mark.asyncio

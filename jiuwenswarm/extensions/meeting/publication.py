@@ -28,7 +28,7 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
 from .config import DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT
-from .prompts import SECTION_NAME, build_meeting_role_section, history_contract, summary_contract
+from .prompts import SECTION_NAME, build_meeting_role_section, forwarding_contract, history_contract, summary_contract
 
 logger = logging.getLogger(__name__)
 _POST = "meeting_post_message"
@@ -227,13 +227,7 @@ class MeetingPublicationRail(DeepAgentRail):
                 self._send_settings = (card.exposure, card.get_exposure_declared(), card.description)
                 card.exposure = ToolExposure.DIRECT
                 card.set_exposure_declared(True)
-                card.description = (
-                    "Silently relay the human's request to the agents in addressed_members. "
-                    "Set them with meeting_set_addressed_members first. Use to for one agent "
-                    "or targets for several; preserve the request and ask them to reply through "
-                    "meeting_post_message to user and the Leader for silent priority cleanup. "
-                    "No user messages or broadcasts: use meeting_post_message for spoken discussion."
-                )
+                card.description = forwarding_contract(self.language)
         for tool in self._tools.values():
             agent.ability_manager.add_ability(tool.card, tool)
         builder.add_section(build_meeting_role_section(leader=self._leader))
@@ -343,11 +337,7 @@ class MeetingPublicationRail(DeepAgentRail):
                 or any(not isinstance(name, str) or name.strip() in {"user", "*", state.leader_member_name}
                        or name.strip() not in state.addressed_members for name in recipients)
             ):
-                message = (
-                    "Silent send_message is only for currently addressed agents. "
-                    "Set them with meeting_set_addressed_members first. "
-                    "Use meeting_post_message for user replies, broadcasts, and spoken discussion."
-                )
+                message = forwarding_contract(self.language)
         elif self._blocked_tool(inputs.tool_name):
             message = (
                 "The host has already built this Team. Use the existing roster; do not call build_team again."

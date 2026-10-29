@@ -125,7 +125,7 @@ class ConfigPanelInternalError(RuntimeError):
 WEB_CONFIG_RELOAD_CHANNEL_ID = "web"
 # Saved through config.save_all but never sent back to clients.
 WRITE_ONLY_CONFIG_KEYS = frozenset({
-    "jev_openrouter_api_key", "jev_typesafe_api_key", "tts_api_key",
+    "jev_openrouter_api_key", "jev_typesafe_api_key",
 })
 SEARCH_RELOAD_ENV_KEYS = {
     "BOCHA_API_KEY", "PERPLEXITY_API_KEY", "SERPER_API_KEY", "JINA_API_KEY",

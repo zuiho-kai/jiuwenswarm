@@ -88,6 +88,7 @@ _CONFIG_SET_ENV_MAP = {
     "github_token": "GITHUB_TOKEN",
     "meeting_feishu_app_id": "MEETING_FEISHU_APP_ID",
     "meeting_feishu_app_secret": "MEETING_FEISHU_APP_SECRET",
+    "tts_api_key": "TTS_API_KEY",
     "teamskills_market_url": "TEAM_SKILLS_HUB_BASE_URL",
     "teamskills_user_token": "TEAM_SKILLS_HUB_USER_TOKEN",
     "teamskills_system_token": "TEAM_SKILLS_HUB_SYSTEM_TOKEN",
@@ -386,12 +387,13 @@ def get_panel() -> dict[str, Any]:
     from jiuwenswarm.common.security.base_crypto import get_crypto_provider
 
     crypto = get_crypto_provider()
-    if crypto is not None and payload["meeting_feishu_app_secret"]:
-        payload["meeting_feishu_app_secret"] = crypto.decrypt(payload["meeting_feishu_app_secret"])
+    if crypto is not None:
+        for key in ("meeting_feishu_app_secret", "tts_api_key"):
+            if payload[key]:
+                payload[key] = crypto.decrypt(payload[key])
     from jiuwenswarm.gateway.voice.config import tts_panel_defaults
 
     payload.update(tts_panel_defaults())
-    payload["tts_api_key"] = ""
     payload["meeting_feishu_configured"] = "true" if (
         os.getenv("MEETING_FEISHU_APP_ID") and os.getenv("MEETING_FEISHU_APP_SECRET")
     ) else "false"

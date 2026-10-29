@@ -21,7 +21,10 @@ unmentioned message. This selector leaves SDK delivery and evaluation unchanged;
 under the current SDK, unmentioned group messages are retained as context.
 
 With Leader routing, the Leader uses the existing `send_message` tool to relay
-requests silently to human-addressed agents. There is no separate forwarding
+complete user messages verbatim to their intended agents. It must not summarize,
+paraphrase, omit details, or append its own instructions. All other communication,
+including the Leader's own delegation, coordination, follow-ups, questions and
+reports, must use `meeting_post_message`. There is no separate forwarding
 tool. The Leader first selects those agents with
 `meeting_set_addressed_members(member_names)`, then uses `send_message(to, content)`
 (or its existing `targets` form) to pass on the request without speech. Silent
@@ -31,7 +34,7 @@ discussion still go through `meeting_post_message` and the speaking queue.
 The priority list is controlled explicitly by the Leader: replace it when focus
 changes and clear it with `[]` when the exchange ends, is abandoned, or discussion
 becomes general. Sending and playback do not reset it or interrupt the current
-speaker. The Leader asks the target to reply to both user and Leader so priority
+speaker. The target follows meeting guidance to reply to both user and Leader so priority
 can be cleared silently. No spoken handoff, delivery acknowledgement, or redundant
 summary is needed. Clarification, routing failure, or a substantive issue may
 require intervention. Recipient selection uses the evolving roster; automatic
@@ -133,7 +136,7 @@ lease and playback identity. The browser calls `meeting.speech.synthesize` with
 that identity and a chunk index; it cannot override text, model or voice. Gateway
 resolves the canonical chunk on AgentServer, synthesizes it using the selected TTS provider,
 then rechecks the lease/configuration before returning audio.
-Credentials stay on Gateway. Configure **Settings > Experimental > Speech synthesis**:
+TTS requests run on Gateway. Configure **Settings > Experimental > Speech synthesis**:
 
 ```dotenv
 TTS_PROVIDER=cosyvoice
@@ -155,8 +158,8 @@ key, model and default voice. Both providers read the same `TTS_API_BASE`,
 `TTS_API_KEY`, `TTS_MODEL_NAME` and `TTS_VOICE` settings; the provider selects the
 request protocol. Switching replaces these values together, with no additional
 provider-specific configuration fields. CosyVoice2 accepts a base URL or full
-`/audio/speech` endpoint; Qwen requires a WebSocket URL. The shared TTS API key
-is never returned by the settings APIs. Missing or invalid
+`/audio/speech` endpoint; Qwen requires a WebSocket URL. The settings editor
+pre-fills the saved TTS API key, masked by default with a visibility toggle. Missing or invalid
 settings fail explicitly without falling back to another provider.
 Restart the meeting after changing settings. Existing `QWEN_OMNI_*` configuration,
 catalog and adapter remain available for other consumers. Meeting TTS never

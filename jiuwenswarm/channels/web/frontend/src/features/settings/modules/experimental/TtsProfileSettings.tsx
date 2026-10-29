@@ -6,7 +6,6 @@ import { SettingItemRenderer } from '../../components/SettingItemRenderer';
 import type { SettingsCustomItemProps } from '../../registry/types';
 import { useSettingsServices } from '../../services/SettingsServicesProvider';
 import { useSettingsSource } from '../../services/SettingsSourceProvider';
-import { buildConfigSavePayload } from '../../services/settingsContract';
 import { AgentConfigDialog, type SaveConfig } from '../agent/AgentSettings';
 
 type VoiceCatalog = {
@@ -19,7 +18,7 @@ type VoiceCatalog = {
 
 export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
   const { t } = useTranslation();
-  const { isConnected, request, saveQueue } = useSettingsServices();
+  const { isConnected } = useSettingsServices();
   const source = useSettingsSource();
   const [editingUrl, setEditingUrl] = useState(false);
   const onUrlEditingChange = useCallback((_id: string, editing: boolean) => setEditingUrl(editing), []);
@@ -39,14 +38,12 @@ export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
   const busy =
     disabled ||
     !isConnected ||
-    ['tts_provider', 'tts_api_base', modelKey, voiceKey].some((key) => source.savingKeys.has(key));
-  // Keep the submitted credential out of the shared frontend settings state.
+    ['tts_provider', 'tts_api_base', keyField, modelKey, voiceKey].some((key) => source.savingKeys.has(key));
   const saveTts: SaveConfig = async (updates, operation) => {
-    const result = await saveQueue.enqueue(operation, () =>
-      request('config.save_all', buildConfigSavePayload(updates), { timeoutMs: 600_000 }),
-    );
-    const { tts_api_key: key, ...settings } = updates;
-    source.patchLocal({ ...settings, ...(key !== undefined ? { tts_key_configured: Boolean(key) } : {}) });
+    const result = await source.save(updates, operation);
+    if (updates.tts_api_key !== undefined) {
+      source.patchLocal({ tts_key_configured: Boolean(updates.tts_api_key) });
+    }
     return result;
   };
 
@@ -122,7 +119,7 @@ export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
         <AgentConfigDialog
           titleKey={keyTitle}
           fields={[keyField]}
-          config={{}}
+          config={source.values}
           save={saveTts}
           onClose={() => setConfiguringKey(false)}
         />
