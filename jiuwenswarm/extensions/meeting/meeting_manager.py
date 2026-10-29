@@ -564,6 +564,27 @@ class MeetingManager:
             )
         if task is not None:
             await asyncio.shield(task)
+        # A stopped Team has no chat stream left to correct a stale busy flag.
+        # Reconcile only this ended meeting; an active/resuming Team owns its
+        # own processing status and must not be marked idle here.
+        if (
+            not self._team_manager.is_runtime_active(session_id)
+            and not self._team_manager.is_runtime_pending(session_id)
+        ):
+            from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
+
+            await AgentWebSocketServer.get_instance().send_push({
+                "request_id": "",
+                "channel_id": "web",
+                "session_id": session_id,
+                "payload": {
+                    "event_type": "chat.processing_status",
+                    "session_id": session_id,
+                    "is_processing": False,
+                    "is_complete": True,
+                },
+                "is_complete": False,
+            })
         return True
 
     async def lifecycle_status(
