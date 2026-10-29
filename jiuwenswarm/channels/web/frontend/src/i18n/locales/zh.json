@@ -529,6 +529,7 @@
       "providerTypesafe": "TypeSafe"
     },
     "experimental": {
+      "tts": "语音合成",
       "taskAsr": "语音转写",
       "taskFullDuplex": "任务对话全双工",
       "externalCliAgents": "三方 Agent",
@@ -544,6 +545,11 @@
       "proactiveLimits": "推荐频率限制",
       "proactiveLimitsDescription": "每天最多 {{daily}} 条，每次检查 {{rounds}} 轮对话。",
       "proactiveLimitsDisabledDescription": "开启主动推荐后可设置。当前保存值：每天最多 {{daily}} 条，每次检查 {{rounds}} 轮对话。"
+    },
+    "tts": {
+      "switchTitle": "配置所选语音合成服务",
+      "cosyvoice": "CosyVoice2",
+      "qwen": "Qwen Omni"
     },
     "taskAsr": {
       "dialogTitle": "配置语音转写模型",
@@ -638,6 +644,30 @@
       },
       "meeting_feishu_app_secret": {
         "title": "App Secret"
+      },
+      "tts_provider": {
+        "title": "语音合成服务",
+        "description": "各服务使用同一组地址、密钥、模型和音色设置。切换时会替换这些值，之后请重新开始会议。"
+      },
+      "tts_api_base": {
+        "title": "语音合成 API 地址",
+        "description": "CosyVoice 填写 HTTP(S) 基础地址或 /audio/speech 地址，Qwen 填写实时 WebSocket 地址。",
+        "placeholder": "https://api.siliconflow.cn/v1"
+      },
+      "tts_api_key": {
+        "title": "语音合成 API 密钥",
+        "description": "已保存的密钥不会显示，输入新密钥可替换。与语音识别密钥独立配置。",
+        "placeholder": "输入 API 密钥"
+      },
+      "tts_model": {
+        "title": "语音合成模型",
+        "description": "用于朗读会议发言摘要的模型。",
+        "placeholder": "FunAudioLLM/CosyVoice2-0.5B"
+      },
+      "tts_voice": {
+        "title": "默认语音合成音色",
+        "description": "Leader 的默认音色，其他成员会分配同一模型的稳定音色。更改后请重新开始会议。",
+        "placeholder": "Anna"
       },
       "asr_api_base": {
         "title": "语音转写 API 地址",

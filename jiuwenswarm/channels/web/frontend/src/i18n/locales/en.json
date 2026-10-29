@@ -536,6 +536,7 @@
       "providerTypesafe": "TypeSafe"
     },
     "experimental": {
+      "tts": "Speech synthesis",
       "taskAsr": "Speech transcription",
       "taskFullDuplex": "Task chat full duplex",
       "externalCliAgents": "Third-Party Agents",
@@ -551,6 +552,11 @@
       "proactiveLimits": "Recommendation limits",
       "proactiveLimitsDescription": "Up to {{daily}} per day and {{rounds}} conversation rounds per check.",
       "proactiveLimitsDisabledDescription": "Enable proactive recommendations to configure these limits. Saved values: up to {{daily}} per day and {{rounds}} conversation rounds per check."
+    },
+    "tts": {
+      "switchTitle": "Configure the selected TTS provider",
+      "cosyvoice": "CosyVoice2",
+      "qwen": "Qwen Omni"
     },
     "taskAsr": {
       "dialogTitle": "Configure speech transcription model",
@@ -645,6 +651,30 @@
       },
       "meeting_feishu_app_secret": {
         "title": "App Secret"
+      },
+      "tts_provider": {
+        "title": "TTS provider",
+        "description": "Providers use the same URL, key, model and voice settings. Switching replaces these values. Restart the meeting afterward."
+      },
+      "tts_api_base": {
+        "title": "TTS API URL",
+        "description": "CosyVoice: HTTP(S) base URL or /audio/speech endpoint. Qwen: Realtime WebSocket URL.",
+        "placeholder": "https://api.siliconflow.cn/v1"
+      },
+      "tts_api_key": {
+        "title": "TTS API key",
+        "description": "Saved keys are hidden. Enter a key to replace it; ASR credentials are configured separately.",
+        "placeholder": "Enter API key"
+      },
+      "tts_model": {
+        "title": "TTS model",
+        "description": "Model used to read meeting summaries.",
+        "placeholder": "FunAudioLLM/CosyVoice2-0.5B"
+      },
+      "tts_voice": {
+        "title": "Default TTS voice",
+        "description": "Leader voice. Other members receive stable voices from the same model. Restart the meeting after changing settings.",
+        "placeholder": "Anna"
       },
       "asr_api_base": {
         "title": "Speech transcription API URL",

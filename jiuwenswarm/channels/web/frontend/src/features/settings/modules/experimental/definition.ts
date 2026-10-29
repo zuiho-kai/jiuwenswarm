@@ -12,6 +12,7 @@ import {
 import { A4PSettings } from './A4PSettings';
 import { MeetingRoutingSetting } from './MeetingRoutingSetting';
 import { MeetingFeishuSetting } from './MeetingFeishuSetting';
+import { TtsProfileSettings } from './TtsProfileSettings';
 
 export const experimentalModule: SettingsModuleDefinition = {
   id: 'experimental',
@@ -23,6 +24,11 @@ export const experimentalModule: SettingsModuleDefinition = {
       id: 'asr',
       titleKey: 'settingsPanel.experimental.taskAsr',
       items: [{ id: 'task-asr-enabled', component: 'custom', render: TaskAsrSetting }],
+    },
+    {
+      id: 'tts',
+      titleKey: 'settingsPanel.experimental.tts',
+      items: [{ id: 'tts-profile', component: 'custom', render: TtsProfileSettings }],
     },
     {
       id: 'task-full-duplex',
