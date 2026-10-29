@@ -8,6 +8,13 @@ THE OPEN SOURCE SOFTWARE IN THIS PRODUCT IS DISTRIBUTED IN THE HOPE THAT IT WILL
 
 ## Copyright Notice and License Texts
 
+### Bundled Silero VAD model
+
+`jiuwenswarm/resources/voice/silero_vad_v5.onnx` is the Silero v5 model distributed
+with `@ricky0123/vad-web` 0.0.30. Copyright (c) 2020-present Silero Team, MIT license.
+The complete license is included in `jiuwenswarm/resources/voice/LICENSE.silero`;
+model provenance and SHA256 are recorded in the adjacent `README.md`.
+
 ### Bundled Playwright MCP runtime
 
 The browser-free runtime archive contains the following production packages resolved by the tracked npm lockfile. It does not contain Chromium, Firefox, WebKit, or downloaded browser executables.

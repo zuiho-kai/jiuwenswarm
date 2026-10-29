@@ -55,12 +55,15 @@ startup flow reuse the message identity. The text editor, Send button, and Enter
 submission stay disabled until the existing startup and playback-ready handshake
 finish. The microphone starts transmitting only after that handshake.
 
-After confirmed speech, a pause automatically finishes the recording, transcribes
-it, and sends the text through normal chat with the Leader as its group-chat
-recipient. There is no editor review or manual Send step. The transcript remains
-visible in the conversation. The active meeting controls also allow another recording,
-stopping audio, or ending the meeting. Leaving the conversation or turning the
-feature off releases the microphone and clears playback.
+The microphone streams continuously while the meeting is listening. Gateway runs
+Silero VAD, transcribes completed utterances through the existing ASR provider,
+and sends each transcript through normal structured group-chat delivery. There
+is no editor review or manual Send step. Listening continues during transcription
+and agent playback. Pause microphone flushes a confirmed current utterance and
+stops sending microphone samples; Resume microphone starts listening again.
+These controls do not interrupt agent speech or acquire/hold its speaking lease.
+Stop audio and End meeting remain separate controls. Leaving the conversation or
+turning the feature off releases the microphone and clears playback.
 
 Server lifecycle: meeting controls attach to the existing group-chat Team after
 its initialization message is accepted. Duplicate controls reuse the reservation.
@@ -104,8 +107,16 @@ The browser checks meeting status while startup is pending. Once active, it uses
 request errors and connection-state notifications without periodic meeting status
 requests or automatic reconnection/resume.
 
-After local media and event listeners are ready, `meeting.playback.ready` installs
-an owner-specific Gateway route and activates native publication/grant scheduling.
+After local media and listeners are ready, `meeting.playback.ready` prepares
+server input and warms one owner-specific Qwen TTS connection on Gateway, then
+activates publication/grant scheduling. The connection is reused across speech
+chunks and member voice changes. The shared provider session serializes input
+and its single event reader; the TTS adapter waits for voice acknowledgements,
+verifies the complete transcript, and deletes completed conversation items.
+Deletion acknowledgements are drained before the next reading, so previous
+speech does not accumulate as conversation context. A failed or cancelled turn
+discards its connection without replay; Stop, End, release and disconnect drain
+the persistent session. Ordinary one-shot TTS consumers retain their behavior.
 AgentServer freezes each granted spoken summary, member voice, source message,
 lease and playback identity. The browser calls `meeting.speech.synthesize` with
 that identity and a chunk index; it cannot override text, model or voice. Gateway
@@ -173,27 +184,26 @@ Leader tool and browser player using controlled supervisor/audio services.
 Physical microphone/speaker behavior and real supervisor classification still
 require a live meeting acceptance run.
 
-Local speech-end detection reuses the full-duplex extension's Silero v5 worker,
-PCM capture worklet, and 16 kHz resampler. The existing speech gate confirms speech
-before ending the recording after 640 ms of silence. Short pauses and initial
-silence do not finish an utterance. Each recording resets the detector so old
-speech cannot end the next recording. This is acoustic end detection, not semantic
-turn completion.
+## Continuous microphone input
 
-Manual finish remains available. The 30-second limit still bounds recordings;
-recordings with no confirmed speech are discarded at that limit. If VAD cannot
-load or fails, a notice explains how to finish manually. Each completed recording
-automatically submits its transcript after ASR, then returns to the Record message
-control; recording does not restart automatically.
-Stopping or leaving the meeting releases the VAD worker, audio graph, and microphone.
+This replaces the browser MediaRecorder/completed-recording strategy. There is
+no browser VAD, recorded-file upload, or fallback to that old path in meetings.
+The separate video-duplex feature retains its own provider-specific paths.
 
-Deferred work includes semantic turn completion, server-side Silero VAD,
-upstream microphone streaming, supervisor recipient selection, seamless speech resume, voice selection UI, a recorded full meeting
-demonstration, and recovery after process restart.
+The browser reuses the capture worklet and resampler to send 100 ms chunks of
+mono PCM16LE at 16 kHz. The existing `meeting.playback.ready` handshake validates
+ownership, loads Gateway's bundled Silero v5 model, and returns a `stream_id`
+before activating publication. Input shares that route's lifecycle; there is no
+separate input startup or ownership registry.
 
-### Ordered transcription batches
+`meeting.input.append` carries meeting/stream identity, sequence, and base64 PCM.
+Requests pipeline without waiting for earlier acknowledgements. Gateway
+serializes inference off the event loop; each side bounds pending audio to two
+seconds. Invalid audio, missing chunks, or overload stops input explicitly.
 
-Three ASR workers transcribe concurrently with a
+Silero confirms speech over eight of ten frames, preserving one second of
+pre-roll. A 640 ms silence or 30-second limit finishes the utterance. Idle/noise
+input does not invoke ASR. Three ASR workers transcribe concurrently with a
 60-second timeout per request while listening continues. A result map restores
 utterance order, with IDs starting at one per stream. At most seven utterances
 can be queued, transcribing, or awaiting publication in total; overload stops
@@ -209,6 +219,18 @@ event uses the last included utterance ID, preserving the browser's existing
 ordering and admission checks. Interruption preparation runs once per message,
 separately from the ASR workers. The shared Speech transcription adapter
 receives WAV audio.
+
+Owner-only transcript/error events include stream and utterance identities.
+Pause drains earlier chunks and flushes confirmed speech; Resume keeps the same
+stream and sequence. Stop, End, and disconnect cancel pending ASR and suppress
+late results. Browser audio stop is sent while provider cancellation drains.
+
+The model and license ship under `resources/voice`; Gateway needs `onnxruntime`
+but does not download weights or depend on frontend packages at runtime.
+
+Deferred work includes semantic turn completion, supervisor recipient selection,
+voice selection UI,
+a recorded full meeting demonstration, and recovery after process restart.
 
 Agent-side publication uses the host-consumer readiness gate. The shared native
 member provider installs scoped meeting guidance and the
@@ -265,39 +287,22 @@ Backend lifecycle validation (from the repository root, using the project
 Python environment):
 
 ```sh
-python -m pytest tests/unit_tests/agentserver/test_meeting_browser_playback.py tests/unit_tests/agentserver/test_meeting_manager.py tests/unit_tests/agentserver/test_meeting_sdk_dependency.py tests/unit_tests/agentserver/test_team_helpers.py tests/unit_tests/common/test_team_meeting_config.py tests/unit_tests/gateway/test_app_web_handlers.py -o addopts='' -q --asyncio-mode=auto
+python -m pytest tests/unit_tests/agentserver/test_meeting_browser_playback.py tests/unit_tests/agentserver/test_meeting_manager.py tests/unit_tests/agentserver/test_team_helpers.py tests/unit_tests/common/test_team_meeting_config.py tests/unit_tests/gateway/test_app_web_handlers.py -o addopts='' -q --asyncio-mode=auto
 ```
 
 Set `JIUWENSWARM_DATA_DIR` to a temporary directory to isolate application logs
 and data. On Windows, use a normal shell if sandbox restrictions stall asyncio.
 
-For a real-model browser smoke test, run the frontend dev server and open
-`/tests/fixtures/meetingVadBrowser.html`. **Run silence test** uses a generated
-silent stream and checks that Silero/WASM/the audio worklet load without false
-speech detection. **Run speech-end test** uses a local WAV sample at
-`node_modules/.cache/meeting/vad-test-speech.wav`. To generate it on Windows,
-from the frontend directory:
+Input validation covers segmentation, continuous capture, ordered ASR, and
+cancellation:
 
-```powershell
-Add-Type -AssemblyName System.Speech
-$vadSamplePath = Join-Path (Get-Location) 'node_modules/.cache/meeting/vad-test-speech.wav'
-$vadSynth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$vadSynth.SetOutputToWaveFile($vadSamplePath)
-$vadSynth.Speak('This is a test of meeting speech detection. I have finished speaking.')
-$vadSynth.Dispose()
+```sh
+python -m pytest tests/unit_tests/agentserver/test_meeting_input_audio.py -o addopts='' -q --asyncio-mode=auto
 ```
 
-The browser tests use synthetic audio only; they do not access a physical
-microphone or call ASR/TTS providers.
+The automated input tests use synthetic audio and controlled ASR responses;
+physical microphone/speaker echo cancellation and live provider accuracy still
+need a browser meeting run.
 
-The opt-in protocol smoke test uses the configured Qwen service and saves WAV
-artifacts under `tmp/meeting-playback-smoke` (isolated SDK/SQLite session):
-
-```powershell
-$env:MEETING_LIVE_TTS_SMOKE='1'
-python -m pytest tests/unit_tests/agentserver/test_meeting_browser_playback.py -k live_qwen -o addopts='' -q --asyncio-mode=auto
-```
-
-This checks live synthesis through RPC and push routing. It simulates playback
-receipts; physical microphone/speaker quality and a complete live browser meeting
-still require user acceptance testing.
+Live provider synthesis and complete browser playback are checked manually;
+the retained automated tests use controlled provider responses.

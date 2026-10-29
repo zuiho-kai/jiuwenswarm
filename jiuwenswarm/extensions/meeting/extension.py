@@ -1,4 +1,4 @@
-"""Frontend contribution for Team voice meetings; voice APIs remain unchanged."""
+"""Frontend contribution for Team voice meetings; Gateway owns the audio stream."""
 
 from __future__ import annotations
 
