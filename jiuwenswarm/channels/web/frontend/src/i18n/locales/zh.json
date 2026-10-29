@@ -557,6 +557,13 @@
       "proactiveLimitsDisabledDescription": "开启主动推荐后可设置。当前保存值：每天最多 {{daily}} 条，每次检查 {{rounds}} 轮对话。"
     },
     "tts": {
+      "testTitle": "测试语音合成",
+      "testDescription": "向已保存的语音合成服务、模型和音色发送“this is working”，并播放返回的音频。",
+      "testButton": "测试 TTS",
+      "testing": "测试中…",
+      "testSuccess": "语音合成服务已响应，音频已开始播放。",
+      "testFailed": "语音合成测试失败：未返回音频。",
+      "playbackFailed": "语音合成服务已响应，但音频播放失败。请检查浏览器音频权限后重试。",
       "switchTitle": "配置所选语音合成服务",
       "cosyvoice": "CosyVoice2",
       "qwen": "Qwen Omni"

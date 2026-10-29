@@ -5043,6 +5043,12 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         channel.register_method(method_name, _handler)
 
     from jiuwenswarm.common.schema.message import ReqMethod as _ConfigReq
+    from jiuwenswarm.gateway.channel_manager.web.tts_test import test_tts_handler
+
+    async def _test_tts(ws, req_id, params, session_id):
+        await test_tts_handler(channel, ws, req_id, params, session_id)
+
+    channel.register_method("tts.test", _test_tts)
     _register_config_proxy("config.get", _ConfigReq.CONFIG_GET, _config_get)
     _register_config_proxy("config.set", _ConfigReq.CONFIG_SET, _config_set)
     _register_config_proxy("config.save_all", _ConfigReq.CONFIG_SAVE_ALL, _config_save_all)

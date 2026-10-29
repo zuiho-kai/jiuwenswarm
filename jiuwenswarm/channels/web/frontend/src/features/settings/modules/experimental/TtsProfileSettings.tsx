@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Select } from '../../../../components/ui';
+import { playAudioBase64 } from '../../../../utils/tts';
 import { SettingRow } from '../../components';
 import { SettingItemRenderer } from '../../components/SettingItemRenderer';
 import type { SettingsCustomItemProps } from '../../registry/types';
@@ -18,12 +19,14 @@ type VoiceCatalog = {
 
 export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
   const { t } = useTranslation();
-  const { isConnected } = useSettingsServices();
+  const { isConnected, request } = useSettingsServices();
   const source = useSettingsSource();
   const [editingUrl, setEditingUrl] = useState(false);
   const onUrlEditingChange = useCallback((_id: string, editing: boolean) => setEditingUrl(editing), []);
   const [configuringKey, setConfiguringKey] = useState(false);
   const [switchProvider, setSwitchProvider] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testFeedback, setTestFeedback] = useState<{ success: boolean; message: string } | null>(null);
   const provider = source.values.tts_provider === 'qwen_omni' ? 'qwen_omni' : 'cosyvoice';
   const catalogs = source.values.tts_voice_catalogs as Record<string, VoiceCatalog> | undefined;
   const catalog = catalogs?.[provider];
@@ -38,6 +41,7 @@ export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
   const busy =
     disabled ||
     !isConnected ||
+    testing ||
     ['tts_provider', 'tts_api_base', keyField, modelKey, voiceKey].some((key) => source.savingKeys.has(key));
   const saveTts: SaveConfig = async (updates, operation) => {
     const result = await source.save(updates, operation);
@@ -45,6 +49,35 @@ export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
       source.patchLocal({ tts_key_configured: Boolean(updates.tts_api_key) });
     }
     return result;
+  };
+
+  const testTts = async () => {
+    if (busy || editingUrl || configuringKey || switchProvider) return;
+    setTesting(true);
+    setTestFeedback(null);
+    try {
+      const response = await request<{
+        success: boolean;
+        audio_base64?: string;
+        audio_mime?: string;
+        error?: string;
+      }>('tts.test', {}, { timeoutMs: 70_000 });
+      if (!response.success || !response.audio_base64) {
+        throw new Error(response.error || t('settingsPanel.tts.testFailed'));
+      }
+      const played = await playAudioBase64(response.audio_base64, response.audio_mime);
+      setTestFeedback({
+        success: played,
+        message: t(played ? 'settingsPanel.tts.testSuccess' : 'settingsPanel.tts.playbackFailed'),
+      });
+    } catch (error) {
+      setTestFeedback({
+        success: false,
+        message: error instanceof Error ? error.message : t('settingsPanel.tts.testFailed'),
+      });
+    } finally {
+      setTesting(false);
+    }
   };
 
   return (
@@ -160,6 +193,32 @@ export function TtsProfileSettings({ disabled }: SettingsCustomItemProps) {
               void source.save({ [voiceKey]: next }, 'tts-voice').catch(() => undefined);
           }}
         />
+      </SettingRow>
+      <SettingRow
+        title={<span data-testid="settings-tts-test-title">{t('settingsPanel.tts.testTitle')}</span>}
+        description={<span data-testid="settings-tts-test-description">{t('settingsPanel.tts.testDescription')}</span>}
+        subSettings={
+          testFeedback ? (
+            <div
+              className={testFeedback.success ? 'p-4 text-sm text-text-secondary' : 'settings-page__error'}
+              role={testFeedback.success ? 'status' : 'alert'}
+              data-testid="settings-tts-test-feedback"
+              data-variant={testFeedback.success ? 'success' : 'error'}
+            >
+              {testFeedback.message}
+            </div>
+          ) : null
+        }
+      >
+        <Button
+          disabled={busy || editingUrl || configuringKey || Boolean(switchProvider)}
+          loading={testing}
+          onClick={() => void testTts()}
+          data-testid="settings-tts-test-btn"
+          data-variant={testing ? 'testing' : 'idle'}
+        >
+          {t(testing ? 'settingsPanel.tts.testing' : 'settingsPanel.tts.testButton')}
+        </Button>
       </SettingRow>
     </>
   );

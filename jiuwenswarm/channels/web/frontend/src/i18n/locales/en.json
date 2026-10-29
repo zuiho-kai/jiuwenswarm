@@ -564,6 +564,13 @@
       "proactiveLimitsDisabledDescription": "Enable proactive recommendations to configure these limits. Saved values: up to {{daily}} per day and {{rounds}} conversation rounds per check."
     },
     "tts": {
+      "testTitle": "Test speech synthesis",
+      "testDescription": "Send “this is working” to the saved TTS provider, model, and voice, then play the response.",
+      "testButton": "Test TTS",
+      "testing": "Testing…",
+      "testSuccess": "TTS responded and audio playback started.",
+      "testFailed": "TTS test failed: no audio was returned.",
+      "playbackFailed": "TTS responded, but audio playback failed. Check your browser audio permissions and try again.",
       "switchTitle": "Configure the selected TTS provider",
       "cosyvoice": "CosyVoice2",
       "qwen": "Qwen Omni"

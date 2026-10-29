@@ -237,6 +237,7 @@ export const OPEN_SOURCE_SETTINGS_REQUEST_METHODS = [
   'config.get',
   'config.save_all',
   'config.validate_model',
+  'tts.test',
   'locale.set_conf',
   'models.list',
   'models.replace_all',
