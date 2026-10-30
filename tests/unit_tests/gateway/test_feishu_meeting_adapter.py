@@ -337,14 +337,22 @@ async def test_manual_connection_interruption_stops_socket(manual_connection, re
     assert manager.get_channels_by_id("feishu") == ([] if reason == "cancelled" else [replacement])
 
 
-def test_connection_state_requires_live_socket():
+@pytest.mark.parametrize("modern", [False, True])
+def test_connection_state_requires_live_socket(modern):
     from jiuwenswarm.gateway.channel_manager.im_platforms.feishu.feishu_connect import FeishuChannel
+    from websockets.protocol import State
 
     channel = SimpleNamespace(_running=True, _websocket_client=None, _websocket_thread=None)
     assert FeishuChannel.connection_state.fget(channel) == "connecting"
-    channel._websocket_client = SimpleNamespace(_conn=SimpleNamespace(closed=False))
+    conn = SimpleNamespace(state=State.OPEN) if modern else SimpleNamespace(closed=False)
+    channel._websocket_client = SimpleNamespace(_conn=conn)
     assert FeishuChannel.connection_state.fget(channel) == "connected"
-    channel._websocket_client._conn.closed = True
+    if modern:
+        for state in (State.CONNECTING, State.CLOSING, State.CLOSED):
+            conn.state = state
+            assert FeishuChannel.connection_state.fget(channel) == "connecting"
+    else:
+        conn.closed = True
     channel._websocket_thread = SimpleNamespace(is_alive=lambda: False)
     assert FeishuChannel.connection_state.fget(channel) == "failed"
     channel._running = False

@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import requests
 from pydantic import BaseModel, Field
+from websockets.protocol import State
 from jiuwenswarm.common.mode_matrix import is_team_mode
 from jiuwenswarm.common.schema.message import Message, ReqMethod, EventType
 from jiuwenswarm.gateway.channel_manager.base import RobotMessageRouter, BaseChannel
@@ -236,8 +237,11 @@ class FeishuChannel(BaseChannel):
         if not self._running:
             return "disconnected"
         conn = getattr(self._websocket_client, "_conn", None)
-        if conn is not None and not conn.closed:
-            return "connected"
+        if conn is not None:
+            # websockets 14+ connections expose state instead of closed.
+            state = getattr(conn, "state", None)
+            if state == State.OPEN or (state is None and not getattr(conn, "closed", True)):
+                return "connected"
         if self._websocket_thread is not None and not self._websocket_thread.is_alive():
             return "failed"
         return "connecting"
