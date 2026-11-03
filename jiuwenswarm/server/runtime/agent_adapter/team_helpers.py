@@ -3683,6 +3683,33 @@ async def _consume_stream_with_query(
                     parsed["role"] = TeamRole.LEADER.value
                 parsed = _truncate_team_tool_result_event(parsed)
                 parsed = _attach_team_leader_identity(parsed, team_leader_identity)
+                if (
+                    parsed.get("event_type") == "team.group_message.accepted"
+                    and isinstance(initial_query, dict)
+                    and initial_query.get("type") == "group_chat"
+                    and not initial_query.get("mentions")
+                    and (
+                        parsed.get("client_message_id")
+                        or (parsed.get("message") or {}).get("client_message_id")
+                    ) == initial_query.get("client_message_id")
+                    and not get_team_manager(channel_id).is_round_active(session_id)
+                ):
+                    # The persistent stream outlives the initiating browser.
+                    # Publish completion independently of its response waiter so
+                    # reloads cannot strand Gateway's cached busy status.
+                    await _broadcast_event(channel_id, session_id, parsed)
+                    await _broadcast_event(
+                        channel_id, session_id,
+                        {
+                            "event_type": "chat.processing_status",
+                            "session_id": session_id,
+                            "rid": round_id,
+                            "is_processing": False,
+                            "is_complete": True,
+                        },
+                    )
+                    terminal_broadcasted = True
+                    continue
                 if parsed.get("event_type") == "team.runtime_ready":
                     ready_team_name = str(parsed.get("team_name") or team_spec.team_name)
                     activation_kind = str(parsed.get("activation_kind") or "").strip()

@@ -2541,7 +2541,7 @@ class AgentWebSocketServer:
             if request.req_method in {
                 ReqMethod.MEETING_START, ReqMethod.MEETING_STATUS, ReqMethod.MEETING_END,
                 ReqMethod.MEETING_RELEASE,
-                ReqMethod.MEETING_PLAYBACK_READY, ReqMethod.MEETING_SPEECH_GET,
+                ReqMethod.MEETING_PLAYBACK_READY, ReqMethod.MEETING_SPEECH_GET, ReqMethod.MEETING_QUEUE_CONTROL,
                 ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED,
                 ReqMethod.MEETING_INPUT_PREPARE, ReqMethod.MEETING_INPUT_ADMITTED,
             }:
@@ -5383,18 +5383,22 @@ class AgentWebSocketServer:
             elif request.req_method == ReqMethod.MEETING_INPUT_PREPARE:
                 playback_payload = await manager.prepare_human_input(
                     session_id, str(params.get("meeting_id") or ""), owner_id, params.get("transcript"),
+                    confirmed_speech=params.get("confirmed_speech") is True,
+                    expected_token=params.get("expected_token"),
                 )
             elif request.req_method == ReqMethod.MEETING_INPUT_ADMITTED:
                 playback_payload = await manager.human_input_admitted(
                     session_id, str(params.get("meeting_id") or ""), owner_id,
                     str(params.get("interruption_id") or ""),
                 )
-            elif request.req_method in {ReqMethod.MEETING_SPEECH_GET, ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED}:
+            elif request.req_method in {ReqMethod.MEETING_SPEECH_GET, ReqMethod.MEETING_QUEUE_CONTROL, ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED}:
                 consumer = await manager.browser_playback(
                     session_id, str(params.get("meeting_id") or ""), owner_id,
-                    closing=request.req_method != ReqMethod.MEETING_SPEECH_GET,
+                    closing=request.req_method in {ReqMethod.MEETING_PLAYBACK_RESULT, ReqMethod.MEETING_PLAYBACK_STOPPED},
                 )
-                if request.req_method == ReqMethod.MEETING_SPEECH_GET:
+                if request.req_method == ReqMethod.MEETING_QUEUE_CONTROL:
+                    playback_payload = await consumer.queue_control(params)
+                elif request.req_method == ReqMethod.MEETING_SPEECH_GET:
                     playback_payload = await consumer.resolve_chunk(params)
                 elif request.req_method == ReqMethod.MEETING_PLAYBACK_RESULT:
                     playback_payload = await consumer.result(params)

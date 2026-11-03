@@ -580,7 +580,11 @@ def load_team_spec_dict(
     spec_dict["progressive_tool"] = bool(spec_dict.pop("swarmflow_progressive_tool", False))
     spec_dict["leader"] = _build_leader_spec(team_raw)
     spec_dict["agents"] = agents
-    spec_dict["language"] = str(config_base.get("preferred_language", "zh")).strip().lower()
+    # Team i18n accepts only "cn"/"en" (openjiuwen.agent_teams.i18n.STRINGS);
+    # a "zh"/"zh-CN" value raises KeyError while a member expands the group
+    # chat context, which silently drops the unread message.
+    preferred_language = str(config_base.get("preferred_language", "zh")).strip().lower()
+    spec_dict["language"] = "en" if preferred_language.startswith("en") else "cn"
 
     workspace_spec = _build_workspace_spec(team_raw)
     if workspace_spec is not None:

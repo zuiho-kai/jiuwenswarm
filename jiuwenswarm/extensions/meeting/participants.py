@@ -15,7 +15,6 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 from .publication import MeetingPublicationRail, create_meeting_publication_rail
 
 if TYPE_CHECKING:
-    from openjiuwen.agent_teams.schema.meeting import SpeechRequest
     from openjiuwen.agent_teams.tools.tool_base import TeamTool
     from jiuwenswarm.common.voice_matching import MemberVoiceRegistry, VoiceAssignment
 
@@ -45,16 +44,6 @@ class MeetingPublicationSession:
         self.on_interrupt = on_interrupt
         self.closed = False
         self._members: set[MeetingPublicationRail] = set()
-
-    def voice_for_speech(self, request: SpeechRequest) -> VoiceAssignment:
-        """Resolve a granted request's canonical speaker to its immutable voice.
-
-        A transport consumer passes provider_voice_id to TTS on Gateway. This
-        lookup performs no synthesis and never changes queue/lease ownership.
-        """
-        if self.closed or request.scope != self.coordinator.scope or self.voices is None:
-            raise ValueError("Speech voice requires the matching active publication scope")
-        return self.voices.get_voice(request.member_name)
 
     async def attach(
         self, agent: Any, member_name: str, language: str, roster_tool: TeamTool | None = None,

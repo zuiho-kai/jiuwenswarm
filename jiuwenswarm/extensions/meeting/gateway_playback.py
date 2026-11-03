@@ -15,6 +15,7 @@ from jiuwenswarm.common.voice_matching import load_voice_catalog
 from jiuwenswarm.gateway.voice.config import TtsConfig
 from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
 from jiuwenswarm.gateway.voice.tts import TtsSession
+from .errors import exception_detail
 from .gateway_input import MeetingInputStream, bind_input_handlers
 from .playback import IDENTITY_FIELDS
 
@@ -35,6 +36,10 @@ class GatewayPlaybackRoute:
         self.input = MeetingInputStream(channel, ws, session_id, meeting_id)
         self.input.prepare_transcript = lambda text: self.fetch(
             ReqMethod.MEETING_INPUT_PREPARE, {"meeting_id": meeting_id, "transcript": text},
+        )
+        self.input.prepare_speech = lambda token: self.fetch(
+            ReqMethod.MEETING_INPUT_PREPARE,
+            {"meeting_id": meeting_id, "confirmed_speech": True, "expected_token": token},
         )
         self.input.admit_transcript = lambda interruption_id: self.fetch(
             ReqMethod.MEETING_INPUT_ADMITTED, {"meeting_id": meeting_id, "interruption_id": interruption_id},
@@ -135,7 +140,7 @@ class GatewayPlaybackRoute:
                 for name in names
             ):
                 raise ValueError("Invalid meeting addressed members")
-        elif event != "meeting.speech.error":
+        elif event not in {"meeting.speech.error", "meeting.queue"}:
             raise ValueError("Unknown meeting playback event")
         await self.channel.send_event(self.ws, event, {
             key: value for key, value in payload.items() if key not in {"event_type", "event", "route_id", "owner_id"}
@@ -198,6 +203,12 @@ def bind_playback_handlers(channel, agent_client):
                 created = True
             if route.revoked or route.input.closed or route.startup_id != startup_id or route.revision != config_revision(config):
                 raise ValueError("Meeting playback configuration changed or has stopped")
+            mode = params.get("input_mode", "pcm")
+            if mode not in {"pcm", "joyai"}:
+                raise ValueError("Unknown meeting input mode")
+            if route.input.initializing is not None and route.input.input_mode != mode:
+                raise ValueError("Meeting input mode changed")
+            route.input.input_mode = mode
             await route.input.start()
             # Prepare the meeting-owned provider session before grants.
             await route.tts.start()
@@ -215,7 +226,7 @@ def bind_playback_handlers(channel, agent_client):
             if created:
                 await route.stop_media()
                 await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
+            await channel.send_response(ws, req_id, ok=False, error=exception_detail(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
 
     async def synthesize(ws, req_id, params, session_id, user_id=None):
         task = None
@@ -262,7 +273,7 @@ def bind_playback_handlers(channel, agent_client):
         except asyncio.CancelledError:
             await channel.send_response(ws, req_id, ok=False, error="Meeting synthesis cancelled", code="CANCELLED")
         except Exception as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code=getattr(exc, "code", "MEETING_TTS_FAILED"))
+            await channel.send_response(ws, req_id, ok=False, error=exception_detail(exc), code=getattr(exc, "code", "MEETING_TTS_FAILED"))
         finally:
             if route is not None and route.tasks.get(key) is task:
                 route.tasks.pop(key, None)
@@ -277,7 +288,7 @@ def bind_playback_handlers(channel, agent_client):
                     raise ValueError("Interrupted speech cannot be reported as played")
                 outcome, count = params.get("outcome"), params.get("completed_chunks")
                 record = route.records[identity["playback_id"]]
-                if outcome not in {"completed", "stopped", "failed"} or type(count) is not int or not 0 <= count <= record["chunk_count"]:
+                if outcome not in {"completed", "stopped", "failed", "skipped"} or type(count) is not int or not 0 <= count <= record["chunk_count"]:
                     raise ValueError("Invalid playback outcome")
                 if outcome == "completed" and count != record["chunk_count"]:
                     raise ValueError("All chunks must finish before completion")
@@ -286,7 +297,7 @@ def bind_playback_handlers(channel, agent_client):
                     raise ValueError("Conflicting playback receipt")
                 if previous is None and (route.revoked or route.current_playback != identity["playback_id"]):
                     raise ValueError("Speech is no longer current")
-                if outcome in {"failed", "stopped"}:
+                if outcome in {"failed", "stopped", "skipped"}:
                     route.pending_receipts[identity["playback_id"]] = (outcome, count)
                     if identity["playback_id"] not in route.drained_playbacks:
                         if outcome == "stopped":
@@ -309,7 +320,19 @@ def bind_playback_handlers(channel, agent_client):
                 route.pending_receipts.pop(identity["playback_id"], None)
             await channel.send_response(ws, req_id, ok=True, payload=payload)
         except (ValueError, RuntimeError) as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_RESULT_FAILED")
+            await channel.send_response(ws, req_id, ok=False, error=exception_detail(exc), code="MEETING_PLAYBACK_RESULT_FAILED")
+
+    async def queue_control(ws, req_id, params, session_id, user_id=None):
+        try:
+            params = params if isinstance(params, dict) else {}
+            route = route_for(ws, params, session_id)
+            payload = await route.fetch(ReqMethod.MEETING_QUEUE_CONTROL, {
+                "meeting_id": route.meeting_id, "operation": params.get("operation", "status"),
+                "request_id": params.get("request_id"),
+            })
+            await channel.send_response(ws, req_id, ok=True, payload=payload)
+        except (ValueError, RuntimeError) as exc:
+            await channel.send_response(ws, req_id, ok=False, error=exception_detail(exc), code="MEETING_QUEUE_FAILED")
 
     async def stopped(ws, req_id, params, session_id, user_id=None):
         try:
@@ -324,12 +347,13 @@ def bind_playback_handlers(channel, agent_client):
             })
             await channel.send_response(ws, req_id, ok=True, payload=payload)
         except (ValueError, RuntimeError) as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_STOP_FAILED")
+            await channel.send_response(ws, req_id, ok=False, error=exception_detail(exc), code="MEETING_PLAYBACK_STOP_FAILED")
 
     async def disconnect(ws, _sessions):
         for route in list(getattr(ws, "_meeting_playback_routes", {}).values()):
             await route.stop_media()
 
+    channel.register_method("meeting.queue.control", queue_control)
     channel.register_method("meeting.playback.ready", ready)
     channel.register_method("meeting.speech.synthesize", synthesize)
     channel.register_method("meeting.playback.result", result)

@@ -6,9 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openjiuwen.agent_teams.duplex.config import DuplexConfig
-from openjiuwen.agent_teams.duplex.policy import APPEND, INTERRUPT, URGENCY
-from jiuwenswarm.extensions.meeting import gateway_input, interruption
+from jiuwenswarm.extensions.meeting import gateway_input
 from jiuwenswarm.extensions.meeting.publication import create_meeting_publication_rail
 from tests.unit_tests.agentserver.test_meeting_browser_playback import (
     activate, browser as browser, identity, next_speech, queue,
@@ -25,15 +23,12 @@ async def test_human_interruption_waits_for_input_acceptance_then_continues(brow
     await queue(browser, driver, "analyst")
     first = await next_speech(browser)
     await queue(browser, driver, "leader", "Next speaker")
-    judge = AsyncMock(return_value=True)
-    monkeypatch.setattr(interruption, "is_human_interruption", judge)
     monkeypatch.setattr(gateway_input, "transcribe_utterance", AsyncMock(return_value="Wait, use last year's figures"))
     route = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])]
     route.input.enqueue([b"pcm"])
     await asyncio.wait_for(route.input.queue.join(), 3)
     transcript = next(p for _, event, p in browser.channel.events if event == "meeting.input.transcript")
     stop_id = transcript["interruption_id"]
-    assert judge.await_args.args[0] == transcript["transcript"]
     assert driver.state.phase == "interrupting"
     assert (await driver.coordinator.get_state()).interruption_id == stop_id
     assert (await driver.coordinator.get_request(first["request_id"])).status == "interrupted"
@@ -56,33 +51,20 @@ async def test_human_interruption_waits_for_input_acceptance_then_continues(brow
     assert (await driver.coordinator.get_speaker()).lease_token == second["lease_token"]
 
 
-async def test_acknowledgement_and_slow_judgment_do_not_interrupt_new_speaker(browser, monkeypatch):
+async def test_stale_confirmed_speech_does_not_interrupt_new_speaker(browser):
     driver, _ = await activate(browser)
     await queue(browser, driver, "analyst")
     first = await next_speech(browser)
-    monkeypatch.setattr(interruption, "is_human_interruption", AsyncMock(return_value=False))
-    manager = browser.host.manager
-    args = (browser.base["session_id"], browser.base["meeting_id"], browser.ws._meeting_owner_id)
-    assert await manager.prepare_human_input(*args, "Okay") == {}
-    assert not any(event == "meeting.speech.stop" for _, event, _ in browser.channel.events)
-    entered, finish = asyncio.Event(), asyncio.Event()
-
-    async def judge(*_):
-        entered.set()
-        await finish.wait()
-        return True
-
-    monkeypatch.setattr(interruption, "is_human_interruption", judge)
-    pending = asyncio.create_task(manager.prepare_human_input(*args, "Actually, change the topic"))
-    await entered.wait()
     await queue(browser, driver, "leader")
     await browser.call("meeting.speech.synthesize", {**identity(first), "chunk_index": 0})
     assert (await browser.call("meeting.playback.result", {
         **identity(first), "outcome": "completed", "completed_chunks": 1,
     }))["ok"]
     second = await next_speech(browser)
-    finish.set()
-    assert await pending == {}
+    args = (browser.base["session_id"], browser.base["meeting_id"], browser.ws._meeting_owner_id)
+    assert await browser.host.manager.prepare_human_input(
+        *args, "", confirmed_speech=True, expected_token=first["lease_token"],
+    ) == {}
     assert (await driver.coordinator.get_speaker()).lease_token == second["lease_token"]
 
 
@@ -173,23 +155,44 @@ async def test_interruption_before_ready_delivery_cannot_publish_late_audio(brow
     assert len(consumer._records) == 1
 
 
-@pytest.mark.parametrize("choice,probability,expected", [(INTERRUPT, .95, True), (INTERRUPT, .6, False), (APPEND, .99, False)])
-async def test_supervisor_reuses_team_provider_and_probability_threshold(monkeypatch, choice, probability, expected):
-    config = DuplexConfig(format="jev", api_base="https://example.invalid", model="test-model", api_key_env="MEETING_TEST_KEY")
-    classifier = SimpleNamespace(
-        classify=AsyncMock(return_value={URGENCY: SimpleNamespace(choice=choice, probabilities={choice: probability})}),
-        aclose=AsyncMock(),
-    )
-    monkeypatch.setattr(interruption, "build_classifier", lambda value: classifier if value is config else None)
-    speaker = SimpleNamespace(member_name="analyst", speech_text="Current explanation")
-    assert await interruption.is_human_interruption("Wait, I have a question", speaker, config) is expected
-    assert classifier.classify.await_args.args[0] == [URGENCY]
-    assert "Current explanation" in classifier.classify.await_args.args[1]
-    classifier.aclose.assert_awaited_once()
+async def test_confirmed_vad_interrupts_before_asr_and_holds_next_speech_until_admitted(browser, monkeypatch):
+    driver, _ = await activate(browser)
+    await queue(browser, driver, "analyst")
+    first = await next_speech(browser)
+    await queue(browser, driver, "leader", "Next speaker")
+    route = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])]
+    stream = route.input
+    response = await browser.call("meeting.input.speech_started", {"stream_id": stream.id, "expected_token": first["lease_token"]})
+    assert response["ok"] and driver.state.phase == "interrupting"
+    assert stream.vad_interruption
+    assert not any(e == "meeting.input.transcript" for _, e, _ in browser.channel.events)
+    assert browser.channel.ready.empty()
+    assert not stream.closed and stream.listening
+    monkeypatch.setattr(gateway_input, "transcribe_utterance", AsyncMock(return_value="Okay"))
+    stream.enqueue([b"pcm"])
+    await asyncio.wait_for(stream.queue.join(), 3)
+    transcript = next(p for _, e, p in browser.channel.events if e == "meeting.input.transcript")
+    assert transcript["interruption_id"] == stream.vad_interruption
+    assert browser.channel.ready.empty()
+    await driver.coordinator.post_human_message(transcript["transcript"], mentions=["leader"])
+    assert (await browser.call("meeting.input.admitted", {"stream_id": stream.id, "utterance_id": transcript["utterance_id"], "interruption_id": transcript["interruption_id"]}))["ok"]
+    assert (await next_speech(browser))["speaker_id"] == "leader"
+    assert stream.vad_interruption is None
 
 
-async def test_supervisor_failure_preserves_speech(monkeypatch):
-    classifier = SimpleNamespace(classify=AsyncMock(side_effect=TimeoutError), aclose=AsyncMock())
-    monkeypatch.setattr(interruption, "build_classifier", lambda _: classifier)
-    assert not await interruption.is_human_interruption("Wait", SimpleNamespace(member_name="a", speech_text="text"), None)
-    classifier.aclose.assert_awaited_once()
+@pytest.mark.parametrize("transcript", ["", None])
+async def test_vad_empty_or_failed_asr_releases_audio_without_fabricating_user_input(browser, monkeypatch, transcript):
+    driver, _ = await activate(browser)
+    await queue(browser, driver, "analyst")
+    first = await next_speech(browser)
+    await queue(browser, driver, "leader", "Next speaker")
+    route = browser.ws._meeting_playback_routes[(browser.base["session_id"], browser.base["meeting_id"])]
+    stream = route.input
+    assert (await browser.call("meeting.input.speech_started", {"stream_id": stream.id, "expected_token": "stale"}))["ok"]
+    assert driver.state.phase == "awaiting_playback"
+    assert (await browser.call("meeting.input.speech_started", {"stream_id": stream.id, "expected_token": first["lease_token"]}))["ok"]
+    monkeypatch.setattr(gateway_input, "transcribe_utterance", AsyncMock(return_value=transcript))
+    stream.enqueue([b"pcm"])
+    await asyncio.wait_for(stream.queue.join(), 3)
+    assert (await next_speech(browser))["speaker_id"] == "leader"
+    assert stream.vad_interruption is None and not stream.closed

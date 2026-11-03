@@ -808,3 +808,44 @@ async def test_queued_stream_emits_runtime_warming(
     await admission.dispatch(object(), cancel, asyncio.Lock())
     await asyncio.wait_for(waiter, 1.0)
     assert any("runtime.warming" in str(item) for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_query_socket_does_not_replace_persistent_push_gateway(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    from jiuwenswarm.server.front.connection import ConnectionHandler
+    from jiuwenswarm.server.front.admission import ExecutionAdmission
+    from jiuwenswarm.server.front.router import MethodRouter
+    from jiuwenswarm.server.front.event_forwarder import EventForwarder
+
+    monkeypatch.setattr("jiuwenswarm.server.front.connection.send_wire_payload", AsyncMock(return_value=True))
+    readiness = Readiness()
+    admission = ExecutionAdmission(readiness)
+    backend = Mock()
+    backend.on_gateway_disconnect = AsyncMock()
+    admission.attach_backend(backend)
+    forwarder = EventForwarder()
+    handler = ConnectionHandler(readiness, MethodRouter(readiness, admission), admission, forwarder=forwarder)
+    close_gateway, close_query = asyncio.Event(), asyncio.Event()
+    gateway = _HoldCloseWs("gateway", close_gateway)
+    gateway.request_headers = {"X-Jiuwen-Gateway-Push": "1"}
+    gateway.send = AsyncMock()
+    query = _HoldCloseWs("query", close_query)
+    task_gateway = asyncio.create_task(handler(gateway))
+    await asyncio.sleep(0)
+    task_query = asyncio.create_task(handler(query))
+    await asyncio.sleep(0)
+    try:
+        assert handler.current_ws is gateway
+        assert forwarder.current_ws is gateway
+        backend.attach_gateway_connection.assert_called_once()
+        close_query.set()
+        await task_query
+        assert handler.current_ws is gateway
+        backend.on_gateway_disconnect.assert_not_awaited()
+        assert await forwarder.send({"event": "meeting.speech.ready"})
+    finally:
+        close_query.set()
+        close_gateway.set()
+        await asyncio.gather(task_gateway, task_query)
+    backend.on_gateway_disconnect.assert_awaited_once_with(gateway, "gateway")

@@ -1059,6 +1059,13 @@ function parseSessionHistoryTimelineEntry(
   const role = normalizeHistoryRole(record.role);
   const at = recordTimestampIso(record) ?? '';
   const forkedFromSessionId = readForkSourceSessionId(record);
+  if (record.meeting_startup === true) {
+    return { kind: 'message', message: {
+      id: String(record.id || `meeting-start-${at}`), role: 'system',
+      content: String(record.content || ''), timestamp: at, isMeetingStartup: true,
+    } };
+  }
+
 
   if (role === 'user') {
     const rawContent = record.content ?? record.text ?? record.body;

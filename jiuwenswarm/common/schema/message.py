@@ -97,6 +97,7 @@ class ReqMethod(Enum):
     MEETING_RELEASE = "meeting.release"
     MEETING_PLAYBACK_READY = "meeting.playback.ready"
     MEETING_SPEECH_GET = "meeting.speech.get"
+    MEETING_QUEUE_CONTROL = "meeting.queue.control"
     MEETING_PLAYBACK_RESULT = "meeting.playback.result"
     MEETING_PLAYBACK_STOPPED = "meeting.playback.stopped"
     MEETING_INPUT_PREPARE = "meeting.input.prepare"

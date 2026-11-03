@@ -248,3 +248,23 @@ test('interruptPlayback stops and resolves an active PCM stream', async () => {
   assert.equal(source.stopped, true);
   assert.deepEqual(states, ['speaking', 'listening']);
 });
+
+
+test('pausing JoyAI capture flushes confirmed speech and ignores muted audio', () => {
+ const turns=[];
+ const voice=new JoyAIVoiceSession({onSpeechStart:()=>{},onTurnAudio:audio=>turns.push(audio),onState:()=>{},onError:()=>{}});
+ voice.processAudio(new Int16Array(1600).fill(1000));
+ voice.handleSpeechDetection({state:'started'});
+ voice.processAudio(new Int16Array(1600).fill(1000));
+ voice.setListening(false);
+ assert.equal(turns.length,1);
+ voice.processAudio(new Int16Array(1600).fill(1000));
+ voice.handleSpeechDetection({state:'started'});
+ assert.equal(voice.speechActive,false);
+ voice.setListening(true);
+ voice.processAudio(new Int16Array(1600).fill(1000));
+ voice.handleSpeechDetection({state:'started'});
+ voice.handleSpeechDetection({state:'ended'});
+ assert.equal(turns.length,2);
+ voice.stop();
+});

@@ -125,6 +125,84 @@ class MeetingSetAddressedMembersTool(TeamTool):
             return ToolOutput(success=False, error="meeting_priority_update_failed")
 
 
+class MeetingUpdateContextTool(TeamTool):
+    def __init__(self, coordinator, member_name):
+        super().__init__(ToolCard(
+            id="team.meeting_update_context", name="meeting_update_context",
+            description=("Leader: when the project, scope or decision changes, immediately replace the shared "
+                         "decision summary with current facts and next agenda. All members see it before their "
+                         "next model call. Cancels waiting old audio, preserves published text and current speech. "
+                         "Use only for substantive changes, not acknowledgements or every progress update."),
+            input_params={"type": "object", "properties": {"summary": {"type": "string", "minLength": 1, "maxLength": 1200}},
+                          "required": ["summary"], "additionalProperties": False},
+        ))
+        self.coordinator, self.member_name = coordinator, member_name
+
+    async def invoke(self, inputs, **kwargs):
+        try:
+            if not isinstance(inputs, dict) or set(inputs) != {"summary"}:
+                raise ValueError("Provide only the current decision summary")
+            return ToolOutput(success=True, data=await self.coordinator.update_context(self.member_name, inputs["summary"]))
+        except (ValueError, RuntimeError, OSError, SQLAlchemyError) as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+
+class MeetingActionTool(TeamTool):
+    def __init__(self, coordinator, member_name, on_interrupt=None):
+        properties = {name: {"type": "string", "maxLength": limit} for name, limit in
+                      (("action_id", 100), ("owner", 255), ("reviewer", 255), ("goal", 2000), ("acceptance", 2000), ("note", 2000))}
+        properties.update(operation={"type": "string", "enum": ["status", "assign", "start", "submit", "block", "accept", "rework", "cancel", "finish", "pause"]},
+                          revision={"type": "integer", "minimum": 1}, evidence={"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string", "maxLength": 1000}})
+        properties["speech_text"] = {"type": "string", "minLength": 1, "maxLength": 600, "description": "Required for assign: a brief spoken explanation of who will do what, using display names and everyday language; no paths, tool names or task IDs."}
+        properties["action_ids"] = {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 50}
+        super().__init__(ToolCard(id="team.meeting_action", name="meeting_action",
+            description=("FIRST on an explicit change invalidating existing work: Leader calls pause with action_ids and note BEFORE reading files, investigating or planning the replacement. No revisions needed for this atomic batch stop. Ordinary questions must not pause tasks. Then investigate; cancel invalid actions or rework still-valid ones with current revisions. "
+                         "Meeting-only action ledger; never changes cluster tasks. Leader assign: action_id, owner, distinct reviewer, goal, concrete acceptance and speech_text naming who will do what. The host queues this short announcement automatically; do not repeat it with meeting_post_message. "
+                         "Owner start/submit/block: action_id and current revision; submit requires evidence paths/test results and note; block note must say dependency and unblock condition. "
+                         "Designated reviewer inspect actual outputs with normal tools, then accept or rework with note and revision. Never accept based on a claim or specification when implementation was required. "
+                         "Leader may cancel with reason. Rework reopens accepted actions when new defects appear. status reads current ledger (do not poll). "
+                         "Leader finish only after all actions accepted/cancelled/blocked; blocked means waiting, not completed. Execution/review notifications remain text-only. Assignment speech_text is spoken separately without delaying work."),
+            input_params={"type": "object", "properties": properties, "required": ["operation"], "additionalProperties": False}))
+        self.coordinator, self.member_name = coordinator, member_name
+        self.on_interrupt = on_interrupt
+
+    async def invoke(self, inputs, **kwargs):
+        try:
+            if not isinstance(inputs, dict) or set(inputs) - set(self.card.input_params["properties"]):
+                raise ValueError("Provide only meeting_action fields")
+            if inputs.get("operation") == "assign":
+                from .coordination import speech_budget_error
+                error = speech_budget_error(inputs.get("speech_text"))
+                if error:
+                    raise ValueError(error)
+            if inputs.get("operation") == "pause":
+                data = await self.coordinator.pause_actions(self.member_name, inputs.get("action_ids"), inputs.get("note"))
+                speaker = await self.coordinator.get_speaker()
+                if self.on_interrupt is not None and speaker is not None and speaker.member_name in set(data["affected_members"]) | {self.member_name}:
+                    try:
+                        await self.on_interrupt(self.member_name, speaker.lease_token)
+                    except Exception:
+                        logger.exception("Work pause retained after audio stop failure")
+                        data["audio_error"] = "work_paused_audio_stop_failed"
+                return ToolOutput(success=True, data=data)
+            data = await self.coordinator.update_action(self.member_name, inputs)
+            if inputs.get("operation") == "assign":
+                try:
+                    announcement = await self.coordinator.announce_assignment(self.member_name, inputs, inputs["speech_text"])
+                    data["speech_queued"] = True
+                    data["speech_request_id"] = announcement.speech_request.request_id
+                    if announcement.audio_error:
+                        data["audio_error"] = announcement.audio_error
+                except Exception:
+                    # The assignee has already received the work. Never report
+                    # assignment failure or repeat its mutation because TTS failed.
+                    logger.exception("Assignment committed; spoken announcement unavailable")
+                    data["audio_error"] = "assignment_committed_announcement_failed"
+            return ToolOutput(success=True, data=data)
+        except (ValueError, RuntimeError, OSError, SQLAlchemyError) as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+
 class _ScopedTool(TeamTool):
     """Retained tool instances cannot publish after their adapter is removed."""
 
@@ -137,6 +215,16 @@ class _ScopedTool(TeamTool):
         self._owner = owner
         if self.card.name == _POST:
             self.card.description += "\n\n" + summary_contract(owner.language)
+            self.card.input_params["properties"]["speech_text"]["maxLength"] = 600
+            if hasattr(owner.coordinator, "update_context"):
+                self.card.description = (
+                    "Publish content immediately as a full-text meeting message and notify the named recipients. "
+                    "Only speech_text waits in the audio queue. Use current roster names in mentions; include user "
+                    "for a human question and the Leader when reporting back. At most one waiting summary per member: "
+                    "a new post replaces that member's waiting audio, so retain still-relevant unspoken actions in the "
+                    "latest summary. Published text is preserved. Do not repost just to check delivery.\n\n"
+                    + summary_contract(owner.language)
+                )
         elif self.card.name == "meeting_read_history":
             self.card.description = history_contract(owner.language)
             self.card.input_params["properties"]["limit"].update(
@@ -163,8 +251,17 @@ class _ScopedTool(TeamTool):
                 return ToolOutput(success=True, data=asdict(interruption) if interruption is not None else None)
             except (ValueError, RuntimeError, OSError, SQLAlchemyError) as exc:
                 return ToolOutput(success=False, error=str(exc))
+        if self.card.name == _POST:
+            from .coordination import speech_budget_error
+            error = speech_budget_error(inputs.get("speech_text") if isinstance(inputs, dict) else None)
+            if error:
+                return ToolOutput(success=False, error=error)
+            if hasattr(self._owner.coordinator, "refresh_user_context"):
+                await self._owner.coordinator.refresh_user_context()
+                if self._owner.context_version != self._owner.coordinator.context_version:
+                    return ToolOutput(success=False, error="Meeting context changed while you were working. Read the latest shared context in the next model call and revise this post before publishing.")
         result = await self._tool.invoke(inputs, **kwargs)
-        if self.card.name == _POST and result.success and self._owner.on_queued is not None:
+        if result.success and self._owner.on_queued is not None and (self.card.name == _POST or (self.card.name == "meeting_action" and isinstance(result.data, dict) and result.data.get("speech_queued"))):
             try:
                 self._owner.on_queued()
             except Exception:
@@ -193,6 +290,8 @@ class MeetingPublicationRail(DeepAgentRail):
         on_interrupt=None,
     ) -> None:
         super().__init__()
+        self.coordinator = coordinator
+        self.context_version = getattr(coordinator, "context_version", 0)
         self._client = coordinator.for_member(member_name)
         self._leader = leader
         self.language = language
@@ -269,6 +368,27 @@ class MeetingPublicationRail(DeepAgentRail):
                 "result_type": "error", "meeting_error": "meeting_unavailable",
             })
             return
+        if isinstance(ctx.inputs, ModelCallInputs) and hasattr(self.coordinator, "refresh_user_context"):
+            await self.coordinator.refresh_user_context()
+            self.context_version = self.coordinator.context_version
+            ctx.extra["_meeting_context_version"] = self.context_version
+            if hasattr(self.coordinator, "actions"):
+                ctx.extra["_meeting_work_version"] = self.coordinator.actions.work_versions.get(self._client.member_name, 0)
+            context = json.dumps({"version": self.context_version,
+                                  "latest_user_input": self.coordinator.latest_user_input,
+                                  "shared_decision": self.coordinator.decision,
+                                  "meeting_execution": self.coordinator.actions.snapshot() if hasattr(self.coordinator, "actions") else {}}, ensure_ascii=False)
+            # The native runtime rebuilds the message window after rails run.
+            # Update its registered system section, rather than ctx.inputs.messages.
+            section = build_meeting_role_section(leader=self._leader)
+            guidance = ("\n\n[Current meeting context] Use the latest user input over older plans "
+                "and conflicting older decisions. Data follows: " + context +
+                " Discuss one agenda item per turn. Post only a new finding, disagreement or blocker; "
+                "do not acknowledge every message or repeat the Leader. Leader must call meeting_update_context "
+                "when the user changes the project or a decision changes. Keep speech concise; details stay in content.")
+            for language in section.content:
+                section.content[language] += guidance
+            self.system_prompt_builder.add_section(section)
         if self._leader and self.system_prompt_builder is not None:
             # Group startup already built the Team. The SDK's ordinary Leader
             # policy re-adds its cold-start instruction before each model call.
@@ -314,6 +434,16 @@ class MeetingPublicationRail(DeepAgentRail):
             return
         inputs = ctx.inputs
         message = None
+        if inputs.tool_name == _POST and hasattr(self.coordinator, "refresh_user_context"):
+            await self.coordinator.refresh_user_context()
+            if ctx.extra.get("_meeting_context_version", self.context_version) != self.coordinator.context_version:
+                message = "Meeting context changed during generation. Review the latest shared context and revise your post."
+        if not self._leader and hasattr(self.coordinator, "actions"):
+            actions = self.coordinator.actions
+            read_only = {"meeting_action", "meeting_read_history", "meeting_get_speaker", "read_file", "grep", "glob", "list_files", "list_members"}
+            stale = ctx.extra.get("_meeting_work_version", 0) != actions.work_versions.get(self._client.member_name, 0)
+            if inputs.tool_name not in read_only and (stale or actions.execution_paused(self._client.member_name)):
+                message = "Leader paused affected work after a user change. Stop old execution/publication; read current actions and wait for cancel/rework/reassignment. Already-running tool results are not new-scope deliverables."
         if inputs.tool_name == "send_message" and self._leader:
             args = inputs.tool_args
             if isinstance(args, str):
@@ -385,6 +515,10 @@ async def create_meeting_publication_rail(
     tools = await create_meeting_tools(coordinator.for_member(member_name), language=language)
     if roster_tool is not None:
         tools[roster_tool.card.name] = roster_tool
+    if hasattr(coordinator, "update_action"):
+        tools["meeting_action"] = MeetingActionTool(coordinator, member_name, on_interrupt)
+    if rail._leader and hasattr(coordinator, "update_context"):
+        tools["meeting_update_context"] = MeetingUpdateContextTool(coordinator, member_name)
     if rail._leader:
         tools[_ADDRESSED] = MeetingSetAddressedMembersTool(coordinator, member_name, on_addressed_members)
     rail._tools = {

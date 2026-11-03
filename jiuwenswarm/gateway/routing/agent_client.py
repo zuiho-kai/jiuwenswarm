@@ -122,7 +122,8 @@ class WebSocketAgentServerClient(AgentServerClient):
     - 接收（流式）：多条 E2AResponse 线 JSON（或 legacy chunk），解析为 AgentResponseChunk。
     """
 
-    def __init__(self, *, ping_interval: float | None = 30.0, ping_timeout: float | None = 300.0) -> None:
+    def __init__(self, *, ping_interval: float | None = 30.0, ping_timeout: float | None = 300.0, gateway_push: bool = False) -> None:
+        self._gateway_push = gateway_push
         self._uri: str | None = None
         self._ws: Any = None
         self._lock = asyncio.Lock()
@@ -241,6 +242,8 @@ class WebSocketAgentServerClient(AgentServerClient):
             for key, value in dict(extra_headers or {}).items()
             if str(value).strip()
         }
+        if self._gateway_push:
+            cleaned_headers["X-Jiuwen-Gateway-Push"] = "1"
         try:
             from websockets.legacy.client import connect as legacy_connect
             connect_fn = legacy_connect

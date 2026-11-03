@@ -905,3 +905,24 @@ def test_worker_lifecycle_owns_runtime_construct() -> None:
     text = (root / "jiuwenswarm/server/worker/lifecycle.py").read_text(encoding="utf-8")
     assert "bind_transport=False" in text
     assert "AgentWebSocketServer.get_instance" in text
+
+
+@pytest.mark.asyncio
+async def test_meeting_push_uses_gateway_instead_of_control_request_socket():
+    class Forwarder:
+        def __init__(self):
+            self.targets = []
+        async def send(self, payload, *, ws=None, send_lock=None):
+            self.targets.append(ws)
+            return True
+    forwarder = Forwarder()
+    supervisor = RuntimeSupervisor(Readiness(), forwarder=forwarder, socket_path=_socket_path())
+    gateway, query = object(), object()
+    supervisor._gateway_ws = gateway
+    supervisor._gateway_lock = asyncio.Lock()
+    supervisor._routes["playback-ready"] = (query, asyncio.Lock())
+    message = _server_push("playback-ready")
+    message["payload"]["payload"] = {"event": "meeting.speech.ready"}
+    await supervisor._forward_wire(message)
+    await supervisor._forward_wire({"request_id": "playback-ready", "payload": {"ok": True}})
+    assert forwarder.targets == [gateway, query]

@@ -8,6 +8,7 @@ import logging
 from functools import partial
 from uuid import uuid4
 
+from .errors import exception_detail
 from .input_audio import UtteranceSegmenter, pcm_wav
 
 MAX_CHUNK_BYTES = 6_400  # Up to 200 ms of signed little-endian PCM16.
@@ -20,22 +21,25 @@ logger = logging.getLogger(__name__)
 
 
 async def transcribe_utterance(pcm: bytes) -> str:
-    from jiuwenswarm.gateway.channel_manager.web.task_asr import (
-        TaskAsrError, transcribe_task_audio,
-    )
+    from jiuwenswarm.gateway.channel_manager.web.task_asr import TaskAsrError, transcribe_task_audio
     from jiuwenswarm.extensions.video_duplex.backend.video_voice import is_ignorable_asr_filler
-
-    # Meetings use Settings > Speech transcription, independently of video duplex.
     try:
         transcript = await transcribe_task_audio({
-            "audio_base64": base64.b64encode(pcm_wav(pcm)).decode("ascii"),
-            "mime_type": "audio/wav",
+            "audio_base64": base64.b64encode(pcm_wav(pcm)).decode("ascii"), "mime_type": "audio/wav",
         })
     except TaskAsrError as exc:
         if exc.code == "ASR_EMPTY_TRANSCRIPT":
             return ""
         raise
     return "" if is_ignorable_asr_filler(transcript) else transcript.strip()
+
+
+async def transcribe_joyai_utterance(audio_data_url: str) -> str:
+    # Use the same provider selection, ASR adapter and filler filter as video.transcribe.
+    from jiuwenswarm.extensions.video_duplex.backend.video_live import _uses_joyai_voice_channel
+    from jiuwenswarm.extensions.video_duplex.backend.video_voice import transcribe_audio, is_ignorable_asr_filler
+    text = await transcribe_audio([(audio_data_url, "用户麦克风")], use_joyai_voice=_uses_joyai_voice_channel())
+    return "" if is_ignorable_asr_filler(text) else text.strip()
 
 
 class MeetingInputStream:
@@ -50,14 +54,19 @@ class MeetingInputStream:
         self.sequence = 0
         self.utterance = 0
         self.segmenter = None
+        self.input_mode = "pcm"
         self.queue = asyncio.Queue(maxsize=MAX_PENDING_UTTERANCES)
         self.workers = []
         self.publisher = None
         self.results: dict[int, str | None] = {}
+        self.errors: dict[int, str] = {}
         self.results_ready = asyncio.Event()
         self.next_utterance = 1
         self.initializing = None
         self.prepare_transcript = None
+        self.prepare_speech = None
+        self.vad_preparation = None
+        self.vad_interruption = None
         self.admit_transcript = None
         self.admissions: dict[int, str] = {}
 
@@ -67,7 +76,8 @@ class MeetingInputStream:
         await asyncio.shield(self.initializing)
 
     async def initialize(self):
-        self.segmenter = await asyncio.to_thread(UtteranceSegmenter)
+        if self.input_mode != "joyai":
+            self.segmenter = await asyncio.to_thread(UtteranceSegmenter)
         if self.closed:
             raise ValueError("Meeting microphone stream has closed")
         self.workers = [asyncio.create_task(self.transcribe()) for _ in range(ASR_CONCURRENCY)]
@@ -79,6 +89,46 @@ class MeetingInputStream:
     async def emit(self, event, **payload):
         if not self.closed:
             await self.channel.send_event(self.ws, event, {**self.envelope(), **payload})
+
+    async def speech_started(self, params):
+        token = params.get("expected_token")
+        if self.closed or not self.listening or not isinstance(token, str) or not token or len(token) > 255:
+            raise ValueError("Invalid confirmed speech start")
+        if self.vad_interruption:
+            return
+        if self.vad_preparation is None:
+            async def prepare():
+                prepared = await self.prepare_speech(token)
+                self.vad_interruption = prepared.get("interruption_id")
+                return prepared
+            self.vad_preparation = asyncio.create_task(prepare())
+        try:
+            await asyncio.shield(self.vad_preparation)
+        finally:
+            if self.vad_preparation is not None and self.vad_preparation.done():
+                self.vad_preparation = None
+
+    async def release_vad(self):
+        if self.vad_preparation is not None:
+            await asyncio.shield(self.vad_preparation)
+        if self.vad_interruption:
+            if self.vad_interruption in self.admissions.values():
+                return  # A nonempty transcript is still awaiting public-message acceptance.
+            interruption_id = self.vad_interruption
+            await self.admit_transcript(interruption_id)
+            self.vad_interruption = None
+
+    async def utterance_audio(self, params):
+        from jiuwenswarm.extensions.video_duplex.backend.video_voice import MAX_AUDIO_CHARS, is_allowed_audio_data_url
+        sequence, audio = params.get("sequence"), params.get("audio_data_url")
+        if self.input_mode != "joyai" or self.closed or not self.listening:
+            raise ValueError("Meeting microphone stream is not ready")
+        if type(sequence) is not int or sequence != self.sequence:
+            raise ValueError("Out-of-order meeting utterance")
+        if not isinstance(audio, str) or not 0 < len(audio) <= MAX_AUDIO_CHARS or not is_allowed_audio_data_url(audio):
+            raise ValueError("Invalid meeting utterance audio")
+        self.enqueue([audio])
+        self.sequence += 1
 
     async def append(self, params):
         sequence, encoded = params.get("sequence"), params.get("audio_base64")
@@ -124,7 +174,7 @@ class MeetingInputStream:
             raise ValueError("Meeting microphone stream is not ready")
         async with self.audio_lock:
             self.listening = False
-            pcm = await asyncio.to_thread(self.segmenter.flush)
+            pcm = await asyncio.to_thread(self.segmenter.flush) if self.segmenter is not None else None
             if self.closed:
                 raise ValueError("Meeting microphone stream has closed")
             if pcm:
@@ -137,11 +187,17 @@ class MeetingInputStream:
             try:
                 await self.emit("meeting.input.transcribing", utterance_id=utterance_id)
                 async with asyncio.timeout(ASR_TIMEOUT_SECONDS):
-                    text = await transcribe_utterance(pcm)
+                    text = await (transcribe_joyai_utterance(pcm) if self.input_mode == "joyai" else transcribe_utterance(pcm))
             except asyncio.CancelledError:
                 self.queue.task_done()
                 raise
-            except Exception:
+            except Exception as exc:
+                self.errors[utterance_id] = (
+                    f"ASR_TIMEOUT: transcription exceeded {ASR_TIMEOUT_SECONDS} seconds"
+                    if isinstance(exc, TimeoutError)
+                    else exception_detail(exc)
+                )
+                logger.warning("Meeting utterance %s transcription failed: %s", utterance_id, self.errors[utterance_id])
                 text = None  # A terminal failure advances ordering just like an empty result.
             if self.closed:
                 self.queue.task_done()
@@ -156,19 +212,19 @@ class MeetingInputStream:
         while not self.closed:
             self.results_ready.clear()
             batch = []
-            for utterance_id in range(self.next_utterance, self.next_utterance + BATCH_SIZE):
+            for utterance_id in range(self.next_utterance, self.next_utterance + (1 if self.input_mode == "joyai" else BATCH_SIZE)):
                 if utterance_id not in self.results:
                     break
                 batch.append((utterance_id, self.results[utterance_id]))
             if batch:
                 if deadline is None:
                     deadline = loop.time() + BATCH_WAIT_SECONDS
-                if len(batch) == BATCH_SIZE or loop.time() >= deadline:
+                if self.input_mode == "joyai" or len(batch) == BATCH_SIZE or loop.time() >= deadline:
                     try:
                         await self.deliver_results(batch)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Meeting transcript batch delivery failed")
-                        await self.emit("meeting.input.error", utterance_id=batch[-1][0], code="transcriptionFailed")
+                        await self.emit("meeting.input.error", utterance_id=batch[-1][0], code="transcriptionFailed", error=f"Transcript publication: {type(exc).__name__}: {exc}")
                     finally:
                         for utterance_id, _ in batch:
                             self.results.pop(utterance_id)
@@ -190,7 +246,8 @@ class MeetingInputStream:
                 # Emit failures in order, flushing earlier text before their IDs.
                 await self.deliver_transcript(group)
                 group = []
-                await self.emit("meeting.input.error", utterance_id=utterance_id, code="transcriptionFailed")
+                await self.release_vad()
+                await self.emit("meeting.input.error", utterance_id=utterance_id, code="transcriptionFailed", error=self.errors.pop(utterance_id, "ASR worker returned no transcript and no diagnostic"))
             else:
                 group.append((utterance_id, text))
         await self.deliver_transcript(group)
@@ -200,27 +257,32 @@ class MeetingInputStream:
             return
         utterance_id = group[-1][0]
         text = " ".join(text for _, text in group if text)
-        prepared = {}
-        if text and self.prepare_transcript is not None:
+        if self.vad_preparation is not None:
+            await asyncio.shield(self.vad_preparation)
+        prepared = {"interruption_id": self.vad_interruption} if self.vad_interruption else {}
+        if not text and self.vad_interruption:
+            await self.release_vad()
+            prepared = {}
+        if text and not prepared and self.prepare_transcript is not None:
             try:
                 prepared = await self.prepare_transcript(text)
             except Exception:
                 logger.warning("Meeting interruption preparation failed; delivering transcript", exc_info=True)
-            if not self.closed and prepared.get("interruption_id"):
-                self.admissions[utterance_id] = prepared["interruption_id"]
+        if not self.closed and prepared.get("interruption_id"):
+            self.admissions[utterance_id] = prepared["interruption_id"]
         await self.emit("meeting.input.transcript", utterance_id=utterance_id, transcript=text, **prepared)
 
     def revoke(self):
         if self.closed:
             return
         self.closed = True
-        for task in (*self.workers, self.publisher, self.initializing):
+        for task in (*self.workers, self.publisher, self.initializing, self.vad_preparation):
             if task is not None:
                 task.cancel()
 
     async def close(self):
         self.revoke()
-        tasks = [task for task in (*self.workers, self.publisher, self.initializing) if task is not None]
+        tasks = [task for task in (*self.workers, self.publisher, self.initializing, self.vad_preparation) if task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         while not self.queue.empty():
@@ -229,12 +291,15 @@ class MeetingInputStream:
         for _ in self.results:
             self.queue.task_done()
         self.results.clear()
+        self.errors.clear()
 
     async def admitted(self, params):
         utterance_id, interruption_id = params.get("utterance_id"), params.get("interruption_id")
         if type(utterance_id) is not int or self.admissions.get(utterance_id) != interruption_id or not interruption_id:
             raise ValueError("Unknown human-input interruption")
         await self.admit_transcript(interruption_id)
+        if self.vad_interruption == interruption_id:
+            self.vad_interruption = None
 
 
 
@@ -248,8 +313,12 @@ def bind_input_handlers(channel, route_for):
             if candidate.closed or params.get("stream_id") != candidate.id:
                 raise ValueError("Unknown or stale meeting microphone stream")
             stream = candidate
-            if operation == "append":
+            if operation == "utterance":
+                await stream.utterance_audio(params)
+            elif operation == "append":
                 await stream.append(params)
+            elif operation == "speech_started":
+                await stream.speech_started(params)
             elif operation == "admitted":
                 await stream.admitted(params)
             elif operation == "stop":
@@ -258,9 +327,9 @@ def bind_input_handlers(channel, route_for):
                 await stream.listening_control(operation == "resume")
             await channel.send_response(ws, req_id, ok=True, payload={"accepted": True})
         except Exception as exc:
-            if stream is not None and operation != "admitted":
+            if stream is not None and operation not in {"admitted", "speech_started"}:
                 await stream.close()
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_INPUT_FAILED")
+            await channel.send_response(ws, req_id, ok=False, error=f"meeting.input.{operation}: {exception_detail(exc)}", code="MEETING_INPUT_FAILED")
 
-    for operation in ("append", "pause", "resume", "stop", "admitted"):
+    for operation in ("append", "utterance", "pause", "resume", "stop", "admitted", "speech_started"):
         channel.register_method(f"meeting.input.{operation}", partial(control, operation=operation), local_only=True)

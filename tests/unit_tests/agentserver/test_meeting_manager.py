@@ -101,6 +101,24 @@ async def _wait_for_idle(manager):
 
 
 @pytest.mark.asyncio
+async def test_reload_releases_pending_start_before_team_activation(setup_manager):
+    manager, teams = setup_manager
+    teams.active = False
+    await manager.request_start("session-one", "old-page", "startup-one")
+    task = manager._sessions["session-one"].task
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert await manager.release("session-one", "old-page", "startup-one")
+    await asyncio.wait_for(task, 1)
+    assert await manager.lifecycle_status("session-one") == {"state": "idle"}
+    assert teams.backend.conversation_calls == 0
+    teams.active = True
+    await manager.request_start("session-one", "new-page", "startup-two")
+    await asyncio.wait_for(manager._sessions["session-one"].task, 1)
+    assert (await manager.lifecycle_status("session-one"))["state"] == "active"
+
+
+@pytest.mark.asyncio
 async def test_start_attaches_existing_team_resources_once(setup_manager):
     manager, teams = setup_manager
 

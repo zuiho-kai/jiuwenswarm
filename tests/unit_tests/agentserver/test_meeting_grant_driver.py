@@ -74,7 +74,7 @@ async def test_native_posts_wake_driver_and_only_matching_completion_advances(
     meeting, publication_host, monkeypatch, native_factory,
 ):
     # Hold the SDK grant, so both native agents can finish tool work while their
-    # posts remain unpublished. The host does not choose their queue order.
+    # audio waits. Full text must arrive even before the first speaking grant.
     allow_grant = asyncio.Event()
     coordinator = publication_host.manager._sessions["publication-session"].coordinator
     original = coordinator.grant_next
@@ -97,15 +97,15 @@ async def test_native_posts_wake_driver_and_only_matching_completion_advances(
         assert all(result["meeting_queued"] for result in results)
         pending = await coordinator.list_pending()
         assert len(pending) == 2
-        assert await meeting.db.message.get_team_messages("publication-team") == []
-        assert await meeting.db.message.get_broadcast_messages("publication-team", "analyst") == []
-        assert not meeting.conversation.history_path.exists()
+        assert len(await meeting.db.message.get_team_messages("publication-team")) == 2
+        assert len(await meeting.db.message.get_broadcast_messages("publication-team", "analyst")) >= 1
+        assert meeting.conversation.history_path.exists()
 
         allow_grant.set()
         first = await _next(consumer.ready)
         assert first.request_id == pending[0].request_id
         assert first.source_message_id and not first.delivery_error
-        assert len(await meeting.db.message.get_team_messages("publication-team")) == 1
+        assert len(await meeting.db.message.get_team_messages("publication-team")) == 2
         assert (await coordinator.get_speaker()).lease_token == first.lease_token
         assert len(await coordinator.list_pending()) == 1
         assert consumer.ready.empty()  # Returning from speech_ready did not complete.
@@ -160,7 +160,7 @@ async def test_failed_publication_holds_lease_and_retry_reuses_committed_message
     recovered = await _next(consumer.ready)
     assert (recovered.request_id, recovered.lease_token) == (request.request_id, request.lease_token)
     assert recovered.source_message_id == stored.message_id
-    assert len(await meeting.db.message.get_team_messages("publication-team")) == 1
-    assert len(meeting.conversation.history_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(await meeting.db.message.get_team_messages("publication-team")) == 2
+    assert len(meeting.conversation.history_path.read_text(encoding="utf-8").splitlines()) == 2
     assert await _complete(publication_host, recovered)
     assert (await _next(consumer.ready)).request_id == next_queued.request_id

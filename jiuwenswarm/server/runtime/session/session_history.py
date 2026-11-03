@@ -1163,7 +1163,7 @@ def append_history_record(
             # 传入用户消息内容,用于自动生成标题
             user_content=(
                 content_text
-                if role_norm == "user" and not is_cross_session_user
+                if role_norm == "user" and not is_cross_session_user and not (extra or {}).get("meeting_startup")
                 else None
             ),
             # 传入渠道元数据,首次写入时持久化
@@ -1176,7 +1176,7 @@ def append_history_record(
             # 与 AgentServer 的 _sync_chat_request_metadata 互补,覆盖所有记录用户消息的路径)
             last_user_message_at=(
                 float(timestamp)
-                if role_norm == "user" and not is_cross_session_user
+                if role_norm == "user" and not is_cross_session_user and not (extra or {}).get("meeting_startup")
                 else None
             ),
         )

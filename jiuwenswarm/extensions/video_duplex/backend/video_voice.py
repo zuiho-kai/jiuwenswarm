@@ -149,11 +149,17 @@ async def transcribe_audio(
         ]
         return "。".join(text for text in transcripts if text)
 
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, APIConnectionError
 
     endpoint, api_key, model = asr_model_config()
-    if not audio_inputs or not all((endpoint, api_key, model)):
+    if not audio_inputs:
         return ""
+    missing = [name for name, value in (("VOICE_ASR_ENDPOINT / ASR_API_BASE", endpoint), ("VOICE_API_KEY / ASR_API_KEY", api_key), ("VOICE_ASR_MODEL / ASR_MODEL_NAME", model)) if not value]
+    if missing:
+        raise ValueError("ASR configuration missing: " + ", ".join(missing) + ". Configure full-duplex speech recognition before starting a meeting.")
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Invalid ASR endpoint in VOICE_ASR_ENDPOINT / ASR_API_BASE: expected a complete http:// or https:// URL. Check full-duplex speech recognition settings.")
     endpoint_kind, api_base = resolve_asr_endpoint(endpoint, model)
     client = AsyncOpenAI(api_key=api_key, base_url=api_base, timeout=45.0)
     try:
@@ -186,6 +192,23 @@ async def transcribe_audio(
             temperature=0,
         )
         return clean_model_text(response.choices[0].message.content or "")
+    except APIConnectionError as exc:
+        cause = exc.__cause__
+        causes = []
+        for _ in range(4):
+            if cause is None:
+                break
+            # Keep network failure types; exception URLs can contain credentials.
+            causes.append(type(cause).__name__)
+            cause = cause.__cause__
+        origin = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port:
+            origin += f":{parsed.port}"
+        raise RuntimeError(
+            f"ASR connection failed: service={origin}, model={model}, route={endpoint_kind}, "
+            f"cause={' -> '.join(causes) or type(exc).__name__}. "
+            "Check VOICE_ASR_ENDPOINT, DNS, proxy, TLS certificates and provider availability."
+        ) from exc
     finally:
         await client.close()
 

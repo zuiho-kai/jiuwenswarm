@@ -376,10 +376,10 @@ class RuntimeSupervisor:
             return
         request_id = str(message.get("request_id") or payload.get("request_id") or "")
         route = self._routes.get(request_id) if request_id else None
-        if route is not None:
-            ws, send_lock = route
-        elif _is_server_push(payload):
+        if _is_server_push(payload):
             ws, send_lock = self._gateway_ws, self._gateway_lock
+        elif route is not None:
+            ws, send_lock = route
         else:
             logger.warning(
                 "[Supervisor] dropped worker wire; no route request_id=%s generation=%s",

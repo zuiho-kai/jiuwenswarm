@@ -51,6 +51,8 @@ def _isolate_video_mode_environment(monkeypatch) -> None:
         "VOICE_TTS_MODEL",
         "VOICE_TTS_VOICE",
         "JOYAI_VOICE_PROVIDER",
+        "JOYAI_ASR_WS_URL",
+        "JOYAI_TTS_WS_URL",
         "ASR_API_MODE",
         "QWEN_OMNI_REALTIME_URL",
         "QWEN_OMNI_API_KEY",
@@ -2785,3 +2787,37 @@ async def test_core_agent_full_answer_follows_tool_language(monkeypatch) -> None
     assert "must be written in English" in prompt
     assert "必须使用简体中文" not in prompt
     assert "Speak to the user in English" in prompt
+
+
+@pytest.mark.asyncio
+async def test_asr_rejects_invalid_endpoint_before_opening_connection(monkeypatch):
+    monkeypatch.setattr(video_voice, "asr_model_config", lambda: ("1", "key", "FunAudioLLM/SenseVoiceSmall"))
+    with pytest.raises(ValueError, match="Invalid ASR endpoint.*VOICE_ASR_ENDPOINT"):
+        await video_voice.transcribe_audio([("data:audio/wav;base64,AAAA", "microphone")], use_joyai_voice=False)
+
+
+@pytest.mark.asyncio
+async def test_asr_missing_config_is_not_reported_as_empty_speech(monkeypatch):
+    monkeypatch.setattr(video_voice, "asr_model_config", lambda: ("", "key", "model"))
+    with pytest.raises(ValueError, match="ASR configuration missing"):
+        await video_voice.transcribe_audio([("data:audio/wav;base64,AAAA", "microphone")], use_joyai_voice=False)
+
+
+@pytest.mark.asyncio
+async def test_asr_connection_error_identifies_service_model_and_network_cause(monkeypatch):
+    import httpx
+    import openai
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    failure = openai.APIConnectionError(request=httpx.Request("POST", "https://voice.example/v1/audio/transcriptions"))
+    failure.__cause__ = httpx.ConnectError("connection refused")
+    client = SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=AsyncMock(side_effect=failure))), close=AsyncMock())
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(video_voice, "asr_model_config", lambda: ("https://voice.example/v1", "private-key", "SenseVoiceSmall"))
+    with pytest.raises(RuntimeError) as error:
+        await video_voice.transcribe_audio([("data:audio/wav;base64,AAAA", "microphone")], use_joyai_voice=False)
+    assert "service=https://voice.example" in str(error.value)
+    assert "model=SenseVoiceSmall" in str(error.value)
+    assert "ConnectError" in str(error.value)
+    assert "private-key" not in str(error.value)
+    client.close.assert_awaited_once()

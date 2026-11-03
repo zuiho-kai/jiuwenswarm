@@ -600,6 +600,17 @@ export const MessageItem = memo(function MessageItem({
     return <GoalCompletedCard content={content} />;
   }
 
+  if (message.isMeetingStartup) {
+    return (
+      <section className="my-5 rounded-xl border border-border bg-card px-4 py-3 text-text-muted" data-testid="chat-panel-meeting-opening">
+        <div className="flex items-center gap-2 text-sm font-medium text-text" data-testid="chat-panel-meeting-opening-title">
+          <Info size={16} aria-hidden="true" />{t('meeting.opening.title')}
+        </div>
+        <p className="mt-1 text-sm leading-6" data-testid="chat-panel-meeting-opening-description">{t('meeting.opening.description')}</p>
+      </section>
+    );
+  }
+
   // 系统消息
   if (role === 'system') {
     // slash 命令输出按命令类型路由：compact 使用时间线分隔条，

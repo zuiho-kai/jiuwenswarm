@@ -26,7 +26,8 @@ def _nonblank(value: str, label: str) -> str:
 
 def _language(value: str) -> str:
     language = _nonblank(value, "Language").replace("_", "-").lower()
-    if language in {"zh", "zh-cn", "zh-hans"}:
+    # Team specs use the SDK's short code "cn"; voice catalogs use "zh-CN".
+    if language in {"zh", "zh-cn", "zh-hans", "cn"}:
         return "zh-CN"
     if language == "en" or language.startswith("en-"):
         return "en"

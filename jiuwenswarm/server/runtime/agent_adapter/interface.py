@@ -493,6 +493,9 @@ def _history_user_extra(params: Any) -> dict[str, Any] | None:
         return None
 
     extra = _with_cross_session_history_metadata(None, params) or {}
+    if params.get("meeting_mode") is True and params.get("meeting_startup") is True:
+        extra["meeting_startup"] = True
+
     raw_media_items = params.get("media_items")
     if isinstance(raw_media_items, list):
         media_items: list[dict[str, Any]] = []

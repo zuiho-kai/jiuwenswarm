@@ -16,6 +16,7 @@ let useWebSocket;
 let useChatStore;
 let useSessionStore;
 let webClient;
+let claimMeetingAudio;
 
 before(async () => {
   const cacheDir = fileURLToPath(new URL('node_modules/.cache/websocket-stream-boundary/', frontendRoot));
@@ -28,6 +29,7 @@ before(async () => {
       { in: 'src/stores/chatStore.ts', out: 'chatStore' },
       { in: 'src/stores/sessionStore.ts', out: 'sessionStore' },
       { in: 'src/services/webClient.ts', out: 'webClient' },
+      { in: 'src/features/teamMeeting/playbackOwnership.ts', out: 'playbackOwnership' },
     ],
     absWorkingDir: fileURLToPath(frontendRoot),
     bundle: true,
@@ -42,6 +44,7 @@ before(async () => {
   ({ useChatStore } = await import(pathToFileURL(join(cacheDir, 'chatStore.js')).href));
   ({ useSessionStore } = await import(pathToFileURL(join(cacheDir, 'sessionStore.js')).href));
   ({ webClient } = await import(pathToFileURL(join(cacheDir, 'webClient.js')).href));
+  ({ claimMeetingAudio } = await import(pathToFileURL(join(cacheDir, 'playbackOwnership.js')).href));
 });
 
 function installDom() {
@@ -114,8 +117,9 @@ async function mountConnection(context, sessionIds) {
     useSessionStore.getState().ensureRuntime(sessionId);
     useSessionStore.getState().setMode(sessionId, 'agent');
   }
+  let hook;
   function Probe() {
-    useWebSocket({ activeSessionId: sessionIds[0] });
+    hook = useWebSocket({ activeSessionId: sessionIds[0] });
     return null;
   }
   await act(async () => root.render(createElement(Probe)));
@@ -123,6 +127,7 @@ async function mountConnection(context, sessionIds) {
   assert.equal(dom.sockets.length, 1);
   const socket = dom.sockets[0];
   return {
+    sendMessage: (...args) => hook.sendMessage(...args),
     runtime: (sessionId = sessionIds[0]) => useChatStore.getState().getRuntime(sessionId),
     receive(event, payload) {
       act(() => socket.receive(event, payload));
@@ -153,6 +158,24 @@ async function mountConnection(context, sessionIds) {
     },
   };
 }
+
+test('live completion during history restore clears stale startup busy state', async (context) => {
+  const sessionId = 'meeting-refresh';
+  const connection = await mountConnection(context, [sessionId]);
+  try {
+    useChatStore.getState().setProcessing(sessionId, true);
+    useChatStore.getState().setThinking(sessionId, true);
+    useChatStore.getState().setLoadingHistory(sessionId, true);
+    connection.receive('chat.processing_status', { session_id: sessionId, is_processing: false, is_complete: true });
+    assert.equal(connection.runtime().isProcessing, false);
+    assert.equal(connection.runtime().isThinking, false);
+    assert.equal(connection.runtime().isLoadingHistory, true);
+    useChatStore.getState().setLoadingHistory(sessionId, false);
+    assert.equal(connection.runtime().isProcessing, false);
+  } finally {
+    await connection.dispose();
+  }
+});
 
 test('cross-session queue status is visible while the target is processing', async (context) => {
   const sessionId = 'target-session';
@@ -475,4 +498,30 @@ test('late paused output stays with its request across a new user turn and anoth
     assert.equal(connection.runtime().messages[2].isStreaming, true);
     assert.deepEqual(connection.runtime(other).messages.map(m => m.content), ['另一会话']);
   } finally { await connection.dispose(); }
+});
+
+
+test('meeting input preserves speech while ordinary chat still stops TTS', async (context) => {
+  const sessionId = 'meeting-input-audio';
+  const connection = await mountConnection(context, [sessionId]);
+  const release = claimMeetingAudio(sessionId);
+  let stops = 0;
+  window.addEventListener('jiuwen-tts-stop', () => stops++);
+  context.mock.method(webClient, 'request', async () => ({ success: true }));
+  try {
+    await act(async () => {
+      await connection.sendMessage('Final microphone transcript', sessionId, [], {
+        groupChat: { sessionId, clientMessageId: 'transcript', mentions: [], meeting: true },
+      });
+    });
+    assert.equal(stops, 0);
+    await act(async () => { await connection.sendMessage('Typed meeting input', sessionId); });
+    assert.equal(stops, 0);
+    release();
+    await act(async () => { await connection.sendMessage('Ordinary chat input', sessionId); });
+    assert.equal(stops, 1);
+  } finally {
+    release();
+    await connection.dispose();
+  }
 });

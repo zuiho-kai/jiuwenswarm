@@ -133,7 +133,12 @@ def identity(speech):
 async def test_ready_gate_server_summary_and_per_member_voices(browser):
     driver, consumer = await activate(browser)
     assert (await browser.call("meeting.playback.ready"))["ok"]
-    await queue(browser, driver, text="Sentence. " * 100)
+    # Legacy SDK admissions still need safe chunked playback; new native tools
+    # enforce the shorter summary budget before admission.
+    from openjiuwen.agent_teams.meeting import MeetingCoordinator
+    await MeetingCoordinator._post_message(driver.coordinator, "leader",
+        "Full public explanation, never synthesized", speech_text="Sentence. " * 100, mentions=["analyst"])
+    driver.wake()
     speech = await next_speech(browser)
     assert speech["voice"] == f"{COSYVOICE_MODEL}:anna" and speech["chunk_count"] == 2
     assert "".join(speech["chunks"]) == ("Sentence. " * 100).strip()
@@ -355,3 +360,27 @@ async def test_meeting_uses_qwen_through_the_same_tts_interface(browser, monkeyp
     }))["ok"]
     assert (await browser.call("meeting.end"))["ok"]
     assert len(sockets) == 1 and sockets[0].closed
+
+
+async def test_skip_current_audio_advances_and_queue_cancel_preserves_text(browser):
+    driver, _ = await activate(browser)
+    await queue(browser, driver)
+    first = await next_speech(browser)
+    await queue(browser, driver, "analyst", "Next summary")
+    assert not (await browser.call("meeting.queue.control", {"operation": "status"}, connection=SimpleNamespace()))["ok"]
+    status = await browser.call("meeting.queue.control", {"operation": "status"})
+    assert status["ok"] and len(status["payload"]["pending"]) == 1
+    receipt = {**identity(first), "outcome": "skipped", "completed_chunks": 0}
+    assert (await browser.call("meeting.playback.result", receipt))["ok"]
+    second = await next_speech(browser)
+    assert second["speaker_id"] == "analyst"
+    route = next(iter(browser.ws._meeting_playback_routes.values()))
+    assert not route.revoked and not route.input.closed
+    assert (await browser.call("meeting.playback.result", receipt))["ok"]
+    await queue(browser, driver, "leader", "Waiting summary")
+    status = await browser.call("meeting.queue.control", {"operation": "status"})
+    waiting = status["payload"]["pending"][0]
+    assert (await browser.call("meeting.queue.control", {"operation": "cancel", "request_id": waiting["request_id"]}))["ok"]
+    assert not await driver.coordinator.list_pending()
+    history = await driver.coordinator.for_member("leader").get_history()
+    assert len(history) == 3

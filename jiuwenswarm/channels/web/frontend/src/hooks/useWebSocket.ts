@@ -1986,7 +1986,8 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
       resetContextCompressionTurn(sessionId);
       userInputVersionRef.current += 1;
-      stopAllTts();
+      // Meeting speech advances through lease receipts; generic TTS stop would hold its queue.
+      if (!options?.groupChat?.meeting && !hasMeetingAudioOwner(sessionId)) stopAllTts();
 
       // A new query supersedes an unanswered inline question for this same session.
       if (useChatStore.getState().getRuntime(sessionId)?.pendingQuestions[0]) {
@@ -2036,7 +2037,8 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       ) {
         useChatStore.getState().addMessage(sessionId, {
           id: userMessageId,
-          role: 'user',
+          role: groupChat?.meetingStartup ? 'system' : 'user',
+          ...(groupChat?.meetingStartup ? { isMeetingStartup: true } : {}),
           content: displayedContent,
           mediaItems,
           timestamp: new Date().toISOString(),
@@ -2170,6 +2172,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
                 client_message_id: groupChat.clientMessageId,
                 mentions: groupChat.mentions,
                 ...(groupChat.meeting ? { meeting_mode: true } : {}),
+                ...(groupChat.meetingStartup ? { meeting_startup: true } : {}),
               }
             : {}),
           ...(outgoingMediaItems ? { media_items: outgoingMediaItems } : {}),
@@ -2257,7 +2260,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     async (content: unknown, sessionId: string) => {
       resetContextCompressionTurn(sessionId);
       userInputVersionRef.current += 1;
-      stopAllTts();
+      if (!hasMeetingAudioOwner(sessionId)) stopAllTts();
 
       useChatStore.getState().setProcessing(sessionId, true);
       useChatStore.getState().setThinking(sessionId, true);
@@ -2391,7 +2394,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       if (intent === 'supplement' && newInput) {
         resetContextCompressionTurn(sessionId);
         userInputVersionRef.current += 1;
-        stopAllTts();
+        if (!hasMeetingAudioOwner(sessionId)) stopAllTts();
         if (useSessionStore.getState().getRuntime(sessionId)?.mode === 'team') {
           closeActiveTeamLeaderMessages(sessionId);
         }
@@ -4527,9 +4530,18 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (isProactiveRecommendationPayload(payload)) return;
         // 切换模式时忽略处理状态更新
         if (useChatStore.getState().getRuntime(sessionId)?.switchingMode) return;
-        // 加载历史消息时忽略处理状态更新
-        if (useChatStore.getState().getRuntime(sessionId)?.isLoadingHistory) return;
         const isProcessingNow = Boolean(payload.is_processing);
+        // History replay must not discard live lifecycle changes. In particular,
+        // startup can finish after metadata was read but before history arrives.
+        // Keep state current without draining queued sends during restoration.
+        if (useChatStore.getState().getRuntime(sessionId)?.isLoadingHistory) {
+          useChatStore.getState().setProcessing(sessionId, isProcessingNow);
+          if (!isProcessingNow) useChatStore.getState().setThinking(sessionId, false);
+          const patch = { is_processing: isProcessingNow };
+          updateSession(sessionId, patch);
+          useWorkspaceStore.getState().patchSession(sessionId, patch);
+          return;
+        }
 
         // 服务器在跨会话执行前先推送带原始问题的 processing=true。把它显式
         // 追加为一个新 user turn，并关闭可能残留的旧 stream 游标；历史消息本身

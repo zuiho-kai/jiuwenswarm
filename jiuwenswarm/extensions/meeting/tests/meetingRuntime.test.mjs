@@ -24,13 +24,14 @@ function harness({startCapture = async()=>{}} = {}) {
     },
   };
   const callbacks={line:line=>lines.push(line),error:code=>errors.push(code),draft:text=>drafts.push(text),recording:state=>states.push(state),ended:()=>{}};
-  let onPcm, captureError;
+  let onPcm, captureError, onSpeech, onTurn;
   const capture={stopped:false,start:startCapture,stop(){this.stopped=true;}};
-  const meeting=new MeetingSession(transport,'s',context,callbacks,(_stream,pcm,error)=>{onPcm=pcm;captureError=error;return capture;});
+  const meeting=new MeetingSession(transport,'s',context,callbacks,(_stream,pcm,error,speech,turn)=>{onTurn=turn;onPcm=pcm;captureError=error;onSpeech=speech;return capture;});
   const track={stop(){this.stopped=true;},onended:null};
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[track],getAudioTracks:()=>[track]})}}});
   return {meeting,requests,handlers,track,lines,errors,drafts,states,resolvers,rejectors,capture,callbacks,
-    pcm:(samples=new Int16Array(1600).fill(1000))=>onPcm(samples), captureError:()=>captureError(),
+    turn:(audio="data:audio/wav;base64,UklGRg==")=>onTurn(audio),
+    speechDetected:(active=true)=>onSpeech(active), pcm:(samples=new Int16Array(1600).fill(1000))=>onPcm(samples), captureError:()=>captureError(),
     disconnect:()=>onState?.('closed')};
 }
 
@@ -164,4 +165,100 @@ test('failed human input and ended meetings never acknowledge admission',async()
  h.meeting.stop();accept();await tick();
  assert.ok(!h.requests.some(r=>r.name==='meeting.input.admitted'));
  h.meeting.finishCleanup();
+});
+
+
+test('pausing microphone leaves speech completion and the next speaker active', async () => {
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+ await tick();h.meeting.stopRecording();await tick();
+ assert.ok(h.requests.some(r=>r.name==='meeting.input.pause'));
+ assert.ok(!audios[0].paused);assert.ok(!h.capture.stopped);
+ inputEvent(h,'meeting.input.transcript',{transcript:'Last words before mute'});await tick();
+ assert.deepEqual(h.drafts,['Last words before mute']);
+ audios[0].onended();await tick();
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.result').params.outcome,'completed');
+ emitSpeech(h,{playback_id:'next',request_id:'next-request',lease_token:'next-lease'});await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'next',chunk_index:0});
+ await tick();assert.equal(audios.length,2);audios[1].onended();await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.playback.result'&&r.params.outcome==='completed').length,2);
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+
+test('skip during synthesis advances without pausing the meeting or playing late audio', async () => {
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+ await h.meeting.skipSpeech();await tick();
+ const skipped=h.requests.find(r=>r.name==='meeting.playback.result');
+ assert.equal(skipped.params.outcome,'skipped');
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+ await tick();assert.equal(audios.length,0);
+ emitSpeech(h,{playback_id:'next',request_id:'next-request',lease_token:'next-lease'});await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'next',chunk_index:0});
+ await tick();assert.equal(audios.length,1);audios[0].onended();await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.playback.result').at(-1).params.outcome,'completed');
+ assert.ok(!h.capture.stopped);h.meeting.stop();h.meeting.finishCleanup();
+});
+
+
+test('confirmed duplex VAD stops TTS locally before transcription or the network response', async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+ await tick();assert.equal(audios.length,1);assert.ok(!audios[0].paused);
+ h.speechDetected();
+ assert.ok(audios[0].paused); // synchronous: no ASR and no server round trip
+ await tick();
+ const requests=h.requests.filter(r=>r.name==='meeting.input.speech_started');
+ assert.equal(requests.length,1);assert.equal(requests[0].params.expected_token,'lease');
+ assert.ok(!h.requests.some(r=>r.name==='meeting.playback.result'));
+ assert.ok(!h.capture.stopped && !h.track.stopped);
+ h.speechDetected();await tick();assert.equal(h.requests.filter(r=>r.name==='meeting.input.speech_started').length,1);
+ interruptSpeech(h);await tick();h.meeting.stop();h.meeting.finishCleanup();
+});
+
+test('confirmed VAD during synthesis prevents late audio; paused microphone ignores detections',async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);emitSpeech(h);await tick();
+ h.speechDetected();await tick();
+ h.resolvers['meeting.speech.synthesize']({success:true,audio_base64:'YQ==',playback_id:'playback',chunk_index:0});
+ await tick();assert.equal(audios.length,0);
+ h.meeting.stopRecording();h.speechDetected();await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.input.speech_started').length,1);
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+
+test('speech confirmed while idle also stops a newly arriving speaker before synthesis',async()=>{
+ const h=harness(),audios=audioHarness();await ready(h);h.speechDetected();await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.input.speech_started').length,0);
+ emitSpeech(h);await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.input.speech_started').length,1);
+ assert.equal(h.requests.filter(r=>r.name==='meeting.speech.synthesize').length,0);
+ assert.equal(audios.length,0);
+ interruptSpeech(h);await tick();h.speechDetected(false);
+ h.meeting.stop();h.meeting.finishCleanup();
+});
+
+
+test('JoyAI meeting sends completed browser utterances and drops turns after End', async()=>{
+ const h=harness();await ready(h);
+ assert.equal(h.requests.find(r=>r.name==='meeting.playback.ready').params.input_mode,'joyai');
+ h.turn();h.turn();await tick();await tick();
+ const turns=h.requests.filter(r=>r.name==='meeting.input.utterance');
+ assert.deepEqual(turns.map(r=>r.params.sequence),[0,1]);
+ assert.equal(turns[0].params.audio_data_url,'data:audio/wav;base64,UklGRg==');
+ assert.ok(!h.requests.some(r=>r.name==='meeting.input.append'));
+ inputEvent(h,'meeting.input.transcript',{transcript:'第一句'});
+ await tick();assert.deepEqual(h.drafts,['第一句']);
+ h.meeting.stop();h.turn();await tick();
+ assert.equal(h.requests.filter(r=>r.name==='meeting.input.utterance').length,2);
+ h.meeting.finishCleanup();
+});
+
+
+test('ASR failures forward their specific cause rather than only the stage name', async()=>{
+ const h=harness();await ready(h);const failures=[];
+ h.callbacks.error=(code,detail)=>failures.push({code,detail});
+ inputEvent(h,'meeting.input.error',{error:'ASR_TIMEOUT: transcription exceeded 60 seconds'});
+ assert.deepEqual(failures,[{code:'transcriptionFailed',detail:'ASR_TIMEOUT: transcription exceeded 60 seconds'}]);
+ h.meeting.stop();h.meeting.finishCleanup();
 });

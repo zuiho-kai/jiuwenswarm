@@ -222,3 +222,9 @@ async def test_heartbeat_stream_persists_both_turns_in_original_session(
     assert assistant_records[0]["extra"]["metadata"] == {
         "automation": params["automation"]
     }
+
+
+def test_meeting_startup_marker_is_explicit_and_does_not_mark_real_speech():
+    assert _history_user_extra({"meeting_mode": True, "meeting_startup": True})["meeting_startup"] is True
+    assert not (_history_user_extra({"meeting_mode": True}) or {}).get("meeting_startup")
+    assert not (_history_user_extra({"meeting_startup": True}) or {}).get("meeting_startup")

@@ -1,5 +1,40 @@
 # Team meeting startup and voice
 
+## Responsive host policy
+
+The application uses `ResponsiveMeetingCoordinator`; the SDK itself is unchanged.
+Full text is published immediately, while spoken summaries wait for a lease.
+Chinese summaries are limited to 150 characters, English to 65 words (600
+characters maximum). Overlong summaries return a tool error for rewriting; they
+are never silently truncated. Each member has at most one waiting summary: a
+new post replaces that member's waiting audio and preserves all published text.
+After 60 seconds, waiting requests take priority over fresh Leader requests.
+
+The Leader calls `meeting_update_context(summary)` for a substantive project or
+decision change. It delivers a text-only decision update to all native members,
+replaces their shared context, and cancels waiting old audio. The current speech
+and published history remain intact. An in-flight post from an older context is
+rejected so the member can revise it on the next model call. The system prompt
+section carries this context because the native runtime rebuilds its message
+window after model hooks. Context lives for this meeting; restart starts a new scope.
+
+The panel shows the shared decision, pending summaries, and text delivery state.
+Remove audio cancels only a waiting request. Skip current speech drains synthesis,
+records a skipped receipt, and advances without muting input. Queue controls
+require the owning browser connection. Explicit floor-taking commands such as
+All confirmed human speech yields the audio floor without a semantic classifier;
+other utterances still use its configured provider and conservative fallback.
+
+```mermaid
+flowchart LR
+  A[Agent post] --> B[Full text delivered]
+  A --> C[Latest summary per member]
+  C --> D[Priority with waiting-time promotion]
+  D --> E[Playback or explicit skip]
+  E --> D
+  F[Decision update] --> G[Notify members and revoke waiting old audio]
+```
+
 Enable **Team meetings** under **Settings → Experimental**. The switch persists as
 `experimental.team_meeting_enabled` in the existing configuration system and
 updates the Task controls immediately. The feature is off by default.
@@ -68,8 +103,9 @@ startup flow reuse the message identity. The text editor, Send button, and Enter
 submission stay disabled until the existing startup and playback-ready handshake
 finish. The microphone starts transmitting only after that handshake.
 
-The microphone streams continuously while the meeting is listening. Gateway runs
-Silero VAD, transcribes completed utterances through the existing ASR provider,
+The microphone uses the same `JoyAIVoiceSession` as JoyAI full duplex. Browser
+Silero VAD segments speech and sends completed WAV utterances to Gateway, which
+transcribes them through the full-duplex ASR adapter
 and sends each transcript through normal structured group-chat delivery. There
 is no editor review or manual Send step. Listening continues during transcription
 and agent playback. Pause microphone flushes a confirmed current utterance and
@@ -163,16 +199,17 @@ pre-fills the saved TTS API key, masked by default with a visibility toggle. Mis
 settings fail explicitly without falling back to another provider.
 Restart the meeting after changing settings. Existing `QWEN_OMNI_*` configuration,
 catalog and adapter remain available for other consumers. Meeting TTS never
-inherits the normal Qwen/video credentials. Video-duplex implementation is unchanged;
-input uses Settings > Speech transcription (`ASR_API_BASE`, `ASR_API_KEY`, and
-`ASR_MODEL_NAME`), independently of the video-duplex provider and voice settings.
+inherits the normal Qwen/video credentials. Meeting input shares full-duplex provider selection and ASR configuration,
+including the native JoyAI voice channel when configured. The separate task ASR
+configuration is used only by legacy PCM clients.
 
 Only natural playback completion of every chunk reports `meeting.playback.result`
 as completed and releases the SDK speaking lease. Synthesized audio alone never
 advances it as completed. A synthesis/playback error shows its failure, drains the
 failed synthesis, and marks that speech interrupted before continuing to the next
-queued item. Published full text remains available. Stop audio still holds the
-queue in a paused state; end the meeting to start again. Duplicate result receipts are idempotent,
+queued item. Published full text remains available. The panel now uses Skip current speech,
+which reports `skipped` and continues the queue. The legacy `stopped` receipt
+still holds the queue for consumers that explicitly pause playback. Duplicate result receipts are idempotent,
 including after the next grant. Foreign identities and stale leases are rejected.
 
 End revokes synthesis, sends `meeting.playback.stop`, and waits for the browser's
@@ -186,18 +223,25 @@ session, and manual TTS shares an audio-stop signal with meeting playback.
 Replies remain in the existing Task conversation. There is no standalone meeting
 sidebar destination or second conversation editor. This path supports native
 in-process Team members; process runtimes, Team plan mode and unsupported rosters
-reject coordinated activation. Video-duplex files and their imports are unchanged.
+reject coordinated activation.
 
 ## Human and Leader interruption
 
-After ASR, human speech during an active speaking lease is checked through the
-SDK's existing duplex supervisor classifier and the Team's configured endpoint,
-model, key environment and timeout. Without a configured endpoint it uses the
-shared JEV defaults (`TYPESAFE_API_KEY`). The judgment concerns taking the audio
-floor only: it does not reject, rewrite or reroute the human message. A confident
-`INTERRUPT` decision (at least 0.9) cuts speech; acknowledgements and uncertain,
-failed or timed-out judgments leave speech running and still deliver the text.
-VAD alone never stops agent audio.
+Meeting capture reuses the video-duplex frontend `SileroVad`, its worker and
+`SpeechGate`. Confirmed speech start immediately stops local TTS, including late
+synthesis results, before any network request, ASR or semantic classification.
+The same microphone retains echo cancellation and noise suppression. A
+connection-owned `meeting.input.speech_started` request carries the observed
+lease token; the server revokes only that lease and holds subsequent speech.
+This does not pause execution tasks or close the microphone. Even a spoken
+acknowledgement yields the audio floor once VAD confirms it.
+
+ASR text still follows normal group-chat delivery. Nonempty transcripts attach
+the existing interruption ID and release it only after public-message acceptance.
+Empty/failed ASR releases a VAD-only hold without fabricating user text. A paused
+microphone resets local VAD, and resumed listening starts with fresh evidence.
+Older clients without a VAD start event yield the floor on a nonempty ASR
+transcript. Neither path uses a semantic classifier or an extra model request.
 
 The Leader can inspect `meeting_get_speaker` and call
 `meeting_interrupt_speech(expected_token)` with its observed lease token. Only
@@ -205,7 +249,7 @@ the Leader receives this tool, and only while the host playback consumer is
 installed. A stale token cannot cut a later speaker's speech. Interruptions stop
 audio only; published full text and the remaining queued requests are preserved.
 
-Both paths revoke the matching SDK lease and send `meeting.speech.stop` with its
+These paths revoke the matching SDK lease and send `meeting.speech.stop` with its
 complete playback identity. The browser stops only that speech and keeps its
 microphone active. Gateway drains synthesis cancellation before forwarding the
 browser's `meeting.playback.stopped` acknowledgement. Cancelled TTS clients
@@ -218,17 +262,17 @@ after the existing `team.group_message.accepted` event confirms public input
 delivery. Duplicate admission receipts are idempotent. Failed delivery or a
 missing audio stop acknowledgement keeps the barrier held; End meeting remains
 the recovery action. Explicit Stop audio and audio failures retain their
-existing paused/failed behavior and are distinct from semantic interruption.
+existing paused/failed behavior and are distinct from human floor-taking.
 
 Automated regressions cover the real SDK/SQLite queue, Gateway routes, native
-Leader tool and browser player using controlled supervisor/audio services.
-Physical microphone/speaker behavior and real supervisor classification still
-require a live meeting acceptance run.
+Leader tool and browser player using controlled audio services. Physical
+microphone/speaker behavior still requires a live meeting acceptance run.
 
 ## Continuous microphone input
 
-This replaces the browser MediaRecorder/completed-recording strategy. There is
-no browser VAD, recorded-file upload, or fallback to that old path in meetings.
+This replaces the browser MediaRecorder/completed-recording strategy. Browser
+VAD now handles immediate barge-in; Gateway VAD retains utterance segmentation.
+There is no recorded-file upload or fallback to that old capture path in meetings.
 The separate video-duplex feature retains its own provider-specific paths.
 
 The browser reuses the capture worklet and resampler to send 100 ms chunks of
@@ -237,37 +281,22 @@ ownership, loads Gateway's bundled Silero v5 model, and returns a `stream_id`
 before activating publication. Input shares that route's lifecycle; there is no
 separate input startup or ownership registry.
 
-`meeting.input.append` carries meeting/stream identity, sequence, and base64 PCM.
-Requests pipeline without waiting for earlier acknowledgements. Gateway
-serializes inference off the event loop; each side bounds pending audio to two
-seconds. Invalid audio, missing chunks, or overload stops input explicitly.
+`meeting.playback.ready` selects `input_mode: joyai` for current browsers.
+`meeting.input.utterance` sends complete WAV data URLs with stream identity and
+sequence. Capture, one-second pre-roll, Silero speech detection and the 20-second
+turn limit reuse `JoyAIVoiceSession`. Pausing flushes confirmed speech, then resets
+local detection; resuming keeps the same stream and sequence.
 
-Silero confirms speech over eight of ten frames, preserving one second of
-pre-roll. A 640 ms silence or 30-second limit finishes the utterance. Idle/noise
-input does not invoke ASR. Three ASR workers transcribe concurrently with a
-60-second timeout per request while listening continues. A result map restores
-utterance order, with IDs starting at one per stream. At most seven utterances
-can be queued, transcribing, or awaiting publication in total; overload stops
-input explicitly rather than growing the buffer.
+Gateway uses the same `transcribe_audio` adapter, provider selection and filler
+filter as full-duplex `video.transcribe`. Three ASR workers preserve utterance
+order, with up to seven outstanding utterances and a 60-second timeout. Each
+ready result is published immediately in order; there is no short-sentence batch
+or 1.5-second merge delay. Empty results do not fabricate user text. Admission
+and interruption acknowledgements remain owned by the meeting lifecycle.
+Stop, End and disconnect cancel pending ASR and suppress late results.
 
-Consecutive results form one message after four utterances or 1.5 seconds from
-the first consecutive ready result, whichever comes first. Later results do not
-reset that deadline. An earlier pending ID waits for its ASR result or timeout;
-the batch timer never skips it. Failed requests emit ordered errors, and empty
-or filler-only transcripts advance the sequence without adding text. Errors
-split a batch so earlier text is delivered before the error ID. Each transcript
-event uses the last included utterance ID, preserving the browser's existing
-ordering and admission checks. Interruption preparation runs once per message,
-separately from the ASR workers. The shared Speech transcription adapter
-receives WAV audio.
-
-Owner-only transcript/error events include stream and utterance identities.
-Pause drains earlier chunks and flushes confirmed speech; Resume keeps the same
-stream and sequence. Stop, End, and disconnect cancel pending ASR and suppress
-late results. Browser audio stop is sent while provider cancellation drains.
-
-The model and license ship under `resources/voice`; Gateway needs `onnxruntime`
-but does not download weights or depend on frontend packages at runtime.
+Legacy clients without an input mode retain the PCM upload, server Silero and
+batching path for compatibility. Current browsers do not instantiate server VAD.
 
 Deferred work includes semantic turn completion, supervisor recipient selection,
 voice selection UI,
@@ -279,8 +308,8 @@ SDK's `meeting_post_message`, `meeting_read_history`, and `meeting_get_speaker`
 tools for the Leader and later members, plus the Leader-only addressed-member
 and `meeting_interrupt_speech` tools. The Leader retains the existing `send_message` for silent addressed handoffs.
 Work and code profiles use the same
-provider. Native discussion output must queue before publication; unsupported
-direct-delivery/runtime tools are blocked while this scope is active. Ending the
+provider. Native discussion uses the host publication tool: text is delivered
+immediately and speech is queued; unsupported direct-delivery/runtime tools are blocked while this scope is active. Ending the
 scope removes the tools and prompt. No SDK or dependency change is required.
 Meeting tool schemas stay directly exposed on every model request, including
 when progressive tool discovery is enabled. Members use the supplied message
@@ -314,8 +343,8 @@ voice. Both providers use catalog files in `resources/voices/`.
 Reuse the same registry for the same native runtime and model to retain assignments across meetings;
 create a new one when that runtime is replaced. Catalog updates affect future
 assignments while retained bindings keep queued speech reproducible.
-`publication.voice_for_speech(request).provider_voice_id` supplies the voice
-argument for the Gateway TTS component. Lookup does not release the speaking
+The playback consumer resolves `voices.get_voice(request.member_name)` and
+supplies its `provider_voice_id` to the Gateway TTS component. Lookup does not release the speaking
 lease or start audio. Browser readiness now creates/reuses this registry for the
 same native runtime; process-restart restoration remains deferred.
 
@@ -351,3 +380,20 @@ need a browser meeting run.
 
 Live provider synthesis and complete browser playback are checked manually;
 the retained automated tests use controlled provider responses.
+
+
+### Meeting action execution
+
+`meeting_action` is a meeting-scoped ledger, separate from SDK task state. It does not change dispatch mode, verification configuration, task tools or task tables. The Leader assigns an owner, a distinct reviewer and concrete acceptance criteria. Owners execute with existing tools and submit evidence; only the reviewer can accept. Rework reopens accepted work; blocked work retains its original goal and unblock condition. Revision checks reject stale updates. `finish` rejects unfinished work and distinguishes waiting for external dependencies from completion.
+
+Action notifications use existing meeting message delivery without waiting for TTS. Start/status updates do not wake teammates. Routine progress does not invalidate speech context. The panel displays action state, acceptance, evidence and review/block notes. Review quality still depends on the reviewer actually inspecting artifacts; the ledger cannot prove arbitrary external work is correct. The ledger lasts for the active meeting instance; it is not a replacement for durable cluster tasks.
+
+
+### Listener-oriented speech
+
+Spoken summaries describe the concrete work, its actual result/uncertainty and the next action in everyday language (normally 50–100 Chinese characters, with the existing 150-character/65-word hard limit). Task/revision IDs, hashes, code/tool names, file paths and URLs stay in full text. Publication rejects these technical forms before storing/notifying/queuing a post and asks the originating agent to rewrite only speech_text. There is no additional summary-model request and no destructive identifier stripping. Product names, useful counts and clock times are allowed. Prompts distinguish specifications from implementation and submission from independent acceptance; the validator checks form, not the truth of arbitrary claims.
+
+
+### Stop invalid work before investigating a scope change
+
+On an explicit user change that invalidates existing actions, the Leader must first call `meeting_action(operation="pause", action_ids=[...], note="...")`, before browsing or analysing the replacement project. This meeting-only batch operation needs no per-action revisions. It retains artifacts, marks affected actions paused, invalidates affected members' in-flight tool generations, cancels their waiting audio and attempts to interrupt their current speech. Notification/audio failures do not undo the execution gate. Paused actions cannot start, submit or accept; the Leader must cancel or rework them after investigation. Members whose owned work is paused cannot execute further side-effect tools; read-only inspection remains available. Unrelated actions continue. Ordinary questions do not call pause. Commands already running can finish and require reassessment; this does not roll back external effects or alter SDK/cluster task tools. Action state lasts for the current meeting instance.

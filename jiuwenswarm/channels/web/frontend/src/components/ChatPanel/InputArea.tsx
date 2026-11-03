@@ -189,6 +189,7 @@ import { isImeCompositionKey } from './imeComposition';
 import { useTaskAsr } from '../../features/taskAsr/useTaskAsr';
 import { useTaskAsrEnabled } from '../../features/taskAsr/featureFlag';
 import { ApplicationPluginTaskInputActions } from '../../applicationPlugins/ApplicationPluginOutlet';
+import type { ApplicationPluginStopAction } from '../../applicationPlugins/types';
 import { isTaskInputBlocked, useTaskInputBlocked } from '../../applicationPlugins/taskInputReadiness';
 
 /** 输入栏下拉所需的最小技能数据结构（与 SkillPanel 中的 SkillItem 保持一致） */
@@ -992,6 +993,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const queuePaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.queuePaused ?? false);
   const isLoadingHistory = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.isLoadingHistory ?? false);
   const [applicationMicrophoneActive, setApplicationMicrophoneActive] = useState(false);
+  const [applicationStopAction, setApplicationStopAction] = useState<ApplicationPluginStopAction | null>(null);
   const inputValue = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.inputValue ?? '');
   const evolutionStatus = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.evolutionStatus ?? null);
   const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
@@ -2515,11 +2517,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // preparing a follow-up. A pending approval keeps Stop available and blocks Send.
   const hasDraft = hasTextDraft || attachments.length > 0 || isListening || isTranscribing;
   const isImageInterruptBlocked = isInterruptible && !isTeamMode && !isAgentMode && readyMediaItems.length > 0;
-  const showStop = isProcessing && !isPaused && (!hasDraft || hasPendingQuestion);
+  const showStop = (Boolean(applicationStopAction) || (isProcessing && !isPaused)) && (!hasDraft || hasPendingQuestion);
   const hasReadyMedia = readyMediaItems.length > 0;
   const canSubmit =
-    showStop ||
-    (!composerDisabled &&
+    (showStop && !applicationStopAction?.disabled) ||
+    (!showStop && !composerDisabled &&
       (hasTextDraft || hasReadyMedia) &&
       !isLoadingHistory &&
       !isImageInterruptBlocked &&
@@ -2528,12 +2530,18 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const handleSendButtonClick = useCallback(() => {
     if (showStop) {
-      onCancel();
+      if (applicationStopAction) {
+        if (applicationStopAction.disabled) return;
+        applicationStopAction.onStop();
+        if (isProcessing && applicationStopAction.sessionId === activeSessionId) onCancel();
+      } else {
+        onCancel();
+      }
       return;
     }
 
     handleSubmit();
-  }, [handleSubmit, showStop, onCancel]);
+  }, [handleSubmit, showStop, onCancel, applicationStopAction, isProcessing, activeSessionId]);
 
   const fullDuplexActionEligible =
     !showStop &&
@@ -4797,7 +4805,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   }
                 />
 
-                {taskAsrEnabled && <button
+                {taskAsrEnabled && !applicationMicrophoneActive && <button
                   type="button"
                   onClick={toggleRecording}
                   disabled={composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive}
@@ -4830,7 +4838,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     <Mic className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
                   )}
                 </button>}
-                {micTooltipNode}
+                {!applicationMicrophoneActive && micTooltipNode}
 
                 <ApplicationPluginTaskInputActions
                   eligible={fullDuplexActionEligible && !isTeamMode}
@@ -4843,6 +4851,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   disabled={composerDisabled || isLoadingHistory}
                   onTranscript={appendTaskAsrTranscript}
                   onMicrophoneActiveChange={setApplicationMicrophoneActive}
+                  onStopActionChange={setApplicationStopAction}
                   microphoneBusy={isListening || isTranscribing}
                   sessionId={activeSessionId}
                   ensureSession={onEnsureSession}
@@ -4862,7 +4871,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                           showStop && 'chat-input-btn--stop',
                           canSubmit ? 'chat-input-btn--send-active' : 'chat-input-btn--disabled',
                         )}
-                        data-tooltip={showStop ? t('chat.stop') : t('chat.send')}
+                        aria-label={showStop ? applicationStopAction?.label || t('chat.stop') : t('chat.send')}
+                        data-tooltip={showStop ? applicationStopAction?.label || t('chat.stop') : t('chat.send')}
                         {...sendTooltipHandlers}
                         data-testid="chat-panel-input-send"
                         data-variant={showStop ? 'stop' : 'send'}

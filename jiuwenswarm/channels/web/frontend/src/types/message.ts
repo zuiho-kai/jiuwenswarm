@@ -92,6 +92,8 @@ export interface TeamMemberContextCompressionState {
 }
 
 export interface Message {
+  /** Meeting lifecycle marker, not a human utterance. */
+  isMeetingStartup?: boolean;
   id: string;
   role: MessageRole;
   content: string;
@@ -184,6 +186,7 @@ export interface ChatSendOptions {
     clientMessageId: string;
     mentions: string[];
     meeting?: boolean;
+    meetingStartup?: boolean;
     onRequestId?: (id: string) => void;
   };
 }

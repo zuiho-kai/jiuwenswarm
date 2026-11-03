@@ -1,3 +1,4 @@
+import { formatMeetingError, meetingFailure } from './meetingErrors';
 import { useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ApplicationPluginTaskRuntimeProps } from '../../../channels/web/frontend/src/applicationPlugins/types';
@@ -8,6 +9,7 @@ import { getMeetingRoutingMode } from '../../../channels/web/frontend/src/featur
 import { webClient } from '../../../channels/web/frontend/src/services/webClient';
 import { rememberGroupChatInput } from '../../../channels/web/frontend/src/features/groupChatInput';
 import { useSessionStore } from '../../../channels/web/frontend/src/stores/sessionStore';
+import { useChatStore } from '../../../channels/web/frontend/src/stores/chatStore';
 import { toast } from '../../../channels/web/frontend/src/components/ui/Toast/toastStore';
 import { MeetingSession, type MeetingContext } from './meetingRuntime';
 import { sendMeetingInput } from './meetingInput';
@@ -89,7 +91,8 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           },
           { timeoutMs: 25000 },
         );
-        if (ended.state !== 'idle') throw new Error('cleanupPending');
+        if (ended.state !== 'idle')
+          throw meetingFailure('cleanupPending', new Error(`meeting.end returned state=${ended.state}`));
         active.meeting.finishCleanup();
         if (current.current === active) {
           current.current = null;
@@ -102,7 +105,7 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
             voice: '',
           });
         }
-      } catch {
+      } catch (error) {
         // A lost End response can still mean cleanup finished. One status query
         // resolves that ambiguity; active meetings are never polled or resumed.
         let idle = false;
@@ -129,10 +132,15 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
             });
           }
         } else if (current.current === active) {
-          publishMeeting({ state: 'cleanup_failed', recording: 'ready' });
+          publishMeeting({
+            state: 'cleanup_failed',
+            recording: 'ready',
+            errorSessionId: active.sessionId,
+            lastError: formatMeetingError(translator.current, 'cleanupFailed', error),
+          });
           if (mounted.current)
             toast.open({
-              content: translator.current('meeting.errors.cleanupFailed'),
+              content: formatMeetingError(translator.current, 'cleanupFailed', error),
               variant: 'error',
             });
         }
@@ -158,12 +166,30 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
       if (!mode || !isTeamAgentMode(mode)) return;
       if (webClient.getState() !== 'ready') throw new Error('disconnected');
       const send = sender.current;
-      if (!send) throw new Error('disconnected');
+      if (!send)
+        throw meetingFailure(
+          'deliveryFailed',
+          new Error('CHAT_SENDER_UNAVAILABLE: conversation input is not mounted; reopen this conversation'),
+        );
       const startupId = crypto.randomUUID();
       const input = new AbortController();
       const routingMode = getMeetingRoutingMode();
       const meeting: MeetingSession = new MeetingSession(webClient, id, context(id), {
-        line: () => {}, // Task handlers already own the conversation timeline.
+        line: (line) => {
+          if (!mounted.current || current.current?.meeting !== meeting || input.signal.aborted) return;
+          const chat = useChatStore.getState();
+          // Reuse member bubbles and the source-message identity. Playback retries
+          // must not duplicate the short, user-visible meeting conversation.
+          const messageId = `team-member-${line.speaker}@meeting-${line.id}`;
+          if (chat.getRuntime(id)?.messages.some((message) => message.id === messageId)) return;
+          chat.addMessage(id, {
+            id: messageId,
+            role: 'system',
+            content: line.text,
+            timestamp: new Date().toISOString(),
+            keepExpanded: true,
+          });
+        },
         draft: (text) => {
           if (!mounted.current || current.current?.meeting !== meeting || input.signal.aborted)
             throw new Error('disconnected');
@@ -179,9 +205,11 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           );
         },
         error: (code, detail) => {
+          if (current.current?.meeting === meeting)
+            publishMeeting({ errorSessionId: id, lastError: formatMeetingError(t, code, detail) });
           if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
             toast.open({
-              content: [t(`meeting.errors.${code}`), detail].filter(Boolean).join(' '),
+              content: formatMeetingError(t, code, detail),
               variant: 'error',
             });
         },
@@ -192,6 +220,10 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           if (current.current?.meeting !== meeting || input.signal.aborted) return;
           const speaker = context(id).members.find((item) => item.member_name === member)?.display_name || member || '';
           publishMeeting({ playback, speaker, voice: voice || '' });
+        },
+        queue: (queue) => {
+          if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
+            publishMeeting({ queue });
         },
         addressedMembers: (names) => {
           if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
@@ -220,8 +252,16 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
         routingMode,
         lastTranscript: '',
         addressedMembers: [],
+        queue: { decision: '', pending: [] },
       });
       try {
+        // Reserve ownership before Team initialization. A page reload can then
+        // release this startup even while its first chat request is pending.
+        await webClient.request<ServerMeeting>('meeting.start', {
+          session_id: id,
+          startup_id: startupId,
+        });
+        if (current.current !== active || input.signal.aborted) return;
         let initial = initialization.current.get(id);
         if (!initial) {
           initial = {
@@ -233,12 +273,18 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
         await sendMeetingInput(webClient, send, id, initial.text, initial.id, [], input.signal);
         rememberGroupChatInput(id);
         if (current.current?.meeting !== meeting || input.signal.aborted) return;
-        let server = await webClient.request<ServerMeeting>('meeting.start', {
+        let server = await webClient.request<ServerMeeting>('meeting.status', {
           session_id: id,
           startup_id: startupId,
         });
         if (current.current?.meeting !== meeting || input.signal.aborted) return;
+        const startupDeadline = Date.now() + 60000;
         while (server.state === 'starting') {
+          if (Date.now() >= startupDeadline)
+            throw meetingFailure(
+              'meetingStartFailed',
+              new Error('MEETING_START_TIMEOUT: server remained starting for 60 seconds'),
+            );
           await new Promise((resolve) => setTimeout(resolve, 1000));
           if (current.current?.meeting !== meeting || input.signal.aborted) return;
           server = await webClient.request<ServerMeeting>('meeting.status', {
@@ -247,19 +293,23 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           });
           if (current.current?.meeting !== meeting || input.signal.aborted) return;
         }
-        if (server.state !== 'active' || !server.meeting_id) throw new Error('meetingStartFailed');
+        if (server.state !== 'active' || !server.meeting_id)
+          throw meetingFailure(
+            'meetingStartFailed',
+            new Error(`meeting.start returned state=${server.state}, meeting_id=${server.meeting_id || 'missing'}`),
+          );
         active.meetingId = server.meeting_id;
         try {
           await meeting.start();
         } catch (error) {
           if (error instanceof Error && ['unsupported', 'disconnected'].includes(error.message)) throw error;
-          throw new Error('microphoneFailed');
+          throw meetingFailure('microphoneFailed', error);
         }
         if (mounted.current && current.current === active && !input.signal.aborted) {
           try {
             await meeting.activatePlayback(server.meeting_id, startupId);
-          } catch {
-            throw new Error('playbackUnavailable');
+          } catch (error) {
+            throw meetingFailure('playbackUnavailable', error);
           }
           if (current.current !== active || input.signal.aborted) return;
           initialization.current.delete(id);
@@ -283,7 +333,10 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           if (snapshot.recording === 'recording') current.current?.meeting.stopRecording();
           else current.current?.meeting.startRecording();
         },
-        stopAudio: () => current.current?.meeting.stopPlayback(),
+        cancelQueued: (requestId) => {
+          void current.current?.meeting.cancelQueued(requestId);
+        },
+        stopAudio: () => void current.current?.meeting.skipSpeech(),
       }),
     [start, stop, snapshot.recording],
   );

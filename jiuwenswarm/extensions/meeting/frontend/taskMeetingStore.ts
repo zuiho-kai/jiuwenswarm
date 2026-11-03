@@ -1,9 +1,11 @@
 import { useSyncExternalStore } from 'react';
 import { blockTaskInput } from '../../../channels/web/frontend/src/applicationPlugins/taskInputReadiness';
-import type { RecordingState, PlaybackState } from './meetingRuntime';
+import type { RecordingState, PlaybackState, MeetingQueue } from './meetingRuntime';
 import type { MeetingRoutingMode } from '../../../channels/web/frontend/src/features/teamMeeting/routingMode';
 
 export type MeetingSnapshot = {
+  lastError?: string;
+  errorSessionId?: string | null;
   state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed';
   sessionId: string | null;
   recording: RecordingState;
@@ -13,12 +15,14 @@ export type MeetingSnapshot = {
   routingMode: MeetingRoutingMode;
   lastTranscript: string;
   addressedMembers: string[];
+  queue: MeetingQueue;
 };
 type Controller = {
   start: (sessionId: string) => Promise<void>;
   stop: () => void;
   record: () => void;
   stopAudio: () => void;
+  cancelQueued?: (requestId: string) => void;
 };
 let controller: Controller | null = null;
 let snapshot: MeetingSnapshot = {
@@ -31,6 +35,7 @@ let snapshot: MeetingSnapshot = {
   routingMode: 'leader',
   lastTranscript: '',
   addressedMembers: [],
+  queue: { decision: '', pending: [] },
 };
 const listeners = new Set<() => void>();
 let releaseInput: (() => void) | undefined;
@@ -44,9 +49,7 @@ export function registerMeetingController(next: Controller): () => void {
 export function publishMeeting(update: Partial<MeetingSnapshot>): void {
   snapshot = { ...snapshot, ...update };
   const previous = releaseInput;
-  releaseInput = snapshot.state === 'starting'
-    ? blockTaskInput(snapshot.sessionId)
-    : undefined;
+  releaseInput = snapshot.state === 'starting' ? blockTaskInput(snapshot.sessionId) : undefined;
   previous?.();
   listeners.forEach((listener) => listener());
 }
@@ -72,4 +75,8 @@ export function recordMeeting(): void {
 }
 export function stopMeetingAudio(): void {
   controller?.stopAudio();
+}
+
+export function cancelMeetingQueued(requestId: string): void {
+  controller?.cancelQueued?.(requestId);
 }

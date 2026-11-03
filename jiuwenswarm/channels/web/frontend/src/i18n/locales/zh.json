@@ -1,5 +1,50 @@
 {
   "meeting": {
+"opening": {"title": "团队讨论", "description": "从你的第一个想法开始。说出想讨论的问题，团队会一起梳理思路、明确分工。"},
+    "diagnostics": {
+  "reasonLabel": "原因：",
+  "solutionLabel": "建议：",
+  "dismiss": "关闭会议错误详情",
+  "unknownReason": "该阶段没有提供更底层的诊断，当前无法确定根因；不能据此判断是权限、网络还是模型配置问题。",
+  "reason": {
+    "unsupported": "当前环境未提供麦克风采集 API 或音频处理能力。",
+    "disconnected": "会议所需的 WebSocket 连接未就绪或已断开。",
+    "microphoneEnded": "浏览器收到麦克风音轨已结束的通知。",
+    "cleanupFailed": "结束请求后，尚未确认服务端状态已回到 idle。",
+    "cleanupPending": "服务端结束请求返回了非 idle 状态。",
+    "inputStreamFailed": "会议音频上传或输入控制未获得有效确认。",
+    "meetingBusy": "另一个浏览器连接持有此会议。",
+    "meetingRequiresNewConversation": "当前会话已创建为普通团队运行时，无法切换为会议运行时。",
+    "deliveryFailed": "消息没有获得团队公开接收确认。"
+  },
+  "solution": {
+    "unknown": "保留此详情，查看对应时刻的服务端日志以定位失败环节；确认原因后再重试，避免重复提交已送达的任务。",
+    "autoplay": "点击页面后重试播放，并在浏览器中允许此站点播放声音。",
+    "permission": "在此站点的浏览器权限中允许麦克风，并检查系统麦克风隐私权限，然后重新开始会议。",
+    "deviceMissing": "连接并启用麦克风，在系统和浏览器中选择可用输入设备，然后重新开始会议。",
+    "deviceBusy": "关闭占用麦克风的应用，检查设备驱动与系统输入设置，然后重新开始会议。",
+    "deviceConstraints": "换用支持单声道录音的输入设备或恢复浏览器默认音频设备后重试。",
+    "credentials": "检查本阶段使用的模型 API Key、账号权限与服务地址。ASR 使用全双工语音配置，播报使用会议语音合成配置。",
+    "quota": "检查服务商配额、余额和并发限制；等待限流解除后重试。",
+    "timeout": "检查本阶段服务地址的连通性和模型响应时间；投递或结束请求超时时，先检查消息是否已送达、会议是否已结束。",
+    "overload": "暂停麦克风或减少连续发言，等待积压处理；若输入已停止，结束后重新开始会议。",
+    "configuration": "ASR 请检查全双工语音识别配置；播报请检查语音合成提供商、模型、音色和地址。保存后开启新会议。",
+    "connection": "确认本地服务及对应模型服务正在运行、地址可访问；连接恢复后结束旧会议并重新开始。",
+    "capture": "检查浏览器控制台中的音频处理或 VAD 模型加载错误，确认模型与 worker 资源可加载，并使用受支持的浏览器重新打开页面。",
+    "session": "结束旧会议后刷新页面，只保留一个会议标签页，再重新开始，避免使用过期音频流或播放凭据。",
+    "audioFormat": "检查提供商返回的音频格式和内容是否有效，并确认浏览器支持该编码；可更换语音合成提供商后开启新会议。",
+    "newConversation": "新建团队对话后开始会议；当前普通团队对话可继续用于文字聊天。",
+    "owner": "返回持有会议的标签页操作，或先在那里结束会议后再在此页启动。",
+    "secureContext": "使用 HTTPS 或 localhost，在支持 AudioWorklet 和麦克风采集的浏览器中打开。"
+  }
+},
+    "controls": {"title": "会议控制", "minimize": "收起会议控制"},
+    "actionsTitle": "会议行动",
+    "actionReviewer": "验收人",
+    "actionAcceptance": "完成条件",
+    "actionPhase": {"adjusting": "调整分工中", "discussion": "讨论", "execution": "执行与验收", "waiting": "等待外部条件", "finished": "议程已完成"},
+    "actionStatus": {"paused": "已暂停，等待调整", "assigned": "待执行", "running": "执行中", "submitted": "待验收", "accepted": "已验收", "blocked": "受阻", "cancelled": "已取消"},
+
     "feishu": {
       "title": "飞书设置",
       "description": "保存应用凭据和 API 地址后，点击连接。飞书使用 https://open.feishu.cn，Lark 使用 https://open.larksuite.com。后端重启后需重新连接。会议语音收发暂未接入。",
@@ -15,6 +60,7 @@
       }
     },
     "panel": {
+      "queueEmpty": "暂无待播报内容，新的发言会显示在这里。",
       "title": "会议",
       "addressedAgents": "会议当前提及的智能体",
       "noAddressedAgents": "当前未提及智能体",
@@ -22,7 +68,7 @@
       "microphone": "麦克风",
       "pauseMicrophone": "暂停麦克风",
       "microphoneStates": {
-        "ready": "已暂停",
+        "ready": "已静音",
         "recording": "正在聆听",
         "transcribing": "正在转写…"
       },
@@ -45,10 +91,11 @@
       "leader": "Leader",
       "none": "None"
     },
-    "startMessage": "开始会议",
+    "defaultTitle": "团队讨论",
+    "startMessage": "大家一起聊聊，梳理思路、明确分工。",
     "playback": {
-      "loading": "正在准备 {{speaker}}（{{voice}}）…",
-      "playing": "{{speaker}} 正在发言（{{voice}}）",
+      "loading": "正在准备 {{speaker}} 的发言…",
+      "playing": "{{speaker}} 正在发言",
       "paused": "语音已暂停。请结束会议后重新开始。",
       "failed": "语音播放失败。请阅读文字记录后结束会议。"
     },
@@ -61,6 +108,14 @@
       "stop": "结束团队会议"
     },
     "title": "团队会议",
+    "textPending": "正文等待重试",
+    "textPublished": "正文已送达",
+    "queueWait": "已等待至少 {{seconds}} 秒",
+    "skipSpeech": "跳过当前发言",
+    "queueTitle": "等待口播：{{count}} 条",
+    "textDeliveredNote": "下方为口播队列。撤回口播会保留已发布正文；新发言会替换该成员尚未播放的旧口播。",
+    "currentDecision": "当前会议决定",
+    "cancelQueued": "撤回口播",
     "stopPlayback": "停止语音",
     "leader": "主持人",
     "record": {
@@ -69,23 +124,26 @@
       "transcribing": "正在转写…"
     },
     "errors": {
-      "playbackUnavailable": "无法准备会议语音。请检查 Qwen 配置后重试。",
+"titleUpdateFailed": "会议已就绪，但对话标题更新失败。",
+"configurationReadFailed": "会议功能配置读取失败，后台正在重试。",
+"queueControlFailed": "撤回待播报内容未成功。","skipFailed": "跳过发言的结果未获服务端确认。",
+      "playbackUnavailable": "会议音频初始化未完成。",
       "cleanupFailed": "尚未确认会议清理完成。请重试结束会议。",
-      "inputStreamFailed": "麦克风推流因连接异常已停止，请重新开始会议。",
+      "inputStreamFailed": "会议音频输入已停止。",
       "unsupported": "语音录制需要支持的浏览器和安全连接。",
-      "microphoneFailed": "无法访问麦克风，请检查浏览器权限后重试。",
-      "meetingStartFailed": "无法启动团队会议，请重试。",
+      "microphoneFailed": "麦克风或本地音频处理初始化失败。",
+      "meetingStartFailed": "会议启动流程未完成。",
       "meetingRequiresNewConversation": "请在新的团队对话中开始会议。当前对话已使用普通团队模式。",
       "meetingBusy": "此团队会议已在另一个标签页中打开。",
       "microphoneEnded": "麦克风已断开。",
       "disconnected": "连接已断开，请在重连后重新开始会议。",
       "recordingTooLarge": "录音过大，请录制更短的消息。",
-      "recordingFailed": "无法录制音频，请重试。",
-      "transcriptionFailed": "无法转写录音，请重试。",
+      "recordingFailed": "本地音频采集或人声检测已停止。",
+      "transcriptionFailed": "本句语音识别或转写结果发布失败。",
       "emptyTranscript": "未检测到清晰语音，请重新录制。",
-      "deliveryFailed": "消息投递失败，请重试。",
-      "playbackFailed": "无法播放智能体回复，完整文字仍然可用。",
-      "playbackSkipped": "语音播放失败。已跳过本段语音并继续处理队列，完整文字仍然可用。",
+      "deliveryFailed": "会议消息投递未获确认。",
+      "playbackFailed": "会议播报或播放确认失败。",
+      "playbackSkipped": "本段语音合成或播放失败，已尝试跳过；请阅读文字记录。",
       "playbackOverloaded": "待播放语音过多，请在会议记录中阅读完整回复。"
     }
   },

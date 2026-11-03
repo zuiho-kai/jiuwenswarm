@@ -302,3 +302,65 @@ async def test_pause_flushes_confirmed_speech_and_stop_discards_late_asr(stream,
     await stream.close()
     assert cancelled.is_set() and stream.closed
     assert not any(call.args[1] == "meeting.input.transcript" for call in stream.channel.send_event.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_joyai_meeting_reuses_duplex_adapter_and_filter(monkeypatch):
+    from jiuwenswarm.extensions.video_duplex.backend import video_live, video_voice
+    monkeypatch.setattr(video_live, "_uses_joyai_voice_channel", lambda: True)
+    transcribe = AsyncMock(return_value=" 简短分工 ")
+    monkeypatch.setattr(video_voice, "transcribe_audio", transcribe)
+    audio = "data:audio/wav;base64,UklGRg=="
+    assert await gateway.transcribe_joyai_utterance(audio) == "简短分工"
+    transcribe.assert_awaited_once_with([(audio, "用户麦克风")], use_joyai_voice=True)
+    transcribe.return_value = "嗯。"
+    assert await gateway.transcribe_joyai_utterance(audio) == ""
+
+
+@pytest.mark.asyncio
+async def test_joyai_turns_skip_server_vad_and_publish_without_batch_delay(monkeypatch):
+    channel = SimpleNamespace(send_event=AsyncMock())
+    stream = gateway.MeetingInputStream(channel, object(), "session", "meeting")
+    stream.input_mode = "joyai"
+    monkeypatch.setattr(gateway, "UtteranceSegmenter", lambda: pytest.fail("Browser already segmented this audio"))
+    transcribe = AsyncMock(side_effect=["first", "second"])
+    monkeypatch.setattr(gateway, "transcribe_joyai_utterance", transcribe)
+    await stream.start()
+    try:
+        assert stream.segmenter is None
+        for sequence in range(2):
+            await stream.utterance_audio({"sequence": sequence, "audio_data_url": "data:audio/wav;base64,UklGRg=="})
+        await asyncio.wait_for(stream.queue.join(), timeout=1)
+        results = [call.args[2] for call in channel.send_event.await_args_list if call.args[1] == "meeting.input.transcript"]
+        assert [result["transcript"] for result in results] == ["first", "second"]
+        await stream.listening_control(False)
+        with pytest.raises(ValueError):
+            await stream.utterance_audio({"sequence": 2, "audio_data_url": "data:audio/wav;base64,UklGRg=="})
+    finally:
+        await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_joyai_asr_error_keeps_upstream_cause_in_browser_event(monkeypatch):
+    channel = SimpleNamespace(send_event=AsyncMock())
+    stream = gateway.MeetingInputStream(channel, object(), "session", "meeting")
+    stream.input_mode = "joyai"
+    monkeypatch.setattr(gateway, "transcribe_joyai_utterance", AsyncMock(side_effect=RuntimeError("401 invalid API key")))
+    await stream.start()
+    try:
+        await stream.utterance_audio({"sequence": 0, "audio_data_url": "data:audio/wav;base64,UklGRg=="})
+        await asyncio.wait_for(stream.queue.join(), timeout=1)
+        errors = [call.args[2] for call in channel.send_event.await_args_list if call.args[1] == "meeting.input.error"]
+        assert len(errors) == 1
+        assert errors[0]["error"] == "RuntimeError: 401 invalid API key"
+        assert errors[0]["utterance_id"] == 1
+    finally:
+        await stream.close()
+
+
+def test_meeting_exception_details_keep_empty_timeout_type_and_hide_credentials():
+    from jiuwenswarm.extensions.meeting.errors import exception_detail
+    assert exception_detail(TimeoutError()) == "TimeoutError: operation timed out before completion"
+    detail = exception_detail(RuntimeError("401 Bearer sample-token https://example.invalid?access_token=sample-secret"))
+    assert "401" in detail
+    assert "sample-token" not in detail and "sample-secret" not in detail

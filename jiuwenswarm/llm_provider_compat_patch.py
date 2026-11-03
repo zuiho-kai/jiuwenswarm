@@ -189,6 +189,41 @@ def _patch_openai_tool_call_fragments(client_class: type, client_module: Any) ->
     setattr(client_class, _TOOL_CALL_PATCH_FLAG, True)
 
 
+_INTERNAL_REQUEST_HINTS = frozenset({"reasoning_level", "_source"})
+_INTERNAL_HINT_PATCH_FLAG = "_internal_hint_strip_patch_applied"
+
+
+def _patch_openai_internal_hints(client_class: type) -> None:
+    """Never send JiuwenSwarm-internal hint fields to the provider SDK.
+
+    ``reasoning_level`` is a UI hint translated into provider switches by
+    ``reasoning_injector``; ``_source`` is an internal bookkeeping tag.  Both
+    may end up in ``ModelRequestConfig`` (``extra="allow"`` forwards them), and
+    the OpenAI SDK rejects unknown kwargs with ``TypeError``.  The model
+    builders strip them, but paths that construct the request config directly
+    do not -- so drop them once, at the last boundary.
+    """
+    if getattr(client_class, _INTERNAL_HINT_PATCH_FLAG, False):
+        return
+    original = client_class._build_request_params  # pylint: disable=protected-access
+
+    def _build_request_params(self, *args, **kwargs):
+        params = original(self, *args, **kwargs)
+        if not isinstance(params, dict):
+            return params
+        dropped = sorted(key for key in _INTERNAL_REQUEST_HINTS if key in params)
+        for key in dropped:
+            params.pop(key, None)
+        if dropped:
+            logger.warning(
+                "Dropped internal model hint(s) before provider call: %s", ", ".join(dropped)
+            )
+        return params
+
+    client_class._build_request_params = _build_request_params  # type: ignore[method-assign]  # pylint: disable=protected-access
+    setattr(client_class, _INTERNAL_HINT_PATCH_FLAG, True)
+
+
 def apply_provider_compat_patches() -> None:
     """Install narrowly-scoped request-shape patches once per process."""
     global _PROVIDER_PATCHES_APPLIED  # pylint: disable=global-statement
@@ -209,6 +244,7 @@ def apply_provider_compat_patches() -> None:
     _patch_anthropic_modelarts(AnthropicModelClient)
     _patch_openai_modelarts_tool_choice(OpenAIModelClient)
     _patch_openai_tool_call_fragments(OpenAIModelClient, openai_model_client)
+    _patch_openai_internal_hints(OpenAIModelClient)
     _PROVIDER_PATCHES_APPLIED = True
     logger.info("Provider compatibility patches applied")
 

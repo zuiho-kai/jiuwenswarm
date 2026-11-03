@@ -1054,3 +1054,14 @@ test('4470 history preserves token-related choices while masking custom input', 
   assert.deepEqual(parsed.items[0].answers,['让你代登录','••••••']);
   assert.ok(!summary.content.includes('FAKE-4470'));
 });
+
+
+test('meeting startup restores as a lifecycle card, while real speech remains a user message',()=>{
+ const messages=parseHistoryJsonFileToPreviewMessages([
+  {id:'start:user',role:'user',content:'大家一起聊聊',meeting_startup:true,timestamp:1},
+  {id:'speech:user',role:'user',content:'讨论下一季度产品规划',timestamp:2},
+ ],sessionId);
+ assert.equal(messages.length,2);
+ assert.equal(messages[0].role,'system');assert.equal(messages[0].isMeetingStartup,true);
+ assert.equal(messages[1].role,'user');assert.equal(messages[1].isMeetingStartup,undefined);
+});

@@ -11,6 +11,8 @@ from typing import Literal, Protocol
 from openjiuwen.agent_teams.meeting import MeetingCoordinator
 from openjiuwen.agent_teams.schema.meeting import MeetingScope, SpeechInterruption, SpeechRequest
 
+from .errors import exception_detail
+
 logger = logging.getLogger(__name__)
 
 
@@ -195,13 +197,13 @@ class MeetingGrantDriver:
         # The SDK's durable interruption barrier blocks all new grants meanwhile.
         try:
             await self.consumer.interrupt(interruption)
-        except Exception:
+        except Exception as exc:
             logger.exception("Meeting speech stop was not confirmed")
             async with self._lock:
                 if not self._closed:
-                    self._state = GrantDriverState("interruption_failed", request, "interruption_stop_failed")
+                    self._state = GrantDriverState("interruption_failed", request, f"interruption_stop_failed: {exception_detail(exc)}")
             await self._report_error()
-            raise RuntimeError("Meeting speech stop was not confirmed; end the meeting to recover") from None
+            raise RuntimeError(f"Meeting speech stop was not confirmed; end the meeting to recover. {exception_detail(exc)}") from exc
         async with self._lock:
             self._audio_stopped = True
             await self._resume_interruption()
@@ -278,7 +280,7 @@ class MeetingGrantDriver:
                 # Do not hold the lock across consumer code: a controlled consumer
                 # may acknowledge actual completion within this callback.
                 await self.consumer.speech_ready(request)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Meeting playback delivery failed for %s", request.request_id)
                 failed = False
                 async with self._lock:
@@ -286,7 +288,7 @@ class MeetingGrantDriver:
                         self._matches(request.scope, request.request_id, request.lease_token)
                         and self._state.phase == "awaiting_playback"
                     ):
-                        self._state = GrantDriverState("consumer_failed", request, "consumer_delivery_failed")
+                        self._state = GrantDriverState("consumer_failed", request, f"consumer_delivery_failed: {exception_detail(exc)}")
                         failed = True
                 if failed:
                     await self._report_error()
@@ -297,8 +299,8 @@ class MeetingGrantDriver:
             self._wake.clear()
             try:
                 await self._step()
-            except Exception:
+            except Exception as exc:
                 logger.exception("Meeting grant coordination failed for %s", self.coordinator.scope)
                 if not self._closed:
-                    self._state = GrantDriverState("coordination_failed", self._state.request, "coordination_failed")
+                    self._state = GrantDriverState("coordination_failed", self._state.request, f"coordination_failed: {exception_detail(exc)}")
                     await self._report_error()

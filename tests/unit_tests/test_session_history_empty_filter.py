@@ -578,3 +578,22 @@ def test_structurally_valid_tool_result_keeps_falsy_terminal_values(
 )
 def test_structurally_invalid_tool_result_is_rejected(extra: dict) -> None:
     assert session_history._is_structurally_valid_tool_result(extra) is False
+
+
+def test_meeting_lifecycle_is_not_used_as_title_or_human_activity(monkeypatch):
+    from jiuwenswarm.server.runtime.session import session_metadata
+    records, updates = [], []
+    monkeypatch.setattr(session_history, "_enqueue_history_item", lambda sid, item, **kwargs: records.append(item))
+    monkeypatch.setattr(session_metadata, "update_session_metadata", lambda **kwargs: updates.append(kwargs))
+    monkeypatch.setattr(session_metadata, "set_session_delivery_context", lambda **kwargs: None)
+    for index, extra in enumerate(({"meeting_startup": True}, None)):
+        session_history.append_history_record(
+            session_id="meeting-title", request_id=f"request-{index}", channel_id="web",
+            role="user", content="开场提示" if extra else "讨论产品规划", timestamp=index + 1,
+            extra=extra, mode="team",
+        )
+    assert records[0]["meeting_startup"] is True
+    assert updates[0]["user_content"] is None
+    assert updates[0]["last_user_message_at"] is None
+    assert updates[1]["user_content"] == "讨论产品规划"
+    assert updates[1]["last_user_message_at"] == 2

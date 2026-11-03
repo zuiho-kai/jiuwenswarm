@@ -1,3 +1,4 @@
+import { meetingFailure } from './meetingErrors';
 import type { ChatSendOptions } from '../../../channels/web/frontend/src/types';
 import type { Transport } from './meetingRuntime';
 
@@ -17,7 +18,16 @@ export function sendMeetingInput(
     let settled = false;
     let requestId: string | undefined;
     const off: Array<() => void> = [];
-    const timer = setTimeout(() => finish(new Error('deliveryFailed')), 60000);
+    const timer = setTimeout(
+      () =>
+        finish(
+          meetingFailure(
+            'deliveryFailed',
+            new Error('PUBLIC_MESSAGE_ACCEPTANCE_TIMEOUT: no team.group_message.accepted event within 60 seconds'),
+          ),
+        ),
+      60000,
+    );
     const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
@@ -41,8 +51,9 @@ export function sendMeetingInput(
         if (payload.session_id !== sessionId || !requestId || payload.request_id !== requestId) return;
         const error = String(payload.error || payload.message || 'deliveryFailed');
         finish(
-          new Error(
+          meetingFailure(
             /conversation.mode|conversation mode/i.test(error) ? 'meetingRequiresNewConversation' : 'deliveryFailed',
+            Object.assign(new Error(error), { code: payload.code, requestId }),
           ),
         );
       }),
@@ -64,6 +75,7 @@ export function sendMeetingInput(
             clientMessageId,
             mentions,
             meeting: true,
+            meetingStartup: clientMessageId.startsWith('meeting-start-'),
             onRequestId: (id) => {
               requestId = id;
             },
@@ -71,7 +83,10 @@ export function sendMeetingInput(
         });
       })
       .then((sent) => {
-        if (sent === false) finish(new Error('deliveryFailed'));
+        if (sent === false)
+          finish(
+            meetingFailure('deliveryFailed', new Error('Chat sender declined the message before public delivery')),
+          );
       })
       .catch((error) => finish(error instanceof Error ? error : new Error('deliveryFailed')));
   });

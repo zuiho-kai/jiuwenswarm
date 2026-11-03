@@ -10,12 +10,13 @@ from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from openjiuwen.agent_teams.meeting import (
-    MeetingCoordinator,
     MeetingScope,
     MeetingState,
 )
+from sqlalchemy.exc import OperationalError
 
 from jiuwenswarm.common.config import get_config
+from .coordination import ResponsiveMeetingCoordinator as MeetingCoordinator
 
 if TYPE_CHECKING:
     from jiuwenswarm.common.voice_matching import MemberVoiceRegistry
@@ -105,6 +106,8 @@ class MeetingManager:
                     config_revision=config_revision, emit=emit,
                 )
             consumer.driver = await self.enable_grant_driver(session_id, meeting_id, consumer=consumer, voices=voices)
+            if hasattr(meeting.coordinator, "on_queue_changed"):
+                meeting.coordinator.on_queue_changed = lambda snapshot: consumer._push("meeting.queue", snapshot)
             return {"ready": True, "meeting_id": meeting_id}
 
     async def browser_playback(self, session_id: str, meeting_id: str, owner_id: str, *, closing=False):
@@ -238,22 +241,17 @@ class MeetingManager:
             driver.start()
             return driver
 
-    async def prepare_human_input(self, session_id: str, meeting_id: str, owner_id: str, text: str) -> dict:
-        from .interruption import is_human_interruption
-
-        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+    async def prepare_human_input(self, session_id: str, meeting_id: str, owner_id: str, text: str, *, confirmed_speech: bool = False, expected_token: str | None = None) -> dict:
+        if not confirmed_speech and (not isinstance(text, str) or not text.strip() or len(text) > 16000):
             raise ValueError("Meeting transcript must contain 1-16000 characters")
         consumer = await self.browser_playback(session_id, meeting_id, owner_id)
         driver = consumer.driver
         speaker = await driver.coordinator.get_speaker()
-        if speaker is None:
+        if speaker is None or (confirmed_speech and speaker.lease_token != expected_token):
             return {}
-        agent = self._team_manager.get_team_agent(session_id)
-        config = getattr(agent.spec, "duplex", None)
-        if not await is_human_interruption(text, speaker, config):
-            return {}
-        # The token observed before judgment prevents a slow answer from
-        # interrupting a newer speaker. Human text is still delivered either way.
+        # VAD-confirmed speech and legacy nonempty transcripts both yield the
+        # audio floor immediately. Never run an LLM to decide whether to stop.
+        # The observed token prevents interruption of a newer speaker.
         try:
             interruption = await driver.interrupt(speaker.lease_token, human=True)
         except RuntimeError:
@@ -504,9 +502,7 @@ class MeetingManager:
             if meeting.driver is not None:
                 await meeting.driver.aclose()
             # Startup might fail before a row exists. Missing/closed is already clean.
-            state = await meeting.coordinator.get_state()
-            if state is not None and not state.closed:
-                await meeting.coordinator.close()
+            await self._close_coordinator(meeting.coordinator)
         except BaseException:
             async with self._lock:
                 meeting.phase = "cleanup_failed"
@@ -514,6 +510,33 @@ class MeetingManager:
         async with self._lock:
             if self._sessions.get(session_id) is meeting:
                 self._sessions.pop(session_id)
+
+    @staticmethod
+    async def _close_coordinator(coordinator: MeetingCoordinator) -> None:
+        """Close the coordinator, retrying while the Team database is busy.
+
+        The Team runtime keeps writing group messages while a meeting ends, so
+        the close transaction can hit SQLite's busy timeout. Each retry is a
+        fresh transaction, so a transient lock must not fail the whole meeting.
+        """
+        last: Exception | None = None
+        for attempt in range(4):
+            try:
+                state = await coordinator.get_state()
+                if state is not None and not state.closed:
+                    await coordinator.close()
+                return
+            except OperationalError as exc:
+                if "database is locked" not in str(exc):
+                    raise
+                last = exc
+                logger.warning(
+                    "Meeting close deferred: team database busy (attempt %d/4)",
+                    attempt + 1,
+                )
+                await asyncio.sleep(1.0 + attempt)
+        assert last is not None
+        raise last
 
     def _release_locked(
         self, session_id: str, meeting: _Meeting

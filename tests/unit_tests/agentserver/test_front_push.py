@@ -133,3 +133,25 @@ async def test_trajectory_bridge_retries_through_front_after_reconnect() -> None
     finally:
         await bridge.unbind()
     test_logger.info("Front reconnect delivered the retained trajectory watermark")
+
+
+@pytest.mark.asyncio
+async def test_meeting_push_survives_real_temporary_query_connections():
+    from websockets.legacy.client import connect
+    front = AgentServerFront(port=0)
+    await front.start()
+    port = front._server.sockets[0].getsockname()[1]
+    try:
+        async with connect(f"ws://127.0.0.1:{port}", extra_headers={"X-Jiuwen-Gateway-Push": "1"}) as gateway:
+            await gateway.recv()
+            async with connect(f"ws://127.0.0.1:{port}") as query:
+                await query.recv()
+                assert await front.send_push({"request_id": "ready", "channel_id": "web", "session_id": "s1", "payload": {"event_type": "meeting.playback", "event": "meeting.speech.ready"}})
+                frame = json.loads(await asyncio.wait_for(gateway.recv(), 2))
+                assert frame["metadata"][E2A_WIRE_SERVER_PUSH_KEY] is True
+            await asyncio.sleep(0.05)
+            assert await front.send_push({"request_id": "stop", "channel_id": "web", "session_id": "s1", "payload": {"event_type": "meeting.playback", "event": "meeting.playback.stop"}})
+            frame = json.loads(await asyncio.wait_for(gateway.recv(), 2))
+            assert frame["request_id"] == "stop"
+    finally:
+        await front.stop()

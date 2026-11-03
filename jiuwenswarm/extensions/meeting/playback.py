@@ -66,6 +66,7 @@ class BrowserPlaybackConsumer:
         self._interrupted: set[str] = set()
         self._speech_stops: dict[str, asyncio.Future] = {}
 
+
     async def _push(self, event: str, payload: dict) -> None:
         if not await self.emit({
             "event_type": EVENT, "event": event, "route_id": self.route_id,
@@ -137,7 +138,7 @@ class BrowserPlaybackConsumer:
     async def result(self, params: dict) -> dict:
         record = self._record(params)
         outcome, count = params.get("outcome"), params.get("completed_chunks")
-        if outcome not in {"completed", "stopped", "failed"} or type(count) is not int or not 0 <= count <= len(record.chunks):
+        if outcome not in {"completed", "stopped", "failed", "skipped"} or type(count) is not int or not 0 <= count <= len(record.chunks):
             raise ValueError("Invalid playback outcome")
         if outcome == "completed" and count != len(record.chunks):
             raise ValueError("All speech chunks must naturally finish before completion")
@@ -153,12 +154,29 @@ class BrowserPlaybackConsumer:
                 accepted = await self.driver.complete_playback(self.scope, record.request_id, record.lease_token)
             else:
                 accepted = await self.driver.fail_playback(
-                    self.scope, record.request_id, record.lease_token, advance=outcome == "failed",
+                    self.scope, record.request_id, record.lease_token, advance=outcome in {"failed", "skipped"},
                 )
             if not accepted:
                 raise ValueError("Playback lease is no longer current")
             self._receipts[record.playback_id] = (outcome, count)
         return {"accepted": True}
+
+    async def queue_control(self, params):
+        coordinator = self.driver.coordinator
+        if not hasattr(coordinator, "queue_snapshot"):
+            raise ValueError("Queue controls are unavailable")
+        operation = params.get("operation", "status")
+        if operation == "cancel":
+            request_id = params.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("A queued request ID is required")
+            if not await coordinator.cancel_request(request_id):
+                raise ValueError("This request is no longer waiting; refresh the queue")
+            await coordinator.notify_queue()
+            self.driver.wake()
+        elif operation != "status":
+            raise ValueError("Unsupported queue operation")
+        return await coordinator.queue_snapshot()
 
     def confirm_stop(self, stop_id: str) -> dict:
         # Deliberately independent from driver/result locks: aclose holds the

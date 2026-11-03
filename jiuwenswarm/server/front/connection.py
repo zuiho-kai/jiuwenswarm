@@ -63,6 +63,7 @@ class ConnectionHandler:
         self._router = router
         self._admission = admission
         self._forwarder = forwarder
+        self._push_gateway_ws: Any = None
         self.current_ws: Any = None
         self.current_send_lock: asyncio.Lock | None = None
 
@@ -70,13 +71,22 @@ class ConnectionHandler:
         remote = ws.remote_address
         logger.info("[Front] 新连接: %s", remote)
         send_lock = asyncio.Lock()
-        self.current_ws = ws
-        self.current_send_lock = send_lock
-        if self._forwarder is not None:
-            self._forwarder.attach(ws, send_lock)
-        backend = self._admission.backend
-        if backend is not None:
-            backend.attach_gateway_connection(ws, send_lock)
+        headers = getattr(ws, "request_headers", None)
+        if headers is None:
+            headers = getattr(getattr(ws, "request", None), "headers", None)
+        is_push_gateway = get_header_value(headers, "X-Jiuwen-Gateway-Push") == "1"
+        # Only the persistent Gateway consumes unsolicited events. Short-lived
+        # HTTP/tool query sockets must not replace it or detach its Runtime bridge.
+        if is_push_gateway or self._push_gateway_ws is None:
+            self.current_ws = ws
+            self.current_send_lock = send_lock
+            if is_push_gateway:
+                self._push_gateway_ws = ws
+            if self._forwarder is not None:
+                self._forwarder.attach(ws, send_lock)
+            backend = self._admission.backend
+            if backend is not None:
+                backend.attach_gateway_connection(ws, send_lock)
         try:
             ack = connection_ack_frame(
                 readiness_state=self._readiness.state.value,
@@ -108,6 +118,8 @@ class ConnectionHandler:
         finally:
             was_current = self.current_ws is ws
             if was_current:
+                if self._push_gateway_ws is ws:
+                    self._push_gateway_ws = None
                 self.current_ws = None
                 self.current_send_lock = None
                 if self._forwarder is not None:

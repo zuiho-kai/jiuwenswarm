@@ -35,6 +35,13 @@ export interface ApplicationPluginSettingsProps {
   onManifestChanged: () => void;
 }
 
+export type ApplicationPluginStopAction = {
+  onStop: () => void;
+  label: string;
+  disabled: boolean;
+  sessionId: string | null;
+};
+
 export interface ApplicationPluginTaskInputActionProps {
   fallback: ReactNode;
   eligible: boolean;
@@ -42,6 +49,7 @@ export interface ApplicationPluginTaskInputActionProps {
   onSelectTeamMode?: () => void;
   onTranscript?: (text: string) => void;
   onMicrophoneActiveChange?: (active: boolean) => void;
+  onStopActionChange?: (action: ApplicationPluginStopAction | null) => void;
   microphoneBusy?: boolean;
   disabled?: boolean;
   sessionId: string | null;

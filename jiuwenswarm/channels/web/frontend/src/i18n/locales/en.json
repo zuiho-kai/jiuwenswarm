@@ -1,5 +1,50 @@
 {
   "meeting": {
+"opening": {"title": "Team discussion", "description": "Start with your first idea. Share a question and the team will explore it and agree on next steps."},
+    "diagnostics": {
+  "reasonLabel": "Reason: ",
+  "solutionLabel": "Suggested action: ",
+  "dismiss": "Dismiss meeting error details",
+  "unknownReason": "This stage supplied no lower-level diagnostic. The root cause is unknown; permissions, connectivity and configuration cannot be distinguished yet.",
+  "reason": {
+    "unsupported": "Microphone capture or audio processing APIs are unavailable in this environment.",
+    "disconnected": "The meeting WebSocket is not ready or has disconnected.",
+    "microphoneEnded": "The browser reported that the microphone track ended.",
+    "cleanupFailed": "The server has not been confirmed idle after the end request.",
+    "cleanupPending": "The end request returned a non-idle server state.",
+    "inputStreamFailed": "Audio upload or input control did not receive a valid acknowledgement.",
+    "meetingBusy": "Another browser connection owns this meeting.",
+    "meetingRequiresNewConversation": "This conversation already has an ordinary team runtime and cannot switch to a meeting runtime.",
+    "deliveryFailed": "The message did not receive public acceptance from the team."
+  },
+  "solution": {
+    "unknown": "Keep these details and inspect the server log at the same time to identify the failed stage. Check delivery before retrying to avoid duplicate work.",
+    "autoplay": "Interact with the page and allow this site to play audio, then retry playback.",
+    "permission": "Allow microphone access for this site and in system privacy settings, then start a new meeting.",
+    "deviceMissing": "Connect and enable a microphone, select it in system and browser input settings, then start a new meeting.",
+    "deviceBusy": "Close applications using the microphone, check its driver and system input settings, then start a new meeting.",
+    "deviceConstraints": "Select an input device supporting mono capture or restore the default audio device and retry.",
+    "credentials": "Check the API key, account permissions and endpoint for this stage. ASR uses full-duplex voice settings; narration uses meeting speech synthesis settings.",
+    "quota": "Check provider quota, balance and concurrency limits; retry after throttling clears.",
+    "timeout": "Check connectivity and response times for this stage. For delivery or end timeouts, first check whether the message was delivered or the meeting ended.",
+    "overload": "Pause the microphone or speak less continuously while pending work drains. If input stopped, end and restart the meeting.",
+    "configuration": "For ASR, check full-duplex voice recognition settings. For narration, check synthesis provider, model, voice and endpoint. Save and start a new meeting.",
+    "connection": "Check that local and model services are running and reachable. After reconnecting, end the old meeting and start again.",
+    "capture": "Inspect browser audio processing and VAD loading errors. Check model and worker resources and reopen the page in a supported browser.",
+    "session": "End the old meeting, reload, keep only one meeting tab, and start again to discard stale audio streams or playback credentials.",
+    "audioFormat": "Check that provider audio content and encoding are valid and supported by the browser; try another synthesis provider in a new meeting.",
+    "newConversation": "Start a meeting in a new team conversation; the existing conversation remains usable for text.",
+    "owner": "Use the tab that owns the meeting, or end it there before starting here.",
+    "secureContext": "Use HTTPS or localhost in a browser supporting AudioWorklet and microphone capture."
+  }
+},
+    "controls": {"title": "Meeting controls", "minimize": "Minimize meeting controls"},
+    "actionsTitle": "Meeting actions",
+    "actionReviewer": "Reviewer",
+    "actionAcceptance": "Acceptance",
+    "actionPhase": {"adjusting": "Adjusting work", "discussion": "Discussion", "execution": "Execution and review", "waiting": "Waiting for dependencies", "finished": "Agenda finished"},
+    "actionStatus": {"paused": "Paused for adjustment", "assigned": "Assigned", "running": "Running", "submitted": "Awaiting review", "accepted": "Accepted", "blocked": "Blocked", "cancelled": "Cancelled"},
+
     "feishu": {
       "title": "Feishu settings",
       "description": "Save the app credentials and API URL, then connect manually. Use https://open.feishu.cn for Feishu or https://open.larksuite.com for Lark. Connect again after restarting the backend. Voice meeting delivery is not connected yet.",
@@ -15,6 +60,7 @@
       }
     },
     "panel": {
+      "queueEmpty": "No speech queued. New spoken updates will appear here.",
       "title": "Meeting",
       "addressedAgents": "Agents currently addressed by the meeting",
       "noAddressedAgents": "No agents currently addressed",
@@ -22,7 +68,7 @@
       "microphone": "Microphone",
       "pauseMicrophone": "Pause microphone",
       "microphoneStates": {
-        "ready": "Paused",
+        "ready": "Muted",
         "recording": "Listening",
         "transcribing": "Transcribing…"
       },
@@ -45,10 +91,11 @@
       "leader": "Leader",
       "none": "None"
     },
-    "startMessage": "Start meeting",
+    "defaultTitle": "Team discussion",
+    "startMessage": "Let’s talk it through, explore ideas, and agree on next steps.",
     "playback": {
-      "loading": "Preparing {{speaker}} ({{voice}})…",
-      "playing": "{{speaker}} speaking ({{voice}})",
+      "loading": "Preparing {{speaker}}’s speech…",
+      "playing": "{{speaker}} speaking",
       "paused": "Speech paused. End this meeting to start again.",
       "failed": "Speech failed. Read the transcript, then end this meeting."
     },
@@ -61,6 +108,14 @@
       "stop": "End Team meeting"
     },
     "title": "Team meetings",
+    "textPending": "Text awaiting retry",
+    "textPublished": "Text delivered",
+    "queueWait": "Waiting at least {{seconds}} s",
+    "skipSpeech": "Skip current speech",
+    "queueTitle": "Waiting for audio: {{count}}",
+    "textDeliveredNote": "Audio queue below. Removing audio preserves published text. A new post replaces that member’s waiting audio.",
+    "currentDecision": "Current meeting decision",
+    "cancelQueued": "Remove audio",
     "stopPlayback": "Stop audio",
     "leader": "Leader",
     "record": {
@@ -69,23 +124,26 @@
       "transcribing": "Transcribing…"
     },
     "errors": {
-      "playbackUnavailable": "Meeting audio could not be prepared. Check the Qwen configuration and try again.",
+"titleUpdateFailed": "The meeting is ready, but its title could not be updated.",
+"configurationReadFailed": "Could not read meeting configuration; retrying in the background.",
+"queueControlFailed": "Could not withdraw queued speech.","skipFailed": "The server did not acknowledge skipping speech.",
+      "playbackUnavailable": "Meeting audio initialization did not complete.",
       "cleanupFailed": "Meeting cleanup was not confirmed. Retry End meeting.",
-      "inputStreamFailed": "Microphone streaming stopped because the connection could not keep up. Start a new meeting.",
+      "inputStreamFailed": "Meeting audio input stopped.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
-      "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
-      "meetingStartFailed": "Could not start the Team meeting. Please try again.",
+      "microphoneFailed": "Microphone or local audio initialization failed.",
+      "meetingStartFailed": "Meeting startup did not complete.",
       "meetingRequiresNewConversation": "Start a meeting in a new Team conversation. This conversation already uses ordinary Team mode.",
       "meetingBusy": "This Team meeting is already open in another tab.",
       "microphoneEnded": "The microphone was disconnected.",
       "disconnected": "Connection lost. Start a new meeting after reconnecting.",
       "recordingTooLarge": "The recording is too large. Please record a shorter message.",
-      "recordingFailed": "Could not record audio. Please try again.",
-      "transcriptionFailed": "Could not transcribe the recording. Please try again.",
+      "recordingFailed": "Local capture or speech detection stopped.",
+      "transcriptionFailed": "Recognition or transcript publication failed for this utterance.",
       "emptyTranscript": "No clear speech was detected. Please record again.",
-      "deliveryFailed": "Your message could not be delivered. Please try again.",
-      "playbackFailed": "Could not play the agent reply. The full text is still available.",
-      "playbackSkipped": "Audio failed. Skipping this speech and continuing the queue; the full text is still available.",
+      "deliveryFailed": "Meeting message delivery was not acknowledged.",
+      "playbackFailed": "Meeting narration or playback acknowledgement failed.",
+      "playbackSkipped": "Synthesis or playback failed for this segment; skipping was attempted. Read the text record.",
       "playbackOverloaded": "Too much speech is queued. Read the full reply in the transcript."
     }
   },
