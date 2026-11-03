@@ -2479,7 +2479,7 @@ class TeamManager:
         self._runner_team_agents[session_id] = team_agent
         from jiuwenswarm.extensions.meeting.meeting_manager import get_server_meeting_manager
 
-        get_server_meeting_manager().team_runtime_ready(session_id)
+        await get_server_meeting_manager().team_runtime_ready(session_id)
 
         if not self._is_distributed_mode(get_config()):
             return False

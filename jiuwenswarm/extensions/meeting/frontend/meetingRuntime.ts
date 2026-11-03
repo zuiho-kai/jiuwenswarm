@@ -1,6 +1,5 @@
 import { claimMeetingAudio } from '../../../channels/web/frontend/src/features/teamMeeting/playbackOwnership';
 import { onTtsStop, requestTtsStop } from '../../../channels/web/frontend/src/utils/ttsControl';
-import { MeetingPcmCapture, type MeetingCapture, type MeetingCaptureFactory } from './meetingCapture';
 
 export type MeetingMember = { member_name: string; display_name: string };
 export type MeetingContext = { leader: string; members: MeetingMember[] };
@@ -11,7 +10,6 @@ export interface Transport {
   onStateChange(handler: (state: string) => void): () => void;
 }
 export type MeetingLine = { id: string; speaker: string; text: string };
-export type RecordingState = 'ready' | 'recording' | 'transcribing';
 
 export type PlaybackState = 'idle' | 'loading' | 'playing' | 'paused' | 'failed';
 type Speech = Payload & {
@@ -43,16 +41,6 @@ function identity(speech: Speech): Payload {
 export class MeetingSession {
   private active = false;
   private disposed = false;
-  private media: MediaStream | null = null;
-  private capture: MeetingCapture | null = null;
-  private streamId: string | null = null;
-  private listening = false;
-  private resuming = false;
-  private inputEpoch = 0;
-  private inputSequence = 0;
-  private inputTail = Promise.resolve();
-  private pendingSamples = 0;
-  private lastUtterance = 0;
   private off: Array<() => void> = [];
   private playbackEpoch = 0;
   private finishAudio: (() => void) | null = null;
@@ -73,46 +61,22 @@ export class MeetingSession {
     public context: MeetingContext,
     private callbacks: {
       line: (line: MeetingLine) => void;
-      draft: (text: string) => void | Promise<void>;
       error: (code: string, detail?: string) => void;
-      recording: (state: RecordingState) => void;
       ended: () => void;
       playback?: (state: PlaybackState, speaker?: string, voice?: string) => void;
       addressedMembers?: (names: string[]) => void;
     },
-    private readonly createCapture: MeetingCaptureFactory = (...args) => new MeetingPcmCapture(...args),
   ) {
     this.releaseAudio = claimMeetingAudio(sessionId);
     requestTtsStop();
   }
 
   async start(): Promise<void> {
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('unsupported');
-    const media = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    if (this.disposed) {
-      media.getTracks().forEach((track) => track.stop());
-      return;
-    }
-    this.media = media;
+    if (this.disposed) throw new Error('disconnected');
     this.active = true;
-    media.getAudioTracks().forEach((track) => {
-      track.onended = () => this.fail('microphoneEnded');
-    });
     this.off.push(
       this.transport.onStateChange((state) => {
         if (state !== 'ready') this.fail('disconnected');
-      }),
-    );
-    this.off.push(
-      this.transport.on('chat.error', ({ payload }) => {
-        if (this.active && payload.session_id === this.sessionId) this.callbacks.error('deliveryFailed');
       }),
     );
     this.off.push(this.transport.on('meeting.speech.ready', ({ payload }) => this.receiveSpeech(payload)));
@@ -128,12 +92,13 @@ export class MeetingSession {
           return;
         const attempt = this.currentSpeech;
         if (
-          attempt?.speech.playback_id === payload.playback_id &&
+          attempt &&
+          attempt.speech.playback_id === payload.playback_id &&
           identityFields.some((key) => attempt.speech[key] !== payload[key])
         )
           return;
         this.interrupted.add(payload.playback_id as string);
-        if (attempt?.speech.playback_id === payload.playback_id) {
+        if (attempt && attempt.speech.playback_id === payload.playback_id) {
           // This is a speech interruption, not End: keep capture and listeners live.
           attempt.reported = true;
           this.playbackEpoch++;
@@ -191,169 +156,23 @@ export class MeetingSession {
     this.offAudio = onTtsStop(() => {
       if (!this.claimingAudio && this.currentSpeech) this.stopPlayback();
     });
-    this.off.push(
-      this.transport.on('meeting.input.transcribing', ({ payload }) => {
-        if (this.matchesInput(payload) && !this.listening) this.callbacks.recording('transcribing');
-      }),
-      this.transport.on('meeting.input.transcript', ({ payload }) => {
-        if (!this.matchesInput(payload) || !this.acceptUtterance(payload)) return;
-        if (typeof payload.transcript === 'string' && payload.transcript.trim()) void this.deliverTranscript(payload);
-        this.callbacks.recording(this.listening ? 'recording' : 'ready');
-      }),
-      this.transport.on('meeting.input.error', ({ payload }) => {
-        if (!this.matchesInput(payload) || !this.acceptUtterance(payload)) return;
-        this.callbacks.error('transcriptionFailed');
-        this.callbacks.recording(this.listening ? 'recording' : 'ready');
-      }),
-    );
-    this.capture = this.createCapture(
-      media,
-      (pcm) => this.sendPcm(pcm),
-      () => this.fail('recordingFailed'),
-    );
-    await this.capture.start();
-  }
-
-  private async deliverTranscript(payload: Payload): Promise<void> {
-    try {
-      await this.callbacks.draft((payload.transcript as string).trim());
-      if (!this.matchesInput(payload) || !payload.interruption_id) return;
-      const result = await this.transport.request<{ accepted?: boolean }>('meeting.input.admitted', {
-        ...this.inputIdentity(),
-        utterance_id: payload.utterance_id,
-        interruption_id: payload.interruption_id,
-      });
-      if (!result.accepted) throw new Error('deliveryFailed');
-    } catch {
-      if (this.active) this.callbacks.error('deliveryFailed');
-    }
-  }
-
-  private matchesInput(payload: Payload): boolean {
-    return this.active && !!this.streamId && this.matchesMeeting(payload) && payload.stream_id === this.streamId;
-  }
-
-  private acceptUtterance(payload: Payload): boolean {
-    const id = payload.utterance_id;
-    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= this.lastUtterance) return false;
-    this.lastUtterance = id;
-    return true;
-  }
-
-  private inputIdentity(): Payload {
-    return {
-      session_id: this.sessionId,
-      meeting_id: this.meetingId,
-      stream_id: this.streamId,
-    };
-  }
-
-  private queueInput(operation: () => Promise<void>): void {
-    const epoch = this.inputEpoch;
-    this.inputTail = this.inputTail
-      .then(async () => {
-        if (this.active && epoch === this.inputEpoch) await operation();
-      })
-      .catch(() => {
-        if (this.active && epoch === this.inputEpoch) this.fail('inputStreamFailed');
-      });
-  }
-
-  private sendPcm(pcm: Int16Array): void {
-    if (!this.active || !this.listening || !this.streamId || !pcm.length) return;
-    // A stalled connection must not build an unbounded microphone backlog.
-    if (pcm.length > 3200 || this.pendingSamples + pcm.length > 32000) {
-      this.fail('inputStreamFailed');
-      return;
-    }
-    this.pendingSamples += pcm.length;
-    const bytes = new Uint8Array(pcm.length * 2);
-    const view = new DataView(bytes.buffer);
-    pcm.forEach((sample, index) => view.setInt16(index * 2, sample, true));
-    const encoded = btoa(String.fromCharCode(...bytes));
-    const epoch = this.inputEpoch;
-    const sequence = this.inputSequence++;
-    // Send without waiting for earlier acknowledgements. The tail is a barrier
-    // for Pause/Resume, while pendingSamples bounds the complete in-flight window.
-    const request = Promise.resolve().then(async () => {
-      try {
-        if (!this.active || epoch !== this.inputEpoch) return;
-        const result = await this.transport.request<{ accepted?: boolean }>(
-          'meeting.input.append',
-          {
-            ...this.inputIdentity(),
-            sequence,
-            audio_base64: encoded,
-          },
-          { timeoutMs: 10000 },
-        );
-        if (!result.accepted) throw new Error('inputStreamFailed');
-      } finally {
-        if (epoch === this.inputEpoch) this.pendingSamples -= pcm.length;
-      }
-    });
-    this.inputTail = Promise.all([this.inputTail, request])
-      .then(() => {})
-      .catch(() => {
-        if (this.active && epoch === this.inputEpoch) this.fail('inputStreamFailed');
-      });
   }
 
   resume(): void {
     if (!this.active || this.disposed) throw new Error('disconnected');
     this.paused = false;
-    this.startRecording();
-  }
-
-  startRecording(): void {
-    if (!this.active || !this.streamId || this.listening || this.resuming) return;
-    this.resuming = true;
-    this.queueInput(async () => {
-      try {
-        const result = await this.transport.request<{ accepted?: boolean }>(
-          'meeting.input.resume',
-          this.inputIdentity(),
-        );
-        if (!result.accepted) throw new Error('inputStreamFailed');
-        if (!this.active) return;
-        this.listening = true;
-        this.callbacks.recording('recording');
-      } finally {
-        this.resuming = false;
-      }
-    });
-  }
-
-  stopRecording(): void {
-    if (!this.active || !this.streamId || !this.listening) return;
-    this.listening = false;
-    this.callbacks.recording('ready');
-    this.queueInput(async () => {
-      const result = await this.transport.request<{ accepted?: boolean }>('meeting.input.pause', this.inputIdentity());
-      if (!result.accepted) throw new Error('inputStreamFailed');
-    });
   }
 
   async activatePlayback(meetingId: string, startupId: string): Promise<void> {
     if (!this.active || this.disposed) throw new Error('disconnected');
     this.meetingId = meetingId;
-    const result = await this.transport.request<{
-      ready?: boolean;
-      stream_id?: string;
-    }>(
+    const result = await this.transport.request<{ ready?: boolean }>(
       'meeting.playback.ready',
-      {
-        session_id: this.sessionId,
-        meeting_id: meetingId,
-        startup_id: startupId,
-      },
+      { session_id: this.sessionId, meeting_id: meetingId, startup_id: startupId },
       { timeoutMs: 20000 },
     );
     if (!this.active || this.disposed) return;
-    if (!result.ready || !result.stream_id) throw new Error('playbackUnavailable');
-    this.streamId = result.stream_id;
-    this.listening = true;
-    this.callbacks.recording('recording');
+    if (!result.ready) throw new Error('playbackUnavailable');
   }
 
   private matchesMeeting(payload: Payload): boolean {
@@ -532,16 +351,7 @@ export class MeetingSession {
     this.disposed = true;
     this.active = false;
     this.stopPlayback();
-    this.listening = false;
-    this.inputEpoch++;
-    this.capture?.stop();
-    this.capture = null;
-    if (this.streamId) void this.transport.request('meeting.input.stop', this.inputIdentity()).catch(() => {});
     this.off.splice(0).forEach((off) => off());
-    this.media?.getTracks().forEach((track) => {
-      track.onended = null;
-      track.stop();
-    });
     this.callbacks.ended();
   }
 }

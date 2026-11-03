@@ -6,6 +6,7 @@
 
 import React, { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { VoiceStreamingRuntime } from '../../features/voice/VoiceStreamingRuntime';
 import {
   Activity,
   ArrowRight,
@@ -1805,6 +1806,7 @@ export const ChatPanel = React.memo(function ChatPanel({
       onDragOver={handleDesktopFileDragOver}
       onDrop={handleDesktopFileDrop}
     >
+      <VoiceStreamingRuntime sessionId={activeSessionId} send={(text, options) => onSendMessage(text, [], options)} />
       <ApplicationPluginTaskRuntimes
         sessionId={activeSessionId}
         onSendMessage={(text, options) => onSendMessage(text, [], options)}

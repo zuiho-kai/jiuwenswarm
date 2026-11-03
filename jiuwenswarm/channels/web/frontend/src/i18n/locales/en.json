@@ -1,4 +1,32 @@
 {
+  "voiceStreaming": {
+    "routing": {
+      "title": "Voice input routing",
+      "description": "Choose Leader or no recipient for group-chat voice input. Applies to the next voice stream. Ordinary Team input uses normal chat routing.",
+      "leader": "Leader",
+      "none": "None"
+    },
+    "start": "Start voice streaming",
+    "stop": "Stop voice streaming",
+    "pause": "Pause microphone and finish the current utterance",
+    "resume": "Resume microphone",
+    "states": {
+      "starting": "Starting voice input…",
+      "listening": "Voice input listening",
+      "paused": "Microphone paused"
+    },
+    "errors": {
+      "unsupported": "Voice streaming requires a supported browser and a secure connection.",
+      "microphoneFailed": "Could not access the microphone. Check browser permissions.",
+      "microphoneEnded": "The microphone was disconnected.",
+      "disconnected": "Voice input stopped because the connection was lost.",
+      "inputStreamFailed": "Voice input could not keep up with the connection. Start it again.",
+      "recordingFailed": "Could not capture microphone audio.",
+      "transcriptionFailed": "Could not transcribe this utterance.",
+      "deliveryFailed": "Could not submit the transcript. Check the chat for details.",
+      "deliveryBacklog": "Too many transcripts are waiting for delivery. Start voice input again."
+    }
+  },
   "meeting": {
     "feishu": {
       "title": "Feishu settings",
@@ -30,12 +58,13 @@
       "noSpeaker": "No agent is speaking",
       "transcript": "Latest recognized speech",
       "waitingForSpeech": "Waiting for your speech…",
-      "empty": "No meeting is active in this conversation. Use Start Team meeting beside the chat input to begin.",
+      "empty": "Create a Team to use meeting controls. New Teams follow the global meeting default in Experimental settings.",
       "states": {
+        "failed": "Meeting activation failed",
         "idle": "No active meeting",
         "starting": "Starting",
         "active": "Active",
-        "closing": "Ending meeting…",
+        "closing": "Disabling meeting…",
         "cleanup_failed": "Cleanup needs attention"
       }
     },
@@ -45,7 +74,6 @@
       "leader": "Leader",
       "none": "None"
     },
-    "startMessage": "Start meeting",
     "playback": {
       "loading": "Preparing {{speaker}} ({{voice}})…",
       "playing": "{{speaker}} speaking ({{voice}})",
@@ -53,12 +81,14 @@
       "failed": "Speech failed. Read the transcript, then end this meeting."
     },
     "task": {
-      "closing": "Ending meeting…",
-      "retryCleanup": "Retry End meeting",
-      "start": "Start Team meeting",
-      "starting": "Starting meeting…",
-      "waiting": "Preparing the Team and meeting…",
-      "stop": "End Team meeting"
+      "enable": "Enable meeting",
+      "enabled": "Meeting enabled",
+      "enabling": "Enabling meeting…",
+      "disabling": "Disabling meeting…",
+      "retryEnable": "Retry enabling meeting",
+      "closing": "Disabling meeting…",
+      "retryCleanup": "Retry disabling meeting",
+      "stop": "Disable meeting"
     },
     "title": "Team meetings",
     "stopPlayback": "Stop audio",
@@ -70,12 +100,11 @@
     },
     "errors": {
       "playbackUnavailable": "Meeting audio could not be prepared. Check the Qwen configuration and try again.",
-      "cleanupFailed": "Meeting cleanup was not confirmed. Retry End meeting.",
+      "cleanupFailed": "Meeting cleanup was not confirmed. Retry disabling meeting.",
       "inputStreamFailed": "Microphone streaming stopped because the connection could not keep up. Start a new meeting.",
       "unsupported": "Voice recording requires a supported browser and a secure connection.",
       "microphoneFailed": "Could not access your microphone. Check browser permissions and try again.",
-      "meetingStartFailed": "Could not start the Team meeting. Please try again.",
-      "meetingRequiresNewConversation": "Start a meeting in a new Team conversation. This conversation already uses ordinary Team mode.",
+      "meetingStartFailed": "Could not enable the Team meeting. Please try again.",
       "meetingBusy": "This Team meeting is already open in another tab.",
       "microphoneEnded": "The microphone was disconnected.",
       "disconnected": "Connection lost. Start a new meeting after reconnecting.",
@@ -620,9 +649,13 @@
         "title": "JEV routing for teammates",
         "description": "Filter teammate broadcasts and allow interruptions in new Team conversations."
       },
+      "team_meeting_default_enabled": {
+        "title": "Enable meetings for new Teams",
+        "description": "Automatically enable a meeting after a new Team is created. Existing Teams keep their current meeting state."
+      },
       "team_meeting_enabled": {
         "title": "Team meetings",
-        "description": "Enable voice input and spoken replies in Team conversations."
+        "description": "Enable spoken replies in Team conversations. Voice streaming has its own chat control."
       },
       "preferred_language": {
         "title": "Language",

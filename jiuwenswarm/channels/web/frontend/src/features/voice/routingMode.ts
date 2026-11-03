@@ -1,9 +1,9 @@
-export type MeetingRoutingMode = 'leader' | 'none';
+export type VoiceInputRoutingMode = 'leader' | 'none';
 
 const storageKey = 'team-meeting-input-routing';
-let fallback: MeetingRoutingMode = 'leader';
+let fallback: VoiceInputRoutingMode = 'leader';
 
-export function getMeetingRoutingMode(): MeetingRoutingMode {
+export function getVoiceInputRoutingMode(): VoiceInputRoutingMode {
   try {
     return window.localStorage.getItem(storageKey) === 'none' ? 'none' : 'leader';
   } catch {
@@ -11,7 +11,7 @@ export function getMeetingRoutingMode(): MeetingRoutingMode {
   }
 }
 
-export function setMeetingRoutingMode(mode: MeetingRoutingMode): void {
+export function setVoiceInputRoutingMode(mode: VoiceInputRoutingMode): void {
   fallback = mode;
   try {
     window.localStorage.setItem(storageKey, mode);

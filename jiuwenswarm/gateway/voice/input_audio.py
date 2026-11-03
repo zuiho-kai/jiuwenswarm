@@ -19,7 +19,7 @@ MAX_UTTERANCE_FRAMES = 937  # Less than 30 seconds, including pre-roll.
 
 @lru_cache(maxsize=1)
 def _model():
-    # Load only when a meeting opens its microphone stream. No runtime download.
+    # Load only when a voice stream opens its microphone. No runtime download.
     import onnxruntime as ort
 
     options = ort.SessionOptions()

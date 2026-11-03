@@ -5360,8 +5360,6 @@ class AgentWebSocketServer:
         try:
             if not is_valid_session_id(session_id) or session_id == "new" or not (get_agent_sessions_dir() / session_id).is_dir():
                 raise ValueError("Meeting session not found")
-            if not is_team_mode(get_session_metadata(session_id).get("mode")):
-                raise ValueError("Meeting requires a Team session")
             manager = get_server_meeting_manager()
             playback_payload = None
             if request.req_method == ReqMethod.MEETING_START:

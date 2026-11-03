@@ -1,18 +1,12 @@
-import { resamplePcm16 } from '../../video_duplex/frontend/VideoLivePanel/joyaiVoice';
+import { resamplePcm16 } from '../../../../../../extensions/video_duplex/frontend/VideoLivePanel/joyaiVoice';
 
-export interface MeetingCapture {
+export interface PcmCapture {
   start(): Promise<void>;
   stop(): void;
 }
 
-export type MeetingCaptureFactory = (
-  stream: MediaStream,
-  onPcm: (pcm: Int16Array) => void,
-  onError: () => void,
-) => MeetingCapture;
-
 /** Capture only: speech detection and utterance boundaries belong to Gateway. */
-export class MeetingPcmCapture implements MeetingCapture {
+export class BrowserPcmCapture implements PcmCapture {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private capture: AudioWorkletNode | null = null;
@@ -31,7 +25,7 @@ export class MeetingPcmCapture implements MeetingCapture {
       const context = new AudioContext({ sampleRate: 16_000 });
       this.context = context;
       await context.audioWorklet.addModule(
-        new URL('../../video_duplex/frontend/VideoLivePanel/duplex-capture.js', import.meta.url),
+        new URL('../../../../../../extensions/video_duplex/frontend/VideoLivePanel/duplex-capture.js', import.meta.url),
       );
       if (this.stopped) return;
       this.source = context.createMediaStreamSource(this.stream);

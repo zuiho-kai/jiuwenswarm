@@ -179,13 +179,13 @@ export interface Message {
 /** Optional routing for queued input and explicit public group-chat messages. */
 export interface ChatSendOptions {
   queuedTaskId?: string;
+  onRequestId?: (id: string) => void;
   groupChat?: {
     sessionId: string;
     clientMessageId: string;
     mentions: string[];
-    meeting?: boolean;
     onRequestId?: (id: string) => void;
-  };
+  } | null;
 }
 
 export interface MessageForkPoint {

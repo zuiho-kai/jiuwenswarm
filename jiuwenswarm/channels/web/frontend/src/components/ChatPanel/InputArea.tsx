@@ -18,6 +18,7 @@
   type SVGProps,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { VoiceStreamingButton } from '../../features/voice/VoiceStreamingButton';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { AtSign, ChevronRight, CircleX, Loader2, Lock, Mic, Pencil, Plus, Settings, Square, Workflow, X } from 'lucide-react';
@@ -992,6 +993,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const queuePaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.queuePaused ?? false);
   const isLoadingHistory = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.isLoadingHistory ?? false);
   const [applicationMicrophoneActive, setApplicationMicrophoneActive] = useState(false);
+  const [voiceStreamingActive, setVoiceStreamingActive] = useState(false);
   const inputValue = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.inputValue ?? '');
   const evolutionStatus = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.evolutionStatus ?? null);
   const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
@@ -4800,11 +4802,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 {taskAsrEnabled && <button
                   type="button"
                   onClick={toggleRecording}
-                  disabled={composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive}
+                  disabled={composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive || voiceStreamingActive}
                   className={cx(
                     'chat-input-btn chat-input-btn--microphone',
                     isListening && 'chat-input-btn--recording',
-                    (composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive) && 'chat-input-btn--disabled',
+                    (composerDisabled || isTranscribing || !taskAsrSupported || applicationMicrophoneActive || voiceStreamingActive) && 'chat-input-btn--disabled',
                   )}
                   aria-label={isListening ? t('chat.stopRecording') : t('chat.startRecording')}
                   aria-pressed={isListening}
@@ -4832,6 +4834,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 </button>}
                 {micTooltipNode}
 
+                <VoiceStreamingButton
+                  sessionId={activeSessionId}
+                  ensureSession={onEnsureSession}
+                  busy={isListening || isTranscribing || applicationMicrophoneActive}
+                  disabled={composerDisabled || isLoadingHistory}
+                  onActiveChange={setVoiceStreamingActive}
+                />
                 <ApplicationPluginTaskInputActions
                   eligible={fullDuplexActionEligible && !isTeamMode}
                   teamEligible={isTeamMode}
@@ -4843,7 +4852,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   disabled={composerDisabled || isLoadingHistory}
                   onTranscript={appendTaskAsrTranscript}
                   onMicrophoneActiveChange={setApplicationMicrophoneActive}
-                  microphoneBusy={isListening || isTranscribing}
+                  microphoneBusy={isListening || isTranscribing || voiceStreamingActive}
                   sessionId={activeSessionId}
                   ensureSession={onEnsureSession}
                   labels={{

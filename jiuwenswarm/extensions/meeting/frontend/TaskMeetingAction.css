@@ -9,7 +9,7 @@
   color: var(--color-text-link);
   background: var(--color-surface-highlight);
 }
-.task-meeting-action:not(.is-idle) {
+.task-meeting-action {
   width: auto;
   gap: 6px;
   padding-inline: 10px;

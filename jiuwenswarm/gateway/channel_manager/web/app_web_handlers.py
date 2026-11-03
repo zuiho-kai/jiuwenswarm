@@ -1966,6 +1966,9 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     updater_service = bind.updater_service
 
     from jiuwenswarm.common.schema.message import Message, EventType
+    from jiuwenswarm.extensions.meeting import gateway_feishu as meeting_feishu
+    from jiuwenswarm.extensions.meeting import gateway_playback as meeting_playback
+    from jiuwenswarm.gateway.voice import input_stream as voice_input
 
     def _resolve(ref, key="value"):
         """若为 ref 字典则取 key（无则返回 None），否则返回自身。"""
@@ -2225,6 +2228,168 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             )
             return
         await channel.send_response(ws, req_id, ok=True, payload={"text": text})
+
+    async def _voice_input_start(ws, req_id, params, session_id, user_id=None):
+        await voice_input.start_voice_input(channel, ws, req_id, params, session_id, user_id)
+
+    async def _voice_input_append(ws, req_id, params, session_id, user_id=None):
+        await voice_input.control_voice_input(channel, ws, req_id, params, session_id, user_id, operation="append")
+
+    async def _voice_input_pause(ws, req_id, params, session_id, user_id=None):
+        await voice_input.control_voice_input(channel, ws, req_id, params, session_id, user_id, operation="pause")
+
+    async def _voice_input_resume(ws, req_id, params, session_id, user_id=None):
+        await voice_input.control_voice_input(channel, ws, req_id, params, session_id, user_id, operation="resume")
+
+    async def _voice_input_stop(ws, req_id, params, session_id, user_id=None):
+        await voice_input.control_voice_input(channel, ws, req_id, params, session_id, user_id, operation="stop")
+
+    async def _meeting_control(ws, req_id, params, session_id, user_id, method):
+        """Forward meeting control to the AgentServer that owns the Team."""
+        from secrets import token_hex
+
+        from jiuwenswarm.common.protocol_ids import is_valid_session_id
+        from jiuwenswarm.common.schema.message import ReqMethod
+        from jiuwenswarm.gateway.routing.e2a_proxy import proxy_unary_request
+
+        params = params if isinstance(params, dict) else {}
+        target_session = str(params.get("session_id") or session_id or "").strip()
+        if not is_valid_session_id(target_session) or target_session == "new":
+            await channel.send_response(
+                ws, req_id, ok=False, error="Meeting session is required", code="BAD_REQUEST"
+            )
+            return
+        owner_id = getattr(ws, "_meeting_owner_id", None)
+        if method != ReqMethod.MEETING_STATUS and owner_id is None:
+            owner_id = token_hex(16)
+            setattr(ws, "_meeting_owner_id", owner_id)
+
+        startup_id = str(params.get("startup_id") or "")
+        owned = getattr(ws, "_meeting_owned_sessions", None)
+        if owned is None:
+            owned = {}
+            setattr(ws, "_meeting_owned_sessions", owned)
+        ownership_key = (target_session, startup_id)
+        if method == ReqMethod.MEETING_START:
+            # Track before dispatch: a lost response must not skip disconnect cleanup.
+            owned[ownership_key] = user_id
+
+        async def _on_done(ok, _payload):
+            if method == ReqMethod.MEETING_STATUS:
+                return
+            if method == ReqMethod.MEETING_START:
+                if not ok:
+                    owned.pop(ownership_key, None)
+                elif getattr(ws, "_meeting_disconnected", False):
+                    await _release_meeting(ws, target_session, user_id, startup_id)
+            elif ok and method != ReqMethod.MEETING_END:
+                owned.pop(ownership_key, None)
+                await meeting_playback.forget_playback_routes(
+                    ws, target_session, params.get("meeting_id") if method == ReqMethod.MEETING_END else None,
+                    startup_id=startup_id,
+                )
+
+        await proxy_unary_request(
+            channel=channel,
+            agent_client=_resolve(agent_client),
+            ws=ws,
+            req_id=req_id,
+            params=params,
+            session_id=target_session,
+            user_id=user_id,
+            req_method=method,
+            label=method.value,
+            drop_params=("_meeting_owner_id",),
+            extra_params={"_meeting_owner_id": owner_id} if owner_id else None,
+            on_done=_on_done,
+        )
+
+    async def _release_meeting(ws, session_id, user_id, startup_id):
+        from jiuwenswarm.common.schema.message import ReqMethod
+        from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
+
+        owner_id = getattr(ws, "_meeting_owner_id", None)
+        if not owner_id:
+            return
+        await fetch_agent_unary(
+            agent_client=_resolve(agent_client),
+            req_method=ReqMethod.MEETING_RELEASE,
+            params={"_meeting_owner_id": owner_id, "startup_id": startup_id},
+            session_id=session_id,
+            user_id=user_id,
+            channel_id=channel.channel_id,
+            label="meeting.disconnect",
+            timeout_seconds=5,
+        )
+
+    async def _release_meetings_on_disconnect(ws, _session_ids):
+        setattr(ws, "_meeting_disconnected", True)
+        owned = getattr(ws, "_meeting_owned_sessions", {})
+        for (owned_session, startup_id), user_id in list(owned.items()):
+            try:
+                await _release_meeting(ws, owned_session, user_id, startup_id)
+            except Exception:
+                logger.exception("Meeting disconnect cleanup failed: session_id=%s", owned_session)
+        owned.clear()
+
+    async def _meeting_start(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_START)
+
+    async def _meeting_status(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_STATUS)
+
+    async def _meeting_end(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_END)
+
+    async def _meeting_release(ws, req_id, params, session_id, user_id=None):
+        from jiuwenswarm.common.schema.message import ReqMethod
+
+        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_RELEASE)
+
+    async def _meeting_playback_ready(ws, req_id, params, session_id, user_id=None):
+        await meeting_playback.playback_ready(
+            channel, lambda: _resolve(agent_client), ws, req_id, params, session_id, user_id,
+        )
+
+    async def _meeting_speech_synthesize(ws, req_id, params, session_id, user_id=None):
+        await meeting_playback.synthesize_speech(channel, ws, req_id, params, session_id, user_id)
+
+    async def _meeting_playback_result(ws, req_id, params, session_id, user_id=None):
+        await meeting_playback.playback_result(channel, ws, req_id, params, session_id, user_id)
+
+    async def _meeting_playback_stopped(ws, req_id, params, session_id, user_id=None):
+        await meeting_playback.playback_stopped(channel, ws, req_id, params, session_id, user_id)
+
+    meeting_feishu_connection = meeting_feishu.MeetingFeishuConnection()
+
+    async def _meeting_feishu_status(ws, req_id, params, session_id):
+        await meeting_feishu.feishu_control(
+            channel, meeting_feishu_connection, _resolve(channel_manager),
+            "status", ws, req_id, params, session_id,
+        )
+
+    async def _meeting_feishu_connect(ws, req_id, params, session_id):
+        await meeting_feishu.feishu_control(
+            channel, meeting_feishu_connection, _resolve(channel_manager),
+            "connect", ws, req_id, params, session_id,
+        )
+
+    async def _meeting_feishu_disconnect(ws, req_id, params, session_id):
+        await meeting_feishu.feishu_control(
+            channel, meeting_feishu_connection, _resolve(channel_manager),
+            "disconnect", ws, req_id, params, session_id,
+        )
+
+    if callable(register_disconnect):
+        register_disconnect(voice_input.close_voice_input)
+        register_disconnect(meeting_playback.close_browser_playback)
+        register_disconnect(_release_meetings_on_disconnect)
 
     # ── vendors.* handlers ──────────────
 
@@ -5078,6 +5243,11 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("vendors.fetch_models", _vendors_fetch_models)
     channel.register_method("channel.get", _channel_get)
     channel.register_method("task.asr.transcribe", _task_asr_transcribe)
+    channel.register_method("voice.input.start", _voice_input_start, local_only=True)
+    channel.register_method("voice.input.append", _voice_input_append, local_only=True)
+    channel.register_method("voice.input.pause", _voice_input_pause, local_only=True)
+    channel.register_method("voice.input.resume", _voice_input_resume, local_only=True)
+    channel.register_method("voice.input.stop", _voice_input_stop, local_only=True)
     channel.register_method("openai_account.auth.status", _openai_account_auth_status)
     channel.register_method("openai_account.auth.start_login", _openai_account_auth_start_login)
     channel.register_method("openai_account.auth.pending_login", _openai_account_auth_pending_login)
@@ -5085,129 +5255,17 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("openai_account.auth.logout", _openai_account_auth_logout)
     channel.register_method("openai_account.models.list", _openai_account_models_list)
 
-    from jiuwenswarm.extensions.meeting.gateway_playback import bind_playback_handlers, forget_playback_routes
-
-    bind_playback_handlers(channel, lambda: _resolve(agent_client))
-
-    from jiuwenswarm.extensions.meeting.gateway_feishu import bind_feishu_handlers
-
-    bind_feishu_handlers(channel, lambda: _resolve(channel_manager))
-
-    async def _meeting_control(ws, req_id, params, session_id, user_id, method):
-        """Forward meeting control to the AgentServer that owns the Team."""
-        from secrets import token_hex
-
-        from jiuwenswarm.common.protocol_ids import is_valid_session_id
-        from jiuwenswarm.common.schema.message import ReqMethod
-        from jiuwenswarm.gateway.routing.e2a_proxy import proxy_unary_request
-
-        params = params if isinstance(params, dict) else {}
-        target_session = str(params.get("session_id") or session_id or "").strip()
-        if not is_valid_session_id(target_session) or target_session == "new":
-            await channel.send_response(
-                ws, req_id, ok=False, error="Meeting session is required", code="BAD_REQUEST"
-            )
-            return
-        owner_id = getattr(ws, "_meeting_owner_id", None)
-        if method != ReqMethod.MEETING_STATUS and owner_id is None:
-            owner_id = token_hex(16)
-            setattr(ws, "_meeting_owner_id", owner_id)
-
-        startup_id = str(params.get("startup_id") or "")
-        owned = getattr(ws, "_meeting_owned_sessions", None)
-        if owned is None:
-            owned = {}
-            setattr(ws, "_meeting_owned_sessions", owned)
-        ownership_key = (target_session, startup_id)
-        if method == ReqMethod.MEETING_START:
-            # Track before dispatch: a lost response must not skip disconnect cleanup.
-            owned[ownership_key] = user_id
-
-        async def _on_done(ok, _payload):
-            if method == ReqMethod.MEETING_STATUS:
-                return
-            if method == ReqMethod.MEETING_START:
-                if not ok:
-                    owned.pop(ownership_key, None)
-                elif getattr(ws, "_meeting_disconnected", False):
-                    await _release_meeting(ws, target_session, user_id, startup_id)
-            elif ok and method != ReqMethod.MEETING_END:
-                owned.pop(ownership_key, None)
-                await forget_playback_routes(
-                    ws, target_session, params.get("meeting_id") if method == ReqMethod.MEETING_END else None,
-                    startup_id=startup_id,
-                )
-
-        await proxy_unary_request(
-            channel=channel,
-            agent_client=_resolve(agent_client),
-            ws=ws,
-            req_id=req_id,
-            params=params,
-            session_id=target_session,
-            user_id=user_id,
-            req_method=method,
-            label=method.value,
-            drop_params=("_meeting_owner_id",),
-            extra_params={"_meeting_owner_id": owner_id} if owner_id else None,
-            on_done=_on_done,
-        )
-
-    async def _release_meeting(ws, session_id, user_id, startup_id):
-        from jiuwenswarm.common.schema.message import ReqMethod
-        from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
-
-        owner_id = getattr(ws, "_meeting_owner_id", None)
-        if not owner_id:
-            return
-        await fetch_agent_unary(
-            agent_client=_resolve(agent_client),
-            req_method=ReqMethod.MEETING_RELEASE,
-            params={"_meeting_owner_id": owner_id, "startup_id": startup_id},
-            session_id=session_id,
-            user_id=user_id,
-            channel_id=channel.channel_id,
-            label="meeting.disconnect",
-            timeout_seconds=5,
-        )
-
-    async def _release_meetings_on_disconnect(ws, _session_ids):
-        setattr(ws, "_meeting_disconnected", True)
-        owned = getattr(ws, "_meeting_owned_sessions", {})
-        for (owned_session, startup_id), user_id in list(owned.items()):
-            try:
-                await _release_meeting(ws, owned_session, user_id, startup_id)
-            except Exception:
-                logger.exception("Meeting disconnect cleanup failed: session_id=%s", owned_session)
-        owned.clear()
-
-    if callable(register_disconnect):
-        register_disconnect(_release_meetings_on_disconnect)
-
-    async def _meeting_start(ws, req_id, params, session_id, user_id=None):
-        from jiuwenswarm.common.schema.message import ReqMethod
-
-        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_START)
-
-    async def _meeting_status(ws, req_id, params, session_id, user_id=None):
-        from jiuwenswarm.common.schema.message import ReqMethod
-
-        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_STATUS)
-
-    async def _meeting_end(ws, req_id, params, session_id, user_id=None):
-        from jiuwenswarm.common.schema.message import ReqMethod
-
-        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_END)
-
-    async def _meeting_release(ws, req_id, params, session_id, user_id=None):
-        from jiuwenswarm.common.schema.message import ReqMethod
-
-        await _meeting_control(ws, req_id, params, session_id, user_id, ReqMethod.MEETING_RELEASE)
-
     channel.register_method("meeting.start", _meeting_start)
     channel.register_method("meeting.status", _meeting_status)
     channel.register_method("meeting.end", _meeting_end)
     channel.register_method("meeting.release", _meeting_release)
+    channel.register_method("meeting.playback.ready", _meeting_playback_ready)
+    channel.register_method("meeting.speech.synthesize", _meeting_speech_synthesize)
+    channel.register_method("meeting.playback.result", _meeting_playback_result)
+    channel.register_method("meeting.playback.stopped", _meeting_playback_stopped)
+    channel.register_method("meeting.feishu.status", _meeting_feishu_status, local_only=True)
+    channel.register_method("meeting.feishu.connect", _meeting_feishu_connect, local_only=True)
+    channel.register_method("meeting.feishu.disconnect", _meeting_feishu_disconnect, local_only=True)
     channel.register_method("session.list", _session_list)
     channel.register_method("session.create", _session_create)
     channel.register_method("session.get_metadata", _session_get_metadata)

@@ -15,7 +15,6 @@ from jiuwenswarm.common.voice_matching import load_voice_catalog
 from jiuwenswarm.gateway.voice.config import TtsConfig
 from jiuwenswarm.gateway.routing.e2a_proxy import fetch_agent_unary
 from jiuwenswarm.gateway.voice.tts import TtsSession
-from .gateway_input import MeetingInputStream, bind_input_handlers
 from .playback import IDENTITY_FIELDS
 
 _routes = weakref.WeakValueDictionary()
@@ -32,13 +31,6 @@ class GatewayPlaybackRoute:
         self.session_id, self.meeting_id = session_id, meeting_id
         self.owner_id, self.user_id, self.config = owner_id, user_id, config
         self.startup_id = startup_id
-        self.input = MeetingInputStream(channel, ws, session_id, meeting_id)
-        self.input.prepare_transcript = lambda text: self.fetch(
-            ReqMethod.MEETING_INPUT_PREPARE, {"meeting_id": meeting_id, "transcript": text},
-        )
-        self.input.admit_transcript = lambda interruption_id: self.fetch(
-            ReqMethod.MEETING_INPUT_ADMITTED, {"meeting_id": meeting_id, "interruption_id": interruption_id},
-        )
         self.revision = config_revision(config)
         self.revoked = False
         self.records = {}
@@ -93,8 +85,7 @@ class GatewayPlaybackRoute:
 
     async def stop_media(self):
         self.revoked = True
-        self.input.revoke()
-        await asyncio.gather(self.cancel_synthesis(), self.input.close())
+        await self.cancel_synthesis()
 
     async def push(self, payload):
         if (payload.get("owner_id"), payload.get("session_id"), payload.get("meeting_id")) != (
@@ -114,7 +105,6 @@ class GatewayPlaybackRoute:
             self.produced.setdefault(record["playback_id"], set())
         elif event == "meeting.playback.stop":
             self.revoked = True
-            self.input.revoke()
             stop_id = payload.get("stop_id")
             if not isinstance(stop_id, str) or not stop_id:
                 raise ValueError("Invalid playback stop identity")
@@ -163,195 +153,185 @@ async def forget_playback_routes(ws, session_id: str, meeting_id: str | None = N
             _routes.pop(route.id, None)
 
 
-def bind_playback_handlers(channel, agent_client):
-    """Separate handlers keep playback controls out of lifecycle ownership cleanup."""
+def _route_for(ws, params, session_id):
+    target = str(params.get("session_id") or session_id or "")
+    route = getattr(ws, "_meeting_playback_routes", {}).get((target, params.get("meeting_id")))
+    if route is None or route.owner_id != getattr(ws, "_meeting_owner_id", None):
+        raise ValueError("Meeting playback is not owned by this connection")
+    return route
 
-    def route_for(ws, params, session_id):
+
+async def playback_ready(channel, agent_client, ws, req_id, params, session_id, user_id=None):
+    route = None
+    created = False
+    try:
+        params = params if isinstance(params, dict) else {}
         target = str(params.get("session_id") or session_id or "")
-        route = getattr(ws, "_meeting_playback_routes", {}).get((target, params.get("meeting_id")))
-        if route is None or route.owner_id != getattr(ws, "_meeting_owner_id", None):
-            raise ValueError("Meeting playback is not owned by this connection")
-        return route
-
-    async def ready(ws, req_id, params, session_id, user_id=None):
-        route = None
-        created = False
-        try:
-            params = params if isinstance(params, dict) else {}
-            target = str(params.get("session_id") or session_id or "")
-            meeting_id, startup_id = params.get("meeting_id"), params.get("startup_id")
-            owner = getattr(ws, "_meeting_owner_id", None)
-            if (
-                not is_valid_session_id(target) or target == "new" or not isinstance(meeting_id, str) or not meeting_id
-                or not isinstance(startup_id, str) or not startup_id or not owner
-                or (target, startup_id) not in getattr(ws, "_meeting_owned_sessions", {})
-            ):
-                raise ValueError("A matching owned meeting startup is required")
-            config = TtsConfig.from_environment()
-            config.validate()
-            load_voice_catalog(config.model).compatible(config.model)
-            routes = getattr(ws, "_meeting_playback_routes", None)
-            if routes is None:
-                routes = {}
-                setattr(ws, "_meeting_playback_routes", routes)
-            route = routes.get((target, meeting_id))
-            if route is not None and route.revoked and (
-                route.shutdown_stop_id in route.stop_receipts
-                or any(outcome == "stopped" for outcome, _ in route.receipts.values())
-            ):
-                await forget_playback_routes(ws, target, meeting_id, startup_id=route.startup_id)
-                route = None
-            if route is None:
-                route = GatewayPlaybackRoute(channel, ws, agent_client, target, meeting_id, owner, user_id, config, startup_id)
-                routes[(target, meeting_id)] = route
-                created = True
-            if route.revoked or route.input.closed or route.startup_id != startup_id or route.revision != config_revision(config):
-                raise ValueError("Meeting playback configuration changed or has stopped")
-            await route.input.start()
-            # Prepare the meeting-owned provider session before grants.
-            await route.tts.start()
-            payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_READY, {
-                "meeting_id": meeting_id, "startup_id": startup_id,
-                "_meeting_route_id": route.id, "_tts_model": config.model,
-                "_tts_revision": route.revision, "_tts_default_voice": config.voice,
-            })
-            await channel.send_response(ws, req_id, ok=True, payload={**payload, "stream_id": route.input.id})
-        except asyncio.CancelledError:
-            if route is None or not route.input.closed:
-                raise
-            await channel.send_response(ws, req_id, ok=False, error="Meeting audio startup cancelled", code="CANCELLED")
-        except Exception as exc:
-            if created:
-                await route.stop_media()
-                await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
-
-    async def synthesize(ws, req_id, params, session_id, user_id=None):
-        task = None
-        key = None
-        route = None
-        try:
-            params = params if isinstance(params, dict) else {}
-            if any(key in params for key in ("text", "voice", "model", "provider_voice_id", "config_revision")):
-                raise ValueError("Meeting TTS text and voice are resolved by the server")
-            route = route_for(ws, params, session_id)
-            identity = route.identity(params)
-            index = params.get("chunk_index")
-            if type(index) is not int:
-                raise ValueError("Invalid speech chunk index")
-            key = (identity["playback_id"], index)
-            if (
-                route.revoked or route.tasks or identity["playback_id"] in route.interrupted
-                or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
-            ):
-                raise ValueError("Meeting synthesis has stopped or is already active")
-            chunk = await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
-            config = TtsConfig.from_environment()
-            if (
-                route.revoked or route.tasks or identity["playback_id"] in route.interrupted or config_revision(config) != route.revision
-                or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
-                or chunk.get("config_revision") != route.revision or chunk.get("model") != config.model
-            ):
-                raise ValueError("Meeting TTS configuration changed")
-            task = asyncio.create_task(route.tts.synthesize(chunk["text"], chunk["voice"]))
-            route.tasks[key] = task
-            audio = await task
-            await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
-            if (
-                route.revoked or identity["playback_id"] in route.interrupted
-                or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
-                or config_revision(TtsConfig.from_environment()) != route.revision
-            ):
-                raise ValueError("Meeting playback stopped or its configuration changed")
-            route.produced[identity["playback_id"]].add(index)
-            await channel.send_response(ws, req_id, ok=True, payload={
-                "success": True, "playback_id": identity["playback_id"], "chunk_index": index,
-                "audio_base64": base64.b64encode(audio.audio).decode(), "audio_mime": audio.audio_mime,
-            })
-        except asyncio.CancelledError:
-            await channel.send_response(ws, req_id, ok=False, error="Meeting synthesis cancelled", code="CANCELLED")
-        except Exception as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code=getattr(exc, "code", "MEETING_TTS_FAILED"))
-        finally:
-            if route is not None and route.tasks.get(key) is task:
-                route.tasks.pop(key, None)
-
-    async def result(ws, req_id, params, session_id, user_id=None):
-        try:
-            params = params if isinstance(params, dict) else {}
-            route = route_for(ws, params, session_id)
-            identity = route.identity(params)
-            async with route.result_lock:
-                if identity["playback_id"] in route.interrupted:
-                    raise ValueError("Interrupted speech cannot be reported as played")
-                outcome, count = params.get("outcome"), params.get("completed_chunks")
-                record = route.records[identity["playback_id"]]
-                if outcome not in {"completed", "stopped", "failed"} or type(count) is not int or not 0 <= count <= record["chunk_count"]:
-                    raise ValueError("Invalid playback outcome")
-                if outcome == "completed" and count != record["chunk_count"]:
-                    raise ValueError("All chunks must finish before completion")
-                previous = route.receipts.get(identity["playback_id"], route.pending_receipts.get(identity["playback_id"]))
-                if previous is not None and previous != (outcome, count):
-                    raise ValueError("Conflicting playback receipt")
-                if previous is None and (route.revoked or route.current_playback != identity["playback_id"]):
-                    raise ValueError("Speech is no longer current")
-                if outcome in {"failed", "stopped"}:
-                    route.pending_receipts[identity["playback_id"]] = (outcome, count)
-                    if identity["playback_id"] not in route.drained_playbacks:
-                        if outcome == "stopped":
-                            route.revoked = True
-                            await route.cancel_synthesis()
-                        else:
-                            # A failed reading must not poison later speakers.
-                            # Drain first; then allow the server to release its lease.
-                            await route.interrupt_synthesis()
-                        route.drained_playbacks.add(identity["playback_id"])
-                elif outcome == "completed":
-                    record = route.records[identity["playback_id"]]
-                    if len(route.produced[identity["playback_id"]]) != record["chunk_count"]:
-                        raise ValueError("Speech chunks have not all been synthesized")
-                route.pending_receipts[identity["playback_id"]] = (outcome, count)
-                payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_RESULT, {
-                    **identity, "outcome": outcome, "completed_chunks": count,
-                })
-                route.receipts[identity["playback_id"]] = (outcome, count)
-                route.pending_receipts.pop(identity["playback_id"], None)
-                if outcome == "stopped":
-                    getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
-            await channel.send_response(ws, req_id, ok=True, payload=payload)
-        except (ValueError, RuntimeError) as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_RESULT_FAILED")
-
-    async def stopped(ws, req_id, params, session_id, user_id=None):
-        try:
-            params = params if isinstance(params, dict) else {}
-            route = route_for(ws, params, session_id)
-            stop_id = params.get("stop_id")
-            if stop_id not in route.stops:
-                raise ValueError("Unknown meeting playback stop")
-            if stop_id in route.stop_receipts:
-                await channel.send_response(ws, req_id, ok=True, payload=route.stop_receipts[stop_id])
-                return
-            await asyncio.shield(route.stops[stop_id])
-            payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_STOPPED, {
-                "meeting_id": route.meeting_id, "stop_id": stop_id,
-            })
-            route.stop_receipts[stop_id] = payload
-            await channel.send_response(ws, req_id, ok=True, payload=payload)
-            if route.revoked:
-                getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
-        except (ValueError, RuntimeError) as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_STOP_FAILED")
-
-    async def disconnect(ws, _sessions):
-        for route in list(getattr(ws, "_meeting_playback_routes", {}).values()):
+        meeting_id, startup_id = params.get("meeting_id"), params.get("startup_id")
+        owner = getattr(ws, "_meeting_owner_id", None)
+        if (
+            not is_valid_session_id(target) or target == "new" or not isinstance(meeting_id, str) or not meeting_id
+            or not isinstance(startup_id, str) or not startup_id or not owner
+            or (target, startup_id) not in getattr(ws, "_meeting_owned_sessions", {})
+        ):
+            raise ValueError("A matching owned meeting startup is required")
+        config = TtsConfig.from_environment()
+        config.validate()
+        load_voice_catalog(config.model).compatible(config.model)
+        routes = getattr(ws, "_meeting_playback_routes", None)
+        if routes is None:
+            routes = {}
+            setattr(ws, "_meeting_playback_routes", routes)
+        route = routes.get((target, meeting_id))
+        if route is not None and route.revoked and (
+            route.shutdown_stop_id in route.stop_receipts
+            or any(outcome == "stopped" for outcome, _ in route.receipts.values())
+        ):
+            await forget_playback_routes(ws, target, meeting_id, startup_id=route.startup_id)
+            route = None
+        if route is None:
+            route = GatewayPlaybackRoute(channel, ws, agent_client, target, meeting_id, owner, user_id, config, startup_id)
+            routes[(target, meeting_id)] = route
+            created = True
+        if route.revoked or route.startup_id != startup_id or route.revision != config_revision(config):
+            raise ValueError("Meeting playback configuration changed or has stopped")
+        # Prepare the meeting-owned provider session before grants.
+        await route.tts.start()
+        payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_READY, {
+            "meeting_id": meeting_id, "startup_id": startup_id,
+            "_meeting_route_id": route.id, "_tts_model": config.model,
+            "_tts_revision": route.revision, "_tts_default_voice": config.voice,
+        })
+        await channel.send_response(ws, req_id, ok=True, payload=payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if created:
             await route.stop_media()
+            await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
+        await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
 
-    channel.register_method("meeting.playback.ready", ready)
-    channel.register_method("meeting.speech.synthesize", synthesize)
-    channel.register_method("meeting.playback.result", result)
-    channel.register_method("meeting.playback.stopped", stopped)
-    bind_input_handlers(channel, route_for)
-    register_disconnect = getattr(channel, "on_disconnect", None)
-    if callable(register_disconnect):
-        register_disconnect(disconnect)
+
+async def synthesize_speech(channel, ws, req_id, params, session_id, user_id=None):
+    task = None
+    key = None
+    route = None
+    try:
+        params = params if isinstance(params, dict) else {}
+        if any(key in params for key in ("text", "voice", "model", "provider_voice_id", "config_revision")):
+            raise ValueError("Meeting TTS text and voice are resolved by the server")
+        route = _route_for(ws, params, session_id)
+        identity = route.identity(params)
+        index = params.get("chunk_index")
+        if type(index) is not int:
+            raise ValueError("Invalid speech chunk index")
+        key = (identity["playback_id"], index)
+        if (
+            route.revoked or route.tasks or identity["playback_id"] in route.interrupted
+            or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
+        ):
+            raise ValueError("Meeting synthesis has stopped or is already active")
+        chunk = await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
+        config = TtsConfig.from_environment()
+        if (
+            route.revoked or route.tasks or identity["playback_id"] in route.interrupted or config_revision(config) != route.revision
+            or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
+            or chunk.get("config_revision") != route.revision or chunk.get("model") != config.model
+        ):
+            raise ValueError("Meeting TTS configuration changed")
+        task = asyncio.create_task(route.tts.synthesize(chunk["text"], chunk["voice"]))
+        route.tasks[key] = task
+        audio = await task
+        await route.fetch(ReqMethod.MEETING_SPEECH_GET, {**identity, "chunk_index": index})
+        if (
+            route.revoked or identity["playback_id"] in route.interrupted
+            or identity["playback_id"] in route.pending_receipts or identity["playback_id"] in route.receipts
+            or config_revision(TtsConfig.from_environment()) != route.revision
+        ):
+            raise ValueError("Meeting playback stopped or its configuration changed")
+        route.produced[identity["playback_id"]].add(index)
+        await channel.send_response(ws, req_id, ok=True, payload={
+            "success": True, "playback_id": identity["playback_id"], "chunk_index": index,
+            "audio_base64": base64.b64encode(audio.audio).decode(), "audio_mime": audio.audio_mime,
+        })
+    except asyncio.CancelledError:
+        await channel.send_response(ws, req_id, ok=False, error="Meeting synthesis cancelled", code="CANCELLED")
+    except Exception as exc:
+        await channel.send_response(ws, req_id, ok=False, error=str(exc), code=getattr(exc, "code", "MEETING_TTS_FAILED"))
+    finally:
+        if route is not None and route.tasks.get(key) is task:
+            route.tasks.pop(key, None)
+
+
+async def playback_result(channel, ws, req_id, params, session_id, user_id=None):
+    try:
+        params = params if isinstance(params, dict) else {}
+        route = _route_for(ws, params, session_id)
+        identity = route.identity(params)
+        async with route.result_lock:
+            if identity["playback_id"] in route.interrupted:
+                raise ValueError("Interrupted speech cannot be reported as played")
+            outcome, count = params.get("outcome"), params.get("completed_chunks")
+            record = route.records[identity["playback_id"]]
+            if outcome not in {"completed", "stopped", "failed"} or type(count) is not int or not 0 <= count <= record["chunk_count"]:
+                raise ValueError("Invalid playback outcome")
+            if outcome == "completed" and count != record["chunk_count"]:
+                raise ValueError("All chunks must finish before completion")
+            previous = route.receipts.get(identity["playback_id"], route.pending_receipts.get(identity["playback_id"]))
+            if previous is not None and previous != (outcome, count):
+                raise ValueError("Conflicting playback receipt")
+            if previous is None and (route.revoked or route.current_playback != identity["playback_id"]):
+                raise ValueError("Speech is no longer current")
+            if outcome in {"failed", "stopped"}:
+                route.pending_receipts[identity["playback_id"]] = (outcome, count)
+                if identity["playback_id"] not in route.drained_playbacks:
+                    if outcome == "stopped":
+                        route.revoked = True
+                        await route.cancel_synthesis()
+                    else:
+                        # A failed reading must not poison later speakers.
+                        # Drain first; then allow the server to release its lease.
+                        await route.interrupt_synthesis()
+                    route.drained_playbacks.add(identity["playback_id"])
+            elif outcome == "completed":
+                record = route.records[identity["playback_id"]]
+                if len(route.produced[identity["playback_id"]]) != record["chunk_count"]:
+                    raise ValueError("Speech chunks have not all been synthesized")
+            route.pending_receipts[identity["playback_id"]] = (outcome, count)
+            payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_RESULT, {
+                **identity, "outcome": outcome, "completed_chunks": count,
+            })
+            route.receipts[identity["playback_id"]] = (outcome, count)
+            route.pending_receipts.pop(identity["playback_id"], None)
+            if outcome == "stopped":
+                getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
+        await channel.send_response(ws, req_id, ok=True, payload=payload)
+    except (ValueError, RuntimeError) as exc:
+        await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_RESULT_FAILED")
+
+
+async def playback_stopped(channel, ws, req_id, params, session_id, user_id=None):
+    try:
+        params = params if isinstance(params, dict) else {}
+        route = _route_for(ws, params, session_id)
+        stop_id = params.get("stop_id")
+        if stop_id not in route.stops:
+            raise ValueError("Unknown meeting playback stop")
+        if stop_id in route.stop_receipts:
+            await channel.send_response(ws, req_id, ok=True, payload=route.stop_receipts[stop_id])
+            return
+        await asyncio.shield(route.stops[stop_id])
+        payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_STOPPED, {
+            "meeting_id": route.meeting_id, "stop_id": stop_id,
+        })
+        route.stop_receipts[stop_id] = payload
+        await channel.send_response(ws, req_id, ok=True, payload=payload)
+        if route.revoked:
+            getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
+    except (ValueError, RuntimeError) as exc:
+        await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_STOP_FAILED")
+
+
+async def close_browser_playback(ws, _sessions=None):
+    for route in list(getattr(ws, "_meeting_playback_routes", {}).values()):
+        await route.stop_media()

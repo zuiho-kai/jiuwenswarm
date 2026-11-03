@@ -1,21 +1,21 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ApplicationPluginTaskRuntimeProps } from '../../../channels/web/frontend/src/applicationPlugins/types';
-import { isTeamAgentMode } from '../../../channels/web/frontend/src/features/planMode/wireMode';
 import { resolveTeamLeaderDisplayName } from '../../../channels/web/frontend/src/features/teamLeaderIdentity';
 import { useTeamMeetingEnabled } from '../../../channels/web/frontend/src/features/teamMeeting/featureFlag';
-import { getMeetingRoutingMode } from '../../../channels/web/frontend/src/features/teamMeeting/routingMode';
 import { webClient } from '../../../channels/web/frontend/src/services/webClient';
-import { rememberGroupChatInput } from '../../../channels/web/frontend/src/features/groupChatInput';
 import { useSessionStore } from '../../../channels/web/frontend/src/stores/sessionStore';
 import { toast } from '../../../channels/web/frontend/src/components/ui/Toast/toastStore';
 import { MeetingSession, type MeetingContext } from './meetingRuntime';
-import { sendMeetingInput } from './meetingInput';
 import { publishMeeting, registerMeetingController, useMeetingSnapshot } from './taskMeetingStore';
 
 type ServerMeeting = {
-  state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed';
+  state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed' | 'failed';
   meeting_id?: string;
+  conversation_mode?: string;
+  error?: string;
+  team_exists: boolean;
+  enabled: boolean;
 };
 
 type ActiveMeeting = {
@@ -23,44 +23,64 @@ type ActiveMeeting = {
   meeting: MeetingSession;
   meetingId: string | null;
   startupId: string;
-  input: AbortController;
+  cancellation: AbortController;
   disabled?: boolean;
   ending?: Promise<void>;
   endingRelease?: boolean;
+  error?: string;
+  enabling?: boolean;
+  cancelled?: boolean;
 };
 
 // Keep the browser session for same-page Stop/Start. Unmount releases its media.
 const retainedMeeting: { current: ActiveMeeting | null } = { current: null };
 
 async function enableServerMeeting(active: ActiveMeeting): Promise<string> {
-  let server = await webClient.request<ServerMeeting>('meeting.start', {
-    session_id: active.sessionId,
-    startup_id: active.startupId,
+  let startupError: string | undefined;
+  const off = webClient.on('chat.error', ({ payload }) => {
+    if (payload.session_id === active.sessionId)
+      startupError = String(payload.error || payload.message || 'meetingStartFailed');
   });
-  while (server.state === 'starting') {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    if (active.input.signal.aborted) throw new Error('disconnected');
-    server = await webClient.request<ServerMeeting>('meeting.status', {
+  try {
+    let server = await webClient.request<ServerMeeting>('meeting.start', {
       session_id: active.sessionId,
       startup_id: active.startupId,
     });
+    while (server.state === 'starting') {
+      if (active.cancellation.signal.aborted) throw new Error('disconnected');
+      if (startupError) throw new Error(startupError);
+      publishMeeting({ state: server.state });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (active.cancellation.signal.aborted) throw new Error('disconnected');
+      server = await webClient.request<ServerMeeting>('meeting.status', {
+        session_id: active.sessionId,
+        startup_id: active.startupId,
+      });
+    }
+    if (active.cancellation.signal.aborted || retainedMeeting.current !== active) throw new Error('disconnected');
+    if (server.state !== 'active' || !server.meeting_id) throw new Error(server.error || 'meetingStartFailed');
+    publishMeeting({
+      state: 'starting',
+      enabled: server.enabled,
+      teamExists: server.team_exists,
+      meetingId: server.meeting_id,
+    });
+    return server.meeting_id;
+  } finally {
+    off();
   }
-  if (active.input.signal.aborted || retainedMeeting.current !== active) throw new Error('disconnected');
-  if (server.state !== 'active' || !server.meeting_id) throw new Error('meetingStartFailed');
-  return server.meeting_id;
 }
 
-export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPluginTaskRuntimeProps) {
+export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimeProps) {
   const { t, i18n } = useTranslation();
   const enabled = useTeamMeetingEnabled();
   const translator = useRef(t);
   translator.current = t;
   const snapshot = useMeetingSnapshot();
   const current = retainedMeeting;
-  const sender = useRef(onSendMessage);
-  sender.current = onSendMessage;
-  const initialization = useRef(new Map<string, { id: string; text: string }>());
   const mounted = useRef(true);
+  const visibleSession = useRef(sessionId);
+  visibleSession.current = sessionId;
   const roster = useSessionStore((state) => state.runtimes[sessionId || '']);
 
   const context = useCallback(
@@ -94,22 +114,29 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
   );
 
   const endServer = useCallback(function finishServer(active: ActiveMeeting, release = true): Promise<void> {
+    if (current.current !== active) return Promise.resolve();
     if (active.ending) {
       if (release && !active.endingRelease) {
-        return active.ending.then(() => current.current === active ? finishServer(active) : undefined);
+        return active.ending.then(() => (current.current === active ? finishServer(active) : undefined));
       }
       return active.ending;
     }
-    if (release) active.input.abort();
-    publishMeeting({ state: 'closing', recording: 'ready' });
-    const finish = () => {
+    if (release) active.cancellation.abort();
+    publishMeeting({ state: 'closing' });
+    const finish = (server: ServerMeeting) => {
       if (release) active.meeting.finishCleanup();
       else active.disabled = true;
       if (current.current !== active) return;
       if (release) current.current = null;
+      if (visibleSession.current !== active.sessionId) return;
       publishMeeting({
-        state: 'idle', sessionId: release ? null : active.sessionId,
-        recording: 'ready', playback: 'idle', speaker: '', voice: '',
+        state: 'idle',
+        enabled: server.enabled,
+        teamExists: server.team_exists,
+        sessionId: active.sessionId,
+        playback: 'idle',
+        speaker: '',
+        voice: '',
       });
     };
     active.endingRelease = release;
@@ -125,22 +152,22 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
           { timeoutMs: 25000 },
         );
         if (result.state !== 'idle') throw new Error('cleanupPending');
-        finish();
+        finish(result);
       } catch {
         // Disabled state alone does not prove that a transport release finished.
-        let idle = false;
+        let settled: ServerMeeting | undefined;
         try {
           const status = await webClient.request<ServerMeeting>(release ? 'meeting.release' : 'meeting.status', {
             session_id: active.sessionId,
             startup_id: active.startupId,
           });
-          idle = status.state === 'idle';
+          if (status.state === 'idle') settled = status;
         } catch {
           /* Keep the explicit cleanup retry available. */
         }
-        if (idle) finish();
+        if (settled) finish(settled);
         else if (current.current === active) {
-          publishMeeting({ state: 'cleanup_failed', recording: 'ready' });
+          publishMeeting({ state: 'cleanup_failed' });
           if (mounted.current)
             toast.open({ content: translator.current('meeting.errors.cleanupFailed'), variant: 'error' });
         }
@@ -155,87 +182,103 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
   const release = useCallback(() => {
     const active = current.current;
     if (!active) return;
-    active.input.abort();
+    active.cancelled = true;
+    active.cancellation.abort();
     active.meeting.stop();
     void endServer(active);
   }, [endServer]);
 
   const stop = useCallback(() => {
     const active = current.current;
-    if (!active) return;
-    if (!active.meetingId || active.input.signal.aborted) return release();
-    active.meeting.stopRecording();
+    if (!active) {
+      if (!sessionId || !snapshot.meetingId) return;
+      publishMeeting({ state: 'closing', error: undefined });
+      void webClient
+        .request<ServerMeeting>('meeting.end', {
+          session_id: sessionId,
+          meeting_id: snapshot.meetingId,
+        })
+        .then((server) => {
+          if (visibleSession.current === sessionId) publishMeeting({ state: 'idle', enabled: server.enabled });
+        })
+        .catch((error) => {
+          if (visibleSession.current === sessionId)
+            publishMeeting({ state: 'failed', error: error instanceof Error ? error.message : 'cleanupFailed' });
+        });
+      return;
+    }
+    if (!active.meetingId || active.cancellation.signal.aborted || active.enabling) return release();
     void endServer(active, false);
-  }, [endServer, release]);
+  }, [endServer, release, sessionId, snapshot.meetingId]);
 
   const start = useCallback(
     async (id: string) => {
       if (!enabled) return;
       const previous = current.current;
-      if (previous) {
-        if (previous.sessionId !== id || previous.input.signal.aborted) return;
-        await previous.ending;
-        if (current.current !== previous || !previous.disabled || previous.input.signal.aborted) return;
-        publishMeeting({ state: 'starting', sessionId: id });
+      if (previous && (previous.sessionId !== id || previous.cancellation.signal.aborted)) {
+        previous.cancellation.abort();
+        previous.meeting.stop();
+        await endServer(previous);
+        if (current.current) throw new Error('cleanupFailed');
+      } else if (previous) {
+        if (previous.enabling) return;
+        previous.enabling = true;
         try {
-          const meetingId = await enableServerMeeting(previous);
-          if (meetingId !== previous.meetingId) throw new Error('meetingStartFailed');
-          previous.disabled = false;
-          previous.meeting.resume();
-          publishMeeting({ state: 'active' });
-        } catch (error) {
-          previous.meeting.stop();
-          await endServer(previous);
-          throw error;
+          await previous.ending;
+          if (current.current !== previous || !previous.disabled || previous.cancellation.signal.aborted) return;
+          publishMeeting({ state: 'starting', sessionId: id });
+          try {
+            const meetingId = await enableServerMeeting(previous);
+            if (meetingId !== previous.meetingId) throw new Error('meetingStartFailed');
+            previous.disabled = false;
+            previous.meeting.resume();
+            publishMeeting({ state: 'active' });
+          } catch (error) {
+            previous.meeting.stop();
+            await endServer(previous);
+            if (!previous.cancelled) throw error;
+          }
+          return;
+        } finally {
+          previous.enabling = false;
         }
-        return;
       }
-      const mode = useSessionStore.getState().getRuntime(id)?.mode;
-      if (!mode || !isTeamAgentMode(mode)) return;
       if (webClient.getState() !== 'ready') throw new Error('disconnected');
-      const send = sender.current;
-      if (!send) throw new Error('disconnected');
       const startupId = crypto.randomUUID();
-      const input = new AbortController();
-      const routingMode = getMeetingRoutingMode();
+      const cancellation = new AbortController();
       const meeting: MeetingSession = new MeetingSession(webClient, id, context(id), {
         line: () => {}, // Task handlers already own the conversation timeline.
-        draft: (text) => {
-          if (!mounted.current || current.current?.meeting !== meeting || current.current.disabled || input.signal.aborted)
-            throw new Error('disconnected');
-          publishMeeting({ lastTranscript: text });
-          return sendMeetingInput(
-            webClient,
-            send,
-            id,
-            text,
-            crypto.randomUUID(),
-            routingMode === 'leader' ? [context(id).leader] : [],
-            input.signal,
-          );
-        },
         error: (code, detail) => {
-          if (mounted.current && current.current?.meeting === meeting && !current.current.disabled && !input.signal.aborted)
+          if (current.current?.meeting === meeting) current.current.error = code;
+          if (
+            mounted.current &&
+            current.current?.meeting === meeting &&
+            !current.current.disabled &&
+            !cancellation.signal.aborted
+          )
             toast.open({
               content: [t(`meeting.errors.${code}`), detail].filter(Boolean).join(' '),
               variant: 'error',
             });
         },
-        recording: (recording) => {
-          if (mounted.current && current.current?.meeting === meeting) publishMeeting({ recording });
-        },
         playback: (playback, member, voice) => {
-          if (current.current?.meeting !== meeting || input.signal.aborted) return;
+          if (current.current?.meeting !== meeting || cancellation.signal.aborted) return;
           const speaker = context(id).members.find((item) => item.member_name === member)?.display_name || member || '';
           publishMeeting({ playback, speaker, voice: voice || '' });
         },
         addressedMembers: (names) => {
-          if (mounted.current && current.current?.meeting === meeting && !input.signal.aborted)
+          if (mounted.current && current.current?.meeting === meeting && !cancellation.signal.aborted)
             publishMeeting({ addressedMembers: names });
         },
         ended: () => {
           const active = current.current;
-          if (active?.meeting === meeting) void endServer(active);
+          if (active?.meeting !== meeting) return;
+          const unexpected = !cancellation.signal.aborted && !!active.error;
+          void endServer(active).then(() => {
+            if (unexpected && mounted.current && !current.current && visibleSession.current === id) {
+              publishMeeting({ state: 'failed', sessionId: id, error: active.error });
+            }
+          });
         },
       });
       const active: ActiveMeeting = {
@@ -243,54 +286,39 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
         meeting,
         meetingId: null,
         startupId,
-        input,
+        cancellation,
       };
       current.current = active;
       publishMeeting({
         state: 'starting',
+        error: undefined,
         sessionId: id,
-        recording: 'ready',
         playback: 'idle',
         speaker: '',
         voice: '',
-        routingMode,
-        lastTranscript: '',
         addressedMembers: [],
       });
       try {
-        let initial = initialization.current.get(id);
-        if (!initial) {
-          initial = {
-            id: `meeting-start-${startupId}`,
-            text: t('meeting.startMessage'),
-          };
-          initialization.current.set(id, initial);
-        }
-        await sendMeetingInput(webClient, send, id, initial.text, initial.id, [], input.signal);
-        rememberGroupChatInput(id);
-        if (current.current?.meeting !== meeting || input.signal.aborted) return;
         const meetingId = await enableServerMeeting(active);
         active.meetingId = meetingId;
-        try {
-          await meeting.start();
-        } catch (error) {
-          if (error instanceof Error && ['unsupported', 'disconnected'].includes(error.message)) throw error;
-          throw new Error('microphoneFailed');
-        }
-        if (mounted.current && current.current === active && !input.signal.aborted) {
+        await meeting.start();
+        if (mounted.current && current.current === active && !cancellation.signal.aborted) {
           try {
             await meeting.activatePlayback(meetingId, startupId);
           } catch {
             throw new Error('playbackUnavailable');
           }
-          if (current.current !== active || input.signal.aborted) return;
-          initialization.current.delete(id);
+          if (current.current !== active || cancellation.signal.aborted) return;
           publishMeeting({ state: 'active' });
         }
       } catch (error) {
+        if (error instanceof Error && /Another (connection|startup)/.test(error.message)) {
+          cancellation.abort();
+          if (current.current === active) current.current = null;
+        }
         meeting.stop();
         await endServer(active);
-        throw error;
+        if (!active.cancelled) throw error;
       }
     },
     [context, enabled, endServer, t],
@@ -301,31 +329,100 @@ export function TaskMeetingRuntime({ sessionId, onSendMessage }: ApplicationPlug
       registerMeetingController({
         start,
         stop,
-        record: () => {
-          if (snapshot.recording === 'recording') current.current?.meeting.stopRecording();
-          else current.current?.meeting.startRecording();
-        },
         stopAudio: () => current.current?.meeting.stopPlayback(),
       }),
-    [start, stop, snapshot.recording],
+    [start, stop],
   );
 
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
-      if (!current.current?.input.signal.aborted) release();
+      if (!current.current?.cancellation.signal.aborted) release();
     };
   }, [release]);
 
   useEffect(() => {
     if (
       current.current &&
-      !current.current.input.signal.aborted &&
+      !current.current.cancellation.signal.aborted &&
       (!enabled || current.current.sessionId !== sessionId)
     )
       release();
   }, [enabled, sessionId, release]);
+  useEffect(() => {
+    publishMeeting({
+      sessionId,
+      teamExists: false,
+      enabled: false,
+      state: 'idle',
+      error: undefined,
+      meetingId: undefined,
+    });
+    if (!enabled || !sessionId || sessionId === 'new') return;
+    let cancelled = false;
+    let attaching = false;
+    let attachmentFailed = false;
+    let revision = 0;
+    const fail = (error: unknown) => {
+      attachmentFailed = true;
+      if (!cancelled)
+        publishMeeting({
+          state: 'failed',
+          sessionId,
+          error: error instanceof Error ? error.message : 'meetingStartFailed',
+        });
+    };
+    const reflect = async (server: ServerMeeting) => {
+      if (cancelled) return;
+      publishMeeting({ teamExists: server.team_exists, enabled: server.enabled, meetingId: server.meeting_id });
+      const local = current.current?.sessionId === sessionId ? current.current : null;
+      if (server.state === 'failed' || server.state === 'cleanup_failed') {
+        publishMeeting({ state: server.state, error: server.error });
+      } else if (server.state === 'starting' || server.state === 'closing') {
+        if (!local?.ending) publishMeeting({ state: server.state });
+      } else if (!server.enabled) {
+        if (local?.ending) return;
+        if (local) {
+          local.disabled = true;
+        }
+        if (!attachmentFailed) publishMeeting({ state: 'idle' });
+      } else if (!attaching && !attachmentFailed && (!local || local.disabled)) {
+        attaching = true;
+        try {
+          await start(sessionId);
+        } catch (error) {
+          fail(error);
+        } finally {
+          attaching = false;
+        }
+      }
+    };
+    const refresh = () => {
+      const observed = revision;
+      void webClient
+        .request<ServerMeeting>('meeting.status', { session_id: sessionId })
+        .then((server) => {
+          if (observed === revision) return reflect(server);
+        })
+        .catch(fail);
+    };
+    const off = webClient.on('meeting.state', ({ payload }) => {
+      if (payload.session_id === sessionId) {
+        revision++;
+        void reflect(payload as unknown as ServerMeeting);
+      }
+    });
+    const offState = webClient.onStateChange((state) => {
+      if (state === 'ready') refresh();
+    });
+    if (webClient.getState() === 'ready') refresh();
+    return () => {
+      cancelled = true;
+      off();
+      offState();
+    };
+  }, [enabled, sessionId, start]);
   useEffect(() => {
     if (current.current) current.current.meeting.context = context(current.current.sessionId);
   }, [roster, context]);

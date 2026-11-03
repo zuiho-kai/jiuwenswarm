@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from functools import partial
 import os
 from urllib.parse import urlsplit
 
@@ -100,39 +99,32 @@ class MeetingFeishuConnection:
         return self.status(manager)
 
 
-def bind_feishu_handlers(web, get_manager):
-    connection = MeetingFeishuConnection()
-
-    async def control(operation, ws, req_id, params, session_id):
-        del params, session_id
-        manager = get_manager()
-        if manager is None:
-            await web.send_response(
-                ws, req_id, ok=False, error="Channel manager unavailable", code="SERVICE_UNAVAILABLE",
-            )
-            return
-        try:
-            if operation == "status":
-                result = connection.status(manager)
-            else:
-                async with connection.lock:
-                    result = await getattr(connection, operation)(manager)
-            await web.send_response(ws, req_id, ok=True, payload=result)
-        except TimeoutError:
-            await web.send_response(
-                ws, req_id, ok=False, code="FEISHU_CONNECTION_ERROR",
-                error="Feishu connection timed out. Check credentials and network access, then retry.",
-            )
-        except ValueError as exc:
-            await web.send_response(
-                ws, req_id, ok=False, error=str(exc), code="FEISHU_CONNECTION_ERROR",
-            )
-        except Exception:
-            # SDK exceptions can include authenticated URLs; never return them to the browser.
-            await web.send_response(
-                ws, req_id, ok=False, code="FEISHU_CONNECTION_ERROR",
-                error="Feishu connection failed. Check Gateway logs and retry.",
-            )
-
-    for operation in ("status", "connect", "disconnect"):
-        web.register_method(f"meeting.feishu.{operation}", partial(control, operation), local_only=True)
+async def feishu_control(web, connection, manager, operation, ws, req_id, params, session_id):
+    del params, session_id
+    if manager is None:
+        await web.send_response(
+            ws, req_id, ok=False, error="Channel manager unavailable", code="SERVICE_UNAVAILABLE",
+        )
+        return
+    try:
+        if operation == "status":
+            result = connection.status(manager)
+        else:
+            async with connection.lock:
+                result = await getattr(connection, operation)(manager)
+        await web.send_response(ws, req_id, ok=True, payload=result)
+    except TimeoutError:
+        await web.send_response(
+            ws, req_id, ok=False, code="FEISHU_CONNECTION_ERROR",
+            error="Feishu connection timed out. Check credentials and network access, then retry.",
+        )
+    except ValueError as exc:
+        await web.send_response(
+            ws, req_id, ok=False, error=str(exc), code="FEISHU_CONNECTION_ERROR",
+        )
+    except Exception:
+        # SDK exceptions can include authenticated URLs; never return them to the browser.
+        await web.send_response(
+            ws, req_id, ok=False, code="FEISHU_CONNECTION_ERROR",
+            error="Feishu connection failed. Check Gateway logs and retry.",
+        )

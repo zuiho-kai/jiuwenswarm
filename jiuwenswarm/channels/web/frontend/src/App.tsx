@@ -3108,7 +3108,7 @@ function AppContent({
           queueOrAddGoalObjectiveMessage(newSid, messageContent);
           setGoalObjective(newSid, messageContent);
         } else {
-          const sent = await sendMessage(messageContent, newSid, mediaItems);
+          const sent = await sendMessage(messageContent, newSid, mediaItems, options);
           if (!sent) {
             useChatStore.getState().setInputValue(newSid, messageContent);
           }
@@ -3130,7 +3130,7 @@ function AppContent({
       return;
     }
     disposeInFlightHistoryHandles(currentSessionId);
-    const sent = await sendMessage(content, currentSessionId, mediaItems);
+    const sent = await sendMessage(content, currentSessionId, mediaItems, options);
     if (sent) {
       const sessionState = useSessionStore.getState();
       const session =
@@ -3141,6 +3141,7 @@ function AppContent({
     } else {
       useChatStore.getState().setInputValue(currentSessionId, content);
     }
+    return sent;
   }, [disposeInFlightHistoryHandles, mode, navigate, request, sendMessage, setGoalObjective, t]);
 
   const handlePersistMedia = useCallback((content: string, mediaItems: MediaItem[]) => {

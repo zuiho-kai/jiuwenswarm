@@ -1,17 +1,17 @@
 import { useTranslation } from 'react-i18next';
-import { Mic, MicOff, Square, UsersRound, VolumeX } from 'lucide-react';
+import { Square, UsersRound, VolumeX } from 'lucide-react';
 import { useSessionStore } from '../../../channels/web/frontend/src/stores/sessionStore';
 import { resolveTeamLeaderDisplayName } from '../../../channels/web/frontend/src/features/teamLeaderIdentity';
-import { recordMeeting, stopMeeting, stopMeetingAudio, useMeetingSnapshot } from './taskMeetingStore';
+import { stopMeeting, stopMeetingAudio, useMeetingSnapshot } from './taskMeetingStore';
 
 export function MeetingPanel({ sessionId }: { sessionId: string | null }) {
   const { t, i18n } = useTranslation();
   const snapshot = useMeetingSnapshot();
   const runtime = useSessionStore((state) => state.runtimes[sessionId || '']);
   const ownsMeeting = !!sessionId && snapshot.sessionId === sessionId;
-  const state = ownsMeeting ? snapshot.state : 'idle';
+  const state = ownsMeeting ? (snapshot.state === 'idle' && snapshot.enabled ? 'active' : snapshot.state) : 'idle';
   const active = state === 'active';
-  const canEnd = ['starting', 'active', 'cleanup_failed'].includes(state);
+  const canEnd = ['starting', 'active', 'cleanup_failed', 'failed'].includes(state);
   const leader = resolveTeamLeaderDisplayName(runtime?.teamLeaderIdentity, i18n.language) || t('meeting.leader');
   const addressedAgents = snapshot.addressedMembers.map((name) => {
     if (runtime?.teamLeaderMemberIds.includes(name)) return `@${leader}`;
@@ -55,20 +55,6 @@ export function MeetingPanel({ sessionId }: { sessionId: string | null }) {
                   {addressedAgents.length ? addressedAgents.join(', ') : t('meeting.panel.noAddressedAgents')}
                 </dd>
               </div>
-              <div>
-                <dt className="mb-1 text-xs text-text-secondary">{t('meeting.panel.speechRoute')}</dt>
-                <dd className="text-sm font-medium text-text" data-testid="team-area-meeting-speech-route">
-                  {snapshot.routingMode === 'leader' ? `@${leader}` : t('meeting.routing.none')}
-                </dd>
-              </div>
-              <div>
-                <dt className="mb-1 text-xs text-text-secondary">{t('meeting.panel.microphone')}</dt>
-                <dd className="text-sm font-medium text-text" data-testid="team-area-meeting-microphone">
-                  {active
-                    ? t(`meeting.panel.microphoneStates.${snapshot.recording}`)
-                    : t(`meeting.panel.states.${state}`)}
-                </dd>
-              </div>
               <div className="col-span-full">
                 <dt className="mb-1 text-xs text-text-secondary">{t('meeting.panel.playback')}</dt>
                 <dd className="text-sm text-text" data-testid="team-area-meeting-playback">
@@ -80,25 +66,6 @@ export function MeetingPanel({ sessionId }: { sessionId: string | null }) {
             </dl>
 
             <div className="flex flex-wrap gap-2" data-testid="team-area-meeting-controls">
-              <button
-                type="button"
-                className={buttonClass}
-                title={t(`meeting.record.${snapshot.recording}`)}
-                disabled={!active || snapshot.recording === 'transcribing'}
-                onClick={recordMeeting}
-                data-testid="team-area-meeting-microphone-btn"
-              >
-                {snapshot.recording === 'recording' ? (
-                  <MicOff size={16} aria-hidden="true" />
-                ) : (
-                  <Mic size={16} aria-hidden="true" />
-                )}
-                {t(
-                  snapshot.recording === 'recording'
-                    ? 'meeting.panel.pauseMicrophone'
-                    : `meeting.record.${snapshot.recording}`,
-                )}
-              </button>
               <button
                 type="button"
                 className={buttonClass}
@@ -132,17 +99,6 @@ export function MeetingPanel({ sessionId }: { sessionId: string | null }) {
                 {t('meeting.errors.cleanupFailed')}
               </p>
             )}
-            <div>
-              <h3 className="mb-2 text-sm font-medium text-text" data-testid="team-area-meeting-transcript-title">
-                {t('meeting.panel.transcript')}
-              </h3>
-              <p
-                className="whitespace-pre-wrap break-words rounded-lg border border-border p-4 text-sm leading-6 text-text-secondary"
-                data-testid="team-area-meeting-transcript"
-              >
-                {snapshot.lastTranscript || t('meeting.panel.waitingForSpeech')}
-              </p>
-            </div>
           </>
         )}
       </div>

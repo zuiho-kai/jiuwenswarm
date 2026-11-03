@@ -10,9 +10,9 @@ import {
   TrajectoryUiSetting,
 } from './ExperimentalSettings';
 import { A4PSettings } from './A4PSettings';
-import { MeetingRoutingSetting } from './MeetingRoutingSetting';
 import { MeetingFeishuSetting } from './MeetingFeishuSetting';
 import { TtsProfileSettings } from './TtsProfileSettings';
+import { VoiceInputRoutingSetting } from './VoiceInputRoutingSetting';
 
 export const experimentalModule: SettingsModuleDefinition = {
   id: 'experimental',
@@ -23,7 +23,10 @@ export const experimentalModule: SettingsModuleDefinition = {
     {
       id: 'asr',
       titleKey: 'settingsPanel.experimental.taskAsr',
-      items: [{ id: 'task-asr-enabled', component: 'custom', render: TaskAsrSetting }],
+      items: [
+        { id: 'task-asr-enabled', component: 'custom', render: TaskAsrSetting },
+        { id: 'voice-input-routing', component: 'custom', render: VoiceInputRoutingSetting },
+      ],
     },
     {
       id: 'tts',
@@ -40,7 +43,7 @@ export const experimentalModule: SettingsModuleDefinition = {
       titleKey: 'meeting.title',
       items: [
         { id: 'team-meeting-enabled', component: 'switch', key: 'team_meeting_enabled' },
-        { id: 'team-meeting-routing', component: 'custom', render: MeetingRoutingSetting },
+        { id: 'team-meeting-default-enabled', component: 'switch', key: 'team_meeting_default_enabled' },
         { id: 'team-meeting-feishu', component: 'custom', render: MeetingFeishuSetting },
         { id: 'meeting-vad-start-threshold', component: 'input', key: 'meeting_vad_start_threshold' },
         { id: 'meeting-vad-start-frames', component: 'input', key: 'meeting_vad_start_frames' },

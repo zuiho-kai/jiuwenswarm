@@ -1,45 +1,27 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { LoaderCircle, Mic, Square, UsersRound, VolumeX } from 'lucide-react';
+import { LoaderCircle, UsersRound, VolumeX } from 'lucide-react';
 import type { ApplicationPluginTaskInputActionProps } from '../../../channels/web/frontend/src/applicationPlugins/types';
-import { blockTaskInput } from '../../../channels/web/frontend/src/applicationPlugins/taskInputReadiness';
 import {
   setTeamMeetingEnabled,
   useTeamMeetingEnabled,
 } from '../../../channels/web/frontend/src/features/teamMeeting/featureFlag';
 import { webClient } from '../../../channels/web/frontend/src/services/webClient';
-import { toast } from '../../../channels/web/frontend/src/components/ui/Toast/toastStore';
-import { recordMeeting, startMeeting, stopMeeting, stopMeetingAudio, useMeetingSnapshot } from './taskMeetingStore';
+import { publishMeeting, startMeeting, stopMeeting, stopMeetingAudio, useMeetingSnapshot } from './taskMeetingStore';
 import './TaskMeetingAction.css';
 
-export function TaskMeetingAction({
-  fallback,
-  teamEligible = false,
-  onSelectTeamMode,
-  sessionId,
-  ensureSession,
-  onMicrophoneActiveChange,
-  microphoneBusy = false,
-  disabled = false,
-}: ApplicationPluginTaskInputActionProps) {
+export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTaskInputActionProps) {
   const { t } = useTranslation();
   const enabled = useTeamMeetingEnabled();
   const snapshot = useMeetingSnapshot();
-  const [creating, setCreating] = useState(false);
-  const attempt = useRef(0);
-  const releaseCreation = useRef<(() => void) | undefined>();
-  const cancelPending = useCallback(() => {
-    attempt.current++;
-    releaseCreation.current?.();
-    releaseCreation.current = undefined;
-  }, []);
-  const mounted = useRef(true);
-  const current = useRef({ sessionId, teamEligible });
-  current.current = { sessionId, teamEligible };
-  const active =
-    snapshot.sessionId === sessionId || snapshot.state === 'closing' || snapshot.state === 'cleanup_failed';
-  const status = creating ? 'starting' : active ? snapshot.state : 'idle';
-  const recording = snapshot.recording;
+  const active = snapshot.sessionId === sessionId;
+  const requested = active && snapshot.enabled;
+  const status =
+    (active || snapshot.state === 'closing' || snapshot.state === 'cleanup_failed') && snapshot.state !== 'idle'
+      ? snapshot.state
+      : requested
+        ? 'active'
+        : 'idle';
 
   useEffect(() => {
     let cancelled = false;
@@ -60,110 +42,66 @@ export function TaskMeetingAction({
       if (retry) clearTimeout(retry);
     };
   }, []);
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-      cancelPending();
-    };
-  }, [cancelPending]);
-  useEffect(() => {
-    onMicrophoneActiveChange?.(status !== 'idle');
-    return () => onMicrophoneActiveChange?.(false);
-  }, [status, onMicrophoneActiveChange]);
-  useEffect(() => {
-    // Session creation removes the draft runtime before selecting the new ID.
-    // Its temporary Agent fallback must not cancel the pending meeting start.
-    const creatingDraft = sessionId === 'new' && releaseCreation.current !== undefined;
-    if (!enabled || (!teamEligible && !creatingDraft)) {
-      cancelPending();
-      setCreating(false);
-      if (active && !teamEligible) stopMeeting();
+  const toggle = () => {
+    if (status === 'cleanup_failed') return stopMeeting();
+    if ((!requested || status === 'failed') && sessionId && active && snapshot.teamExists && status !== 'starting') {
+      publishMeeting({ state: 'starting', error: undefined });
+      void startMeeting(sessionId).catch((error) => {
+        publishMeeting({
+          state: 'failed',
+          sessionId,
+          error: error instanceof Error ? error.message : 'meetingStartFailed',
+        });
+      });
+      return;
     }
-  }, [enabled, teamEligible, active, sessionId, cancelPending]);
-
-  const start = async () => {
-    if (creating || microphoneBusy || disabled || (!teamEligible && !onSelectTeamMode)) return;
-    const id = ++attempt.current;
-    const origin = sessionId;
-    const release = blockTaskInput(null);
-    releaseCreation.current = release;
-    setCreating(true);
-    try {
-      if (!teamEligible) onSelectTeamMode?.();
-      const readyId = await ensureSession('');
-      if (id !== attempt.current || !mounted.current || !enabled) return;
-      if (!readyId || (current.current.sessionId !== origin && current.current.sessionId !== readyId)) return;
-      setCreating(false);
-      const started = startMeeting(readyId);
-      release();
-      releaseCreation.current = undefined;
-      await started;
-    } catch (error) {
-      if (id !== attempt.current || !mounted.current) return;
-      const code =
-        error instanceof Error && error.message.includes('Another connection owns this meeting')
-          ? 'meetingBusy'
-          : error instanceof Error &&
-              [
-                'unsupported',
-                'disconnected',
-                'microphoneFailed',
-                'playbackUnavailable',
-                'meetingStartFailed',
-                'deliveryFailed',
-                'meetingRequiresNewConversation',
-              ].includes(error.message)
-            ? error.message
-            : 'meetingStartFailed';
-      toast.open({ content: t(`meeting.errors.${code}`), variant: 'error' });
-    } finally {
-      release();
-      if (releaseCreation.current === release) releaseCreation.current = undefined;
-      if (id === attempt.current && mounted.current) setCreating(false);
-    }
-  };
-  const stop = () => {
-    cancelPending();
-    setCreating(false);
-    stopMeeting();
+    if (requested || status === 'starting') stopMeeting();
   };
   const title = t(
-    `meeting.task.${status === 'idle' ? 'start' : status === 'starting' ? 'starting' : status === 'closing' ? 'closing' : status === 'cleanup_failed' ? 'retryCleanup' : 'stop'}`,
+    `meeting.task.${status === 'idle' ? 'enable' : status === 'starting' ? 'enabling' : status === 'closing' ? 'disabling' : status === 'cleanup_failed' ? 'retryCleanup' : status === 'failed' ? 'retryEnable' : 'enabled'}`,
   );
   return (
     <>
-      {(enabled || status !== 'idle') && (teamEligible || onSelectTeamMode || status !== 'idle') && (
+      {((enabled && active && snapshot.teamExists) || status === 'closing' || status === 'cleanup_failed') && (
         <div className="task-meeting-actions" data-testid="chat-panel-meeting-controls" data-variant={status}>
           <button
             type="button"
             className={`chat-input-btn task-meeting-action is-${status}`}
             title={title}
             aria-label={title}
-            aria-pressed={status === 'active'}
-            disabled={
-              status === 'closing' ||
-              (status === 'starting' && creating) ||
-              (status === 'idle' && (microphoneBusy || disabled))
-            }
+            aria-pressed={requested}
+            aria-busy={status === 'starting' || status === 'closing'}
+            disabled={status === 'closing'}
             data-testid="chat-panel-input-meeting"
             data-variant={status}
-            onClick={() => {
-              if (['active', 'starting', 'cleanup_failed'].includes(status)) stop();
-              else if (status === 'idle') void start();
-            }}
+            onClick={toggle}
           >
             {status === 'starting' || status === 'closing' ? (
               <LoaderCircle className="chat-input-btn-icon task-meeting-spinner" aria-hidden="true" />
             ) : (
               <UsersRound className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
             )}
-            {status !== 'idle' && <span>{title}</span>}
+            <span data-testid="chat-panel-meeting-toggle-label">{title}</span>
           </button>
-          {status === 'starting' && !creating && (
-            <span className="task-meeting-waiting" data-testid="chat-panel-meeting-waiting">
-              {t('meeting.task.waiting')}
-            </span>
+          {status === 'failed' && (
+            <>
+              <span className="task-meeting-waiting" role="alert" data-testid="chat-panel-meeting-activation-error">
+                {t(`meeting.errors.${snapshot.error || 'meetingStartFailed'}`, {
+                  defaultValue: snapshot.error || t('meeting.errors.meetingStartFailed'),
+                })}
+              </span>
+              <button
+                type="button"
+                className="chat-input-btn task-meeting-action"
+                data-testid="chat-panel-meeting-cancel-enable"
+                onClick={() => {
+                  if (requested) stopMeeting();
+                  else publishMeeting({ state: 'idle', error: undefined });
+                }}
+              >
+                {t('meeting.task.stop')}
+              </button>
+            </>
           )}
           {status === 'cleanup_failed' && (
             <span className="task-meeting-waiting" role="status" data-testid="chat-panel-meeting-cleanup-error">
@@ -182,25 +120,6 @@ export function TaskMeetingAction({
           )}
           {status === 'active' && (
             <>
-              <button
-                type="button"
-                className={`chat-input-btn${recording === 'recording' ? ' chat-input-btn--recording' : ''}`}
-                title={t(`meeting.record.${recording}`)}
-                aria-label={t(`meeting.record.${recording}`)}
-                aria-pressed={recording === 'recording'}
-                disabled={recording === 'transcribing'}
-                data-testid="chat-panel-input-meeting-record"
-                data-variant={recording}
-                onClick={recordMeeting}
-              >
-                {recording === 'transcribing' ? (
-                  <LoaderCircle className="chat-input-btn-icon task-meeting-spinner" aria-hidden="true" />
-                ) : recording === 'recording' ? (
-                  <Square className="chat-input-btn-icon" fill="currentColor" aria-hidden="true" />
-                ) : (
-                  <Mic className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
-                )}
-              </button>
               <button
                 type="button"
                 className="chat-input-btn"

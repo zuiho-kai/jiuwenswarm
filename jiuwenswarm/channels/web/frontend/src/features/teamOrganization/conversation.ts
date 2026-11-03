@@ -46,6 +46,7 @@ export async function sendExpertMessage(
   sessionId: string,
   mediaItems: MediaItem[] = [],
   attachments: Record<string, unknown> = {},
+  onRequestId?: (id: string) => void,
 ): Promise<boolean | null> {
   const teamId = selectedExpertTeamId(sessionId);
   if (!teamId) return null;
@@ -63,13 +64,17 @@ export async function sendExpertMessage(
   });
   chat.setProcessing(key, true);
   try {
-    await webClient.request('chat.send', {
-      ...attachments,
-      session_id: sessionId,
-      mode: 'team',
-      content,
-      target_team_id: teamId,
-    });
+    await webClient.request(
+      'chat.send',
+      {
+        ...attachments,
+        session_id: sessionId,
+        mode: 'team',
+        content,
+        target_team_id: teamId,
+      },
+      { onRequestId },
+    );
     return true;
   } finally {
     chat.setProcessing(key, false);

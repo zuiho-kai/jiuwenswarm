@@ -1932,7 +1932,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             attachments.files = { ...persisted.files, ...documents.files };
             query = withUploadDocumentBlock(persisted.content ?? persisted.query ?? content, toUploadDocumentHints(documents.media_items));
           }
-          return (await sendExpertMessage(query, sessionId, mediaItems, attachments)) ?? false;
+          return (await sendExpertMessage(query, sessionId, mediaItems, attachments, options?.onRequestId)) ?? false;
         } catch (error) {
           onErrorRef.current?.((error as WebError).message || t('network.sendMessageFailed'));
           return false;
@@ -1965,14 +1965,16 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       if (!stripUploadDocumentBlocks(content).trim() && !hasMedia) return false;
 
       const currentMode = useSessionStore.getState().getRuntime(sessionId)?.mode;
-      const groupChat = options?.groupChat ?? (
-        isTeamAgentMode(currentMode)
-          ? defaultGroupChatInput(
-              sessionId,
-              useSessionStore.getState().getRuntime(sessionId)?.teamLeaderMemberIds[0] || 'team_leader',
-            )
-          : undefined
-      );
+      const groupChat =
+        options?.groupChat === null
+          ? undefined
+          : (options?.groupChat ??
+            (isTeamAgentMode(currentMode)
+              ? defaultGroupChatInput(
+                  sessionId,
+                  useSessionStore.getState().getRuntime(sessionId)?.teamLeaderMemberIds[0] || 'team_leader',
+                )
+              : undefined));
       const unsupportedEvolutionMode = unsupportedEvolutionModeMessage(content, currentMode ?? 'agent');
       if (unsupportedEvolutionMode) {
         useChatStore.getState().addMessage(sessionId, {
@@ -2169,7 +2171,6 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
                 body: outgoingContent,
                 client_message_id: groupChat.clientMessageId,
                 mentions: groupChat.mentions,
-                ...(groupChat.meeting ? { meeting_mode: true } : {}),
               }
             : {}),
           ...(outgoingMediaItems ? { media_items: outgoingMediaItems } : {}),
@@ -2199,6 +2200,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           // 登记乐观 user 气泡的单号：runtime.accepted 到达时按单号回填服务端权威
           // 时间戳（见 optimisticUserBubblesRef 注释与 runtime.accepted 处理器）。
           onRequestId: (requestId) => {
+            options?.onRequestId?.(requestId);
             options?.groupChat?.onRequestId?.(requestId);
             const registry = optimisticUserBubblesRef.current;
             // 兜底清理：accepted 丢失（发送失败/断连）时登记项不会被消费，限制驻留规模

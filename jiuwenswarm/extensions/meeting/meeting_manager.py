@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from openjiuwen.agent_teams.meeting import (
@@ -28,8 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _Meeting:
     owner_id: str | None
-    phase: Literal["pending", "starting", "active", "disabled", "closing", "cleanup_failed"]
-    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    phase: Literal["starting", "active", "disabled", "closing", "cleanup_failed"]
     abandoned: bool = False
     backend: Any = None
     coordinator: MeetingCoordinator | None = None
@@ -42,6 +41,7 @@ class _Meeting:
     disable_on_cleanup: bool = True
     release_playback: bool = False
     retiring: bool = False
+    activation_error: str | None = None
 
 
 def _meeting_enabled() -> bool:
@@ -302,7 +302,7 @@ class MeetingManager:
 
     async def _driver_is_current(self, session_id: str, meeting: _Meeting) -> bool:
         async with self._lock:
-            if self._sessions.get(session_id) is not meeting or meeting.retiring or meeting.phase in {"pending", "starting"}:
+            if self._sessions.get(session_id) is not meeting or meeting.retiring or meeting.phase == "starting":
                 return False
             if not self._runtime_matches(session_id, meeting):
                 return False
@@ -382,14 +382,41 @@ class MeetingManager:
             return False
         return backend is meeting.backend
 
-    def team_runtime_ready(self, session_id: str) -> None:
-        """Register queue discovery once per Team activation, without creating a queue."""
+    async def team_runtime_ready(self, session_id: str) -> None:
+        """Subscribe before agent startup; runtime readiness does not imply a Team row."""
         if not self._stopping:
             self._stopped_sessions.discard(session_id)
-            meeting = self._sessions.get(session_id)
-            if meeting is not None and meeting.phase == "pending":
-                meeting.ready.set()
-            self._spawn(self.attach_team_runtime(session_id))
+            await self.attach_team_runtime(session_id)
+            await self._publish_status(session_id)
+
+    async def _team_created(self, session_id: str) -> None:
+        """Apply the global default only at successful Team creation."""
+        experimental = get_config().get("experimental") or {}
+        try:
+            if self._enabled() and experimental.get("team_meeting_default_enabled") is True:
+                await self.start(session_id)
+            else:
+                await self.attach_team_runtime(session_id)
+        except Exception:
+            logger.exception("New Team meeting activation failed: session_id=%s", session_id)
+        finally:
+            await self._publish_status(session_id)
+
+    async def _publish_status(self, session_id: str) -> None:
+        from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
+
+        try:
+            await AgentWebSocketServer.get_instance().send_push({
+                "request_id": "", "channel_id": "web", "session_id": session_id,
+                "payload": {"event_type": "meeting.state", "session_id": session_id,
+                            **await self.lifecycle_status(session_id)},
+            })
+        except Exception:
+            logger.exception("Meeting state notification failed: session_id=%s", session_id)
+
+    async def _refresh_runtime(self, session_id: str) -> None:
+        await self.attach_team_runtime(session_id)
+        await self._publish_status(session_id)
 
     async def attach_team_runtime(self, session_id: str, *, wake: bool = False) -> None:
         from .grant_driver import MeetingGrantDriver
@@ -407,14 +434,16 @@ class MeetingManager:
                 async def on_event(event) -> None:
                     if event.payload.get("team_name") != backend.team_name:
                         return
-                    if event.event_type == TeamEvent.MEETING_QUEUE_CHANGED:
+                    if event.event_type == TeamEvent.CREATED:
+                        self._spawn(self._team_created(session_id))
+                    elif event.event_type == TeamEvent.MEETING_QUEUE_CHANGED:
                         current = self._sessions.get(session_id)
                         if current is not None and current.driver is not None and current.driver.started:
                             current.driver.wake()
                         else:
                             self._spawn(self.attach_team_runtime(session_id, wake=True))
                     elif event.event_type == TeamEvent.MEETING_STATE_CHANGED:
-                        self._spawn(self.attach_team_runtime(session_id))
+                        self._spawn(self._refresh_runtime(session_id))
 
                 agent.add_event_listener(on_event)
                 self._runtime_listeners[session_id] = (agent, on_event)
@@ -546,6 +575,7 @@ class MeetingManager:
             if startup_id is not None and meeting.startup_id not in (None, startup_id):
                 raise RuntimeError("Another startup already owns this meeting")
             if meeting.phase == "disabled":
+                meeting.activation_error = None
                 meeting.phase = "starting"
                 meeting.abandoned = False
                 meeting.disable_on_cleanup = True
@@ -560,13 +590,8 @@ class MeetingManager:
                 meeting.owner_id = owner_id
             if startup_id is not None:
                 meeting.startup_id = startup_id
-            if meeting.phase == "pending" and self._team_manager.is_runtime_active(
-                session_id
-            ):
-                meeting.ready.set()
             return meeting
-        active = self._team_manager.is_runtime_active(session_id)
-        meeting = _Meeting(owner_id, "starting" if active else "pending")
+        meeting = _Meeting(owner_id, "starting")
         meeting.startup_id = startup_id
         self._sessions[session_id] = meeting
         meeting.task = self._spawn(self._run_start(session_id, meeting))
@@ -579,7 +604,10 @@ class MeetingManager:
                 raise ValueError("Meeting session ID must be non-empty")
             if not self._enabled():
                 raise RuntimeError("Team meetings are disabled")
-            self._team_backend(session_id)
+            _, backend = self._team_backend(session_id)
+            await backend.db.initialize()
+            if await backend.get_team_info() is None:
+                raise RuntimeError("Team has not been created")
             meeting = self._request_locked(session_id, None)
             if meeting.phase == "active":
                 assert meeting.state is not None
@@ -594,10 +622,14 @@ class MeetingManager:
     async def request_start(
         self, session_id: str, owner_id: str, startup_id: str | None = None
     ) -> MeetingState | None:
-        """Reserve startup, waiting for normal Team activation if needed."""
+        """Enable an existing Team; pre-creation selection belongs to global settings."""
         if not owner_id:
             raise ValueError("Meeting owner is required")
         async with self._lock:
+            _, backend = self._team_backend(session_id)
+            await backend.db.initialize()
+            if await backend.get_team_info() is None:
+                raise RuntimeError("Team has not been created")
             meeting = self._request_locked(session_id, owner_id, startup_id)
             return meeting.state if meeting.phase == "active" else None
 
@@ -615,8 +647,6 @@ class MeetingManager:
     ) -> MeetingState | None:
         activated = False
         try:
-            if meeting.phase == "pending":
-                await meeting.ready.wait()
             async with self._lock:
                 if meeting.abandoned or not self._enabled():
                     return None
@@ -624,6 +654,7 @@ class MeetingManager:
                 meeting.initializing = self._spawn(
                     self._initialize(session_id, meeting)
                 )
+            await self._publish_status(session_id)
             state = await meeting.initializing
             async with self._lock:
                 if (
@@ -640,11 +671,20 @@ class MeetingManager:
                 return state
             return None
         except TimeoutError:
+            activated = False
+            meeting.activation_error = "Meeting activation timed out"
             logger.info("Meeting startup timed out: session_id=%s", session_id)
             return None
         except asyncio.CancelledError:
             if not meeting.abandoned:
                 raise
+            return None
+        except Exception as exc:
+            from jiuwenswarm.common.utils import mask_sensitive
+
+            activated = False
+            meeting.activation_error = mask_sensitive(str(exc))
+            logger.exception("Meeting activation failed: session_id=%s", session_id)
             return None
         finally:
             if not activated and not meeting.retiring:
@@ -664,6 +704,7 @@ class MeetingManager:
                     await asyncio.shield(task)
             else:
                 meeting.initializing = None
+            await self._publish_status(session_id)
 
     def _begin_close_locked(
         self, session_id: str, meeting: _Meeting
@@ -676,7 +717,10 @@ class MeetingManager:
         if meeting.driver is not None:
             meeting.driver.set_audio_enabled(False)
         if meeting.backend is None:
-            self._sessions.pop(session_id)
+            if meeting.activation_error:
+                meeting.phase = "disabled"
+            else:
+                self._sessions.pop(session_id)
             return None
         meeting.task = self._spawn(self._close(session_id, meeting))
         return meeting.task
@@ -704,15 +748,16 @@ class MeetingManager:
                     meeting.owner_id = None
                     meeting.startup_id = None
                 meeting.publication = None
+        await self._publish_status(session_id)
 
     def _release_locked(
         self, session_id: str, meeting: _Meeting
     ) -> asyncio.Task | None:
+        meeting.activation_error = None
         meeting.release_playback = True
-        if meeting.phase in ("pending", "starting"):
+        if meeting.phase == "starting":
             meeting.abandoned = True
             meeting.phase = "closing"
-            meeting.ready.set()
             if meeting.initializing is not None:
                 meeting.initializing.cancel()
             return meeting.task
@@ -754,7 +799,7 @@ class MeetingManager:
                 or meeting.state is None
                 or meeting.phase not in ("active", "disabled", "closing", "cleanup_failed")
                 or meeting.state.scope.meeting_id != meeting_id
-                or (owner_id is not None and meeting.owner_id != owner_id)
+                or (owner_id is not None and meeting.owner_id not in (None, owner_id))
             ):
                 return False
             task = (
@@ -789,6 +834,22 @@ class MeetingManager:
 
     async def lifecycle_status(
         self, session_id: str, startup_id: str | None = None
+    ) -> dict[str, Any]:
+        status = await self._lifecycle_status(session_id, startup_id)
+        try:
+            _, backend = self._team_backend(session_id)
+        except RuntimeError:
+            return {**status, "team_exists": False, "enabled": False}
+        await backend.db.initialize()
+        exists = await backend.get_team_info() is not None
+        coordinator = await backend.get_meeting() if exists else None
+        state = await coordinator.get_state() if coordinator is not None else None
+        return {**status, "team_exists": exists,
+                **({"meeting_id": state.scope.meeting_id} if state is not None else {}),
+                "enabled": state is not None and state.enabled and not state.closed}
+
+    async def _lifecycle_status(
+        self, session_id: str, startup_id: str | None = None
     ) -> dict[str, str]:
         async with self._lock:
             meeting = self._sessions.get(session_id)
@@ -796,17 +857,15 @@ class MeetingManager:
                 startup_id is not None and meeting.startup_id != startup_id
             ):
                 return {"state": "idle"}
-            if meeting.phase == "pending" and self._team_manager.is_runtime_active(
-                session_id
-            ):
-                meeting.ready.set()
             if meeting.phase == "active" and (
                 not self._enabled() or not self._runtime_matches(session_id, meeting)
             ):
                 self._release_locked(session_id, meeting)
             if meeting.phase != "active":
+                if meeting.activation_error:
+                    return {"state": "failed", "error": meeting.activation_error}
                 return {
-                    "state": "starting" if meeting.phase == "pending" else "idle" if meeting.phase == "disabled" else meeting.phase
+                    "state": "idle" if meeting.phase == "disabled" else meeting.phase
                 }
             coordinator = meeting.coordinator
         assert coordinator is not None
@@ -831,6 +890,7 @@ class MeetingManager:
                 "session_id": session_id,
                 "team_name": state.scope.team_name,
                 "meeting_id": state.scope.meeting_id,
+                "conversation_mode": getattr(meeting.backend, "conversation_mode", "team"),
             }
 
     async def status(self, session_id: str) -> MeetingState | None:

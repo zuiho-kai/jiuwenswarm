@@ -440,6 +440,9 @@ def get_panel() -> dict[str, Any]:
         payload["team_meeting_enabled"] = _bool_text(
             experimental_cfg.get("team_meeting_enabled"), False
         )
+        payload["team_meeting_default_enabled"] = _bool_text(
+            experimental_cfg.get("team_meeting_default_enabled"), False
+        )
         payload["team_organization_ui_enabled"] = _bool_text(
             experimental_cfg.get("team_organization_ui_enabled"), False
         )
@@ -494,6 +497,7 @@ def get_panel() -> dict[str, Any]:
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("team_organization_ui_enabled", "false")
         payload.setdefault("team_meeting_enabled", "false")
+        payload.setdefault("team_meeting_default_enabled", "false")
         payload.setdefault("team_jev_routing_enabled", "false")
         payload.setdefault("swarmflow_enabled", "false")
         payload.setdefault("team_scheduled_dispatch_enabled", "false")
