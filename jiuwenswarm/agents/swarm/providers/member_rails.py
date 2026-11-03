@@ -86,14 +86,14 @@ HEARTBEAT = "swarm.heartbeat"
 @harness_element(
     kind=ElementKind.RAIL,
     name=MEETING_PARTICIPANT,
-    description="Native group-chat meeting guidance and publication, gated by the active host consumer.",
+    description="Native Team meeting guidance and controls, gated by the active host consumer.",
 )
 def build_meeting_participant(params: dict[str, Any], context: SwarmBuildContext) -> Any:
     del params
     backend = get_team_backend(context)
     if (
         getattr(context, "role", "") not in {"leader", "teammate"}
-        or getattr(backend, "conversation_mode", "team") != "group_chat"
+        or backend is None
         or not context.session_id or not context.member_name
     ):
         return None

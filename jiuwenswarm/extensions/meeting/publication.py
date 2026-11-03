@@ -185,7 +185,9 @@ class MeetingPublicationRail(DeepAgentRail):
         self.system_prompt_builder = builder
         for tool in self._tools.values():
             agent.ability_manager.add_ability(tool.card, tool)
-        builder.add_section(build_meeting_role_section(leader=self._leader))
+        builder.add_section(build_meeting_role_section(
+            leader=self._leader, can_interrupt="meeting_interrupt_speech" in self._tools,
+        ))
 
     def uninit(self, agent: Any) -> None:
         self.active = False
@@ -207,11 +209,9 @@ class MeetingPublicationRail(DeepAgentRail):
         ctx.extra[_STREAMING] = ctx.extra.get("_streaming", False)
         ctx.extra["_streaming"] = False
         ctx.extra.setdefault(_TURN, _PublicationTurn())
-        try:
-            state = await self._client.get_state()
-        except (ValueError, RuntimeError, OSError, SQLAlchemyError):
-            state = None
-        if not self.active or state is None or not state.enabled:
+        # The participant rail reconciles the current host scope. SDK tools
+        # validate persisted meeting state at admission/control execution.
+        if not self.active:
             # Callback exceptions are logged by the SDK and may be swallowed.
             # Use its explicit control signal to stop before the model executes.
             ctx.request_force_finish({

@@ -96,12 +96,14 @@ def _resolve_session(session_id: str, team_name: str) -> MeetingPublicationSessi
 class MeetingParticipantRail(DeepAgentRail):
     """Always mounted, inert until this exact session has a host-enabled scope.
 
-    Providers apply this to both the Leader and newly constructed native members.
-    Per-invocation policy references survive tool-context copies and prevent late
-    calls from falling back to unrestricted sending after meeting closure.
+    Providers apply this to the Leader and constructed or reloaded native members.
+    Per-invocation policy references survive tool-context copies so a replaced
+    meeting scope cannot be used by a late call from an earlier invocation.
     """
 
-    priority = 4
+    # Reconcile after SDK Team policy/tool rails so bootstrap removal and
+    # meeting controls apply to the model's final prompt and tool list.
+    priority = MeetingPublicationRail.priority
 
     def __init__(
         self, session_id: str, team_name: str, member_name: str, *, language: str = "en",
@@ -122,9 +124,6 @@ class MeetingParticipantRail(DeepAgentRail):
 
     def init(self, agent: Any) -> None:
         self._agent = agent
-        session = self._resolve(self._session_id, self._team_name)
-        if session is not None and session.voices is not None:
-            self.voice_assignment = session.voices.assign_voice(self._member_name, language=self._language)
 
     def uninit(self, agent: Any) -> None:
         if self._session is not None and self._policy is not None:
@@ -151,13 +150,14 @@ class MeetingParticipantRail(DeepAgentRail):
             if self._session is not None and self._policy is not None:
                 self._session.detach(self._policy)
             self._session, self._policy = session, None
+            self.voice_assignment = None
         if session is None:
             return
         try:
-            if session.voices is not None:
-                self.voice_assignment = session.voices.assign_voice(self._member_name, language=self._language)
             if self._policy is None:
                 self._policy = await session.attach(self._agent, self._member_name, self._language, self._roster_tool)
+                if session.voices is not None:
+                    self.voice_assignment = session.voices.get_voice(self._member_name)
                 if isinstance(ctx.inputs, ModelCallInputs) and not ctx.extra.get("_finalizing_max_iterations"):
                     # Append only the new tools: never restore an unrelated tool
                     # that an earlier permission/mode rail has already filtered.
