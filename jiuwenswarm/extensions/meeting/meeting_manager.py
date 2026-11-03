@@ -1,4 +1,4 @@
-"""Team-ready waiting and manager-owned meeting cleanup on an existing Team."""
+"""Team-owned meeting activation and host media cleanup."""
 
 from __future__ import annotations
 
@@ -7,11 +7,9 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
-from uuid import uuid4
 
 from openjiuwen.agent_teams.meeting import (
     MeetingCoordinator,
-    MeetingScope,
     MeetingState,
 )
 
@@ -223,7 +221,7 @@ class MeetingManager:
                 return meeting.driver
             assert meeting.coordinator is not None
             state = await meeting.coordinator.get_state()
-            if state is None or state.closed or state.owner_request_id or state.interruption_id:
+            if state is None or not state.enabled or state.owner_request_id or state.interruption_id:
                 raise ValueError("Grant driver requires an open meeting without an existing lease or interruption")
             driver = MeetingGrantDriver(
                 meeting.coordinator, consumer,
@@ -331,11 +329,10 @@ class MeetingManager:
             or not self._team_manager.is_runtime_active(session_id)
             or backend is None
             or backend.team_name != team_name
-            or backend.conversation_mode != "group_chat"
             or backend.group_session_id != session_id
         ):
             raise RuntimeError(
-                "An active group-chat Team is required to start a meeting"
+                "An active Team is required to start a meeting"
             )
         return team_name, backend
 
@@ -417,17 +414,13 @@ class MeetingManager:
             return meeting.state if meeting.phase == "active" else None
 
     async def _initialize(self, session_id: str, meeting: _Meeting) -> MeetingState:
-        team_name, backend = self._team_backend(session_id)
+        _, backend = self._team_backend(session_id)
         meeting.backend = backend
-        conversation = await backend.group_conversation()
-        # Retain the coordinator BEFORE start: it can persist a row and then fail.
-        meeting.coordinator = MeetingCoordinator(
-            backend.db,
-            MeetingScope(session_id, team_name, uuid4().hex),
-            message_manager=backend.message_manager,
-            conversation=conversation,
-        )
-        return await meeting.coordinator.start()
+        meeting.coordinator = await backend.enable_meeting()
+        state = await meeting.coordinator.get_state()
+        if state is None or not state.enabled:
+            raise RuntimeError("Team meeting did not become active")
+        return state
 
     async def _run_start(
         self, session_id: str, meeting: _Meeting
@@ -492,21 +485,24 @@ class MeetingManager:
             meeting.publication.close()
         if meeting.driver is not None:
             meeting.driver.close()
-        if meeting.coordinator is None:
+        if meeting.backend is None:
             self._sessions.pop(session_id)
             return None
         meeting.task = self._spawn(self._close(session_id, meeting))
         return meeting.task
 
     async def _close(self, session_id: str, meeting: _Meeting) -> None:
-        assert meeting.coordinator is not None
         try:
             if meeting.driver is not None:
                 await meeting.driver.aclose()
-            # Startup might fail before a row exists. Missing/closed is already clean.
-            state = await meeting.coordinator.get_state()
-            if state is not None and not state.closed:
-                await meeting.coordinator.close()
+            # Enable may persist a row before its state-change notification fails.
+            coordinator = meeting.coordinator or await meeting.backend.get_meeting()
+            if coordinator is not None:
+                disabled = await meeting.backend.disable_meeting(meeting_id=coordinator.scope.meeting_id)
+                if not disabled:
+                    state = await coordinator.get_state()
+                    if state is not None and (state.enabled or state.flushing):
+                        raise RuntimeError("Team meeting disable did not finish; retry cleanup")
         except BaseException:
             async with self._lock:
                 meeting.phase = "cleanup_failed"
@@ -532,7 +528,7 @@ class MeetingManager:
     async def release(
         self, session_id: str, owner_id: str, startup_id: str | None = None
     ) -> bool:
-        """Connection/page teardown: abandon startup or close its active meeting."""
+        """Connection/page teardown: stop media and disable the Team meeting."""
         if not owner_id:
             return False
         async with self._lock:
@@ -549,7 +545,7 @@ class MeetingManager:
     async def end(
         self, session_id: str, meeting_id: str, owner_id: str | None = None
     ) -> bool:
-        """End only a matching active meeting; repeated ends join its close task."""
+        """Disable a matching meeting; re-enabling reuses its persisted identity."""
         async with self._lock:
             meeting = self._sessions.get(session_id)
             if (
@@ -619,7 +615,7 @@ class MeetingManager:
                 return {"state": "idle"}
             if meeting.phase != "active":
                 return {"state": meeting.phase}
-            if state is None or state.closed:
+            if state is None or not state.enabled:
                 if meeting.publication is not None:
                     meeting.publication.close()
                 if meeting.driver is not None:

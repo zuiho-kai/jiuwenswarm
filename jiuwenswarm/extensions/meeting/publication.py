@@ -1,16 +1,11 @@
-"""Explicit native-agent publication adapter; not enabled by meeting startup yet.
-
-The host must supply a running coordinator and install one rail per member before
-using this adapter. Browser activation waits for the grant/playback integration.
-"""
+"""Meeting controls and playback wake-ups alongside SDK-owned Team messaging."""
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -27,16 +22,13 @@ from openjiuwen.core.single_agent.rail.base import (
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
-from .config import DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT
-from .prompts import SECTION_NAME, build_meeting_role_section, forwarding_contract, history_contract, summary_contract
+from .prompts import SECTION_NAME, build_meeting_role_section
 
 logger = logging.getLogger(__name__)
-_POST = "meeting_post_message"
+_SEND_TOOLS = frozenset({"send_message", "group_send_message"})
 _ADDRESSED = "meeting_set_addressed_members"
 _STREAMING = "_meeting_previous_streaming"
 _TURN = "_meeting_publication_turn"
-# send_message includes point-to-point, multicast, and broadcast variants.
-_BYPASS_TOOLS = frozenset({"send_message", "group_send_message", "ask_user_question"})
 # These runtimes do not mount the native member policy. Reject their creation
 # before it has side effects instead of allowing an uncoordinated speaker.
 _UNSUPPORTED_TOOLS = frozenset({
@@ -50,11 +42,6 @@ _ORG_OBSERVATION_TOOLS = frozenset({
     "org_get_leader_message", "org_list_leader_messages", "org_ack_leader_message",
     "org_view_child_tasks", "org_view_pending_reviews",
 })
-_CORRECTION = (
-    "Publish your answer with meeting_post_message(content, speech_text, mentions). "
-    "Generate complete text and a concise spoken summary together. "
-    "Do not answer with ordinary final text."
-)
 
 
 def _unsupported_tool(name: str) -> bool:
@@ -65,7 +52,7 @@ def _unsupported_tool(name: str) -> bool:
 class _PublicationTurn:
     # The SDK copies ctx.extra for parallel tool calls. Keep this one mutable
     # per-invocation value so successful admission is visible to the model hook.
-    queued_content: list[str] = field(default_factory=list)
+    queued: bool = False
 
 
 class MeetingSetAddressedMembersTool(TeamTool):
@@ -105,7 +92,7 @@ class MeetingSetAddressedMembersTool(TeamTool):
             return ToolOutput(success=False, error="member_names must be a list of at most 100 member names")
         try:
             state = await self.client.get_state()
-            if state is None or state.closed or state.leader_member_name != self.client.member_name:
+            if state is None or not state.enabled or state.leader_member_name != self.client.member_name:
                 raise ValueError("Only the active meeting Leader may change addressed members")
             names = sorted(set(names))
             for name in names:
@@ -126,7 +113,7 @@ class MeetingSetAddressedMembersTool(TeamTool):
 
 
 class _ScopedTool(TeamTool):
-    """Retained tool instances cannot publish after their adapter is removed."""
+    """Retained meeting controls stop working when their scope is removed."""
 
     def __init__(self, tool: TeamTool, owner: MeetingPublicationRail) -> None:
         super().__init__(deepcopy(tool.card))
@@ -135,23 +122,10 @@ class _ScopedTool(TeamTool):
         self.card.set_exposure_declared(True)
         self._tool = tool
         self._owner = owner
-        if self.card.name == _POST:
-            self.card.description += "\n\n" + summary_contract(owner.language)
-        elif self.card.name == "meeting_read_history":
-            self.card.description = history_contract(owner.language)
-            self.card.input_params["properties"]["limit"].update(
-                maximum=MAX_HISTORY_LIMIT, default=DEFAULT_HISTORY_LIMIT,
-            )
 
     async def invoke(self, inputs: dict[str, Any], **kwargs: Any) -> ToolOutput:
         if not self._owner.active:
             return ToolOutput(success=False, error="This meeting publication scope has ended")
-        if self.card.name == "meeting_read_history" and isinstance(inputs, dict):
-            limit = inputs.get("limit", DEFAULT_HISTORY_LIMIT)
-            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_HISTORY_LIMIT:
-                return ToolOutput(success=False, error=f"History limit must be an integer from 1 to {MAX_HISTORY_LIMIT}")
-            # The SDK still defaults to 50; always supply the meeting's default.
-            inputs = {**inputs, "limit": limit}
         if self.card.name == "meeting_interrupt_speech":
             if (
                 not isinstance(inputs, dict) or set(inputs) != {"expected_token"}
@@ -163,23 +137,14 @@ class _ScopedTool(TeamTool):
                 return ToolOutput(success=True, data=asdict(interruption) if interruption is not None else None)
             except (ValueError, RuntimeError, OSError, SQLAlchemyError) as exc:
                 return ToolOutput(success=False, error=str(exc))
-        result = await self._tool.invoke(inputs, **kwargs)
-        if self.card.name == _POST and result.success and self._owner.on_queued is not None:
-            try:
-                self._owner.on_queued()
-            except Exception:
-                # Admission has already committed. Preserve its receipt so the
-                # agent does not retry and enqueue another copy of the message.
-                logger.exception("Meeting consumer wake-up failed after queue admission")
-                result.data["audio_error"] = "meeting_consumer_unavailable"
-        return result
+        return await self._tool.invoke(inputs, **kwargs)
 
     def render_for_llm(self, output: Any) -> str:
         return self._tool.render_for_llm(output)
 
 
 class MeetingPublicationRail(DeepAgentRail):
-    """Gate native discussion output while preserving ordinary tools on removal.
+    """Attach meeting controls without replacing SDK send tools or their schemas.
 
     Construct via ``create_meeting_publication_rail``. This is intentionally an
     explicit capability, not a global patch to Team tools or SDK prompts.
@@ -202,8 +167,6 @@ class MeetingPublicationRail(DeepAgentRail):
         self._agent: Any = None
         self.system_prompt_builder: Any = None
         self._bootstrap: Any = None
-        self._send_card: ToolCard | None = None
-        self._send_settings: Any = None
         self.active = True
 
     def init(self, agent: Any) -> None:
@@ -220,14 +183,6 @@ class MeetingPublicationRail(DeepAgentRail):
             raise ValueError("This member runtime already has a meeting publication scope")
         self._agent = agent
         self.system_prompt_builder = builder
-        if self._leader:
-            self._send_card = agent.ability_manager.get("send_message")
-            if self._send_card is not None:
-                card = self._send_card
-                self._send_settings = (card.exposure, card.get_exposure_declared(), card.description)
-                card.exposure = ToolExposure.DIRECT
-                card.set_exposure_declared(True)
-                card.description = forwarding_contract(self.language)
         for tool in self._tools.values():
             agent.ability_manager.add_ability(tool.card, tool)
         builder.add_section(build_meeting_role_section(leader=self._leader))
@@ -238,11 +193,6 @@ class MeetingPublicationRail(DeepAgentRail):
             return
         for name in self._tools:
             agent.ability_manager.remove_ability(name)
-        if self._send_card is not None:
-            self._send_card.exposure, declared, self._send_card.description = self._send_settings
-            self._send_card.set_exposure_declared(declared)
-            self._send_card = None
-            self._send_settings = None
         if self.system_prompt_builder is not None:
             self.system_prompt_builder.remove_section(SECTION_NAME)
             if self._bootstrap is not None:
@@ -261,7 +211,7 @@ class MeetingPublicationRail(DeepAgentRail):
             state = await self._client.get_state()
         except (ValueError, RuntimeError, OSError, SQLAlchemyError):
             state = None
-        if not self.active or state is None or state.closed:
+        if not self.active or state is None or not state.enabled:
             # Callback exceptions are logged by the SDK and may be swallowed.
             # Use its explicit control signal to stop before the model executes.
             ctx.request_force_finish({
@@ -280,15 +230,9 @@ class MeetingPublicationRail(DeepAgentRail):
             ctx.inputs.tools = [
                 tool for tool in ctx.inputs.tools if not self._blocked_tool(tool.name)
             ]
-            if self._send_card is not None:
-                # It may have been deferred before this scope attached on the first call.
-                send = next(tool for tool in await ctx.agent.ability_manager.list_tool_info() if tool.name == "send_message")
-                ctx.inputs.tools = [tool for tool in ctx.inputs.tools if tool.name != "send_message"] + [send]
 
     def _blocked_tool(self, name: str) -> bool:
-        return _unsupported_tool(name) or (
-            name in _BYPASS_TOOLS and not (self._leader and name == "send_message")
-        )
+        return _unsupported_tool(name)
 
     async def after_model_call(self, ctx: AgentCallbackContext) -> None:
         if _STREAMING in ctx.extra:
@@ -306,7 +250,7 @@ class MeetingPublicationRail(DeepAgentRail):
         # This includes idle turns with nothing new to post.
         # Asking for another post here can duplicate an already queued message.
         ctx.request_force_finish({
-            "output": "", "result_type": "answer", "meeting_queued": bool(turn.queued_content),
+            "output": "", "result_type": "answer", "meeting_queued": turn.queued,
         })
 
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
@@ -314,36 +258,11 @@ class MeetingPublicationRail(DeepAgentRail):
             return
         inputs = ctx.inputs
         message = None
-        if inputs.tool_name == "send_message" and self._leader:
-            args = inputs.tool_args
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except ValueError:
-                    args = None
-            recipients = []
-            if isinstance(args, dict):
-                if "to" in args and "targets" not in args:
-                    recipients = [args["to"]]
-                elif "targets" in args and "to" not in args:
-                    recipients = args["targets"]
-            try:
-                state = await self._client.get_state()
-            except (ValueError, RuntimeError, OSError, SQLAlchemyError):
-                state = None
-            if (
-                not self.active or state is None or state.closed
-                or not isinstance(recipients, list) or not recipients
-                or any(not isinstance(name, str) or name.strip() in {"user", "*", state.leader_member_name}
-                       or name.strip() not in state.addressed_members for name in recipients)
-            ):
-                message = forwarding_contract(self.language)
-        elif self._blocked_tool(inputs.tool_name):
+        if self._blocked_tool(inputs.tool_name):
             message = (
                 "The host has already built this Team. Use the existing roster; do not call build_team again."
                 if inputs.tool_name == "build_team" else
                 "This runtime or cross-Team delivery is not supported during a coordinated native meeting."
-                if _unsupported_tool(inputs.tool_name) else _CORRECTION
             )
         if message is not None:
             # A model can still emit a hidden/cached tool name. Reject execution
@@ -355,12 +274,23 @@ class MeetingPublicationRail(DeepAgentRail):
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
         inputs = ctx.inputs
-        if not isinstance(inputs, ToolCallInputs) or inputs.tool_name != _POST or ctx.exception is not None:
+        if not isinstance(inputs, ToolCallInputs) or inputs.tool_name not in _SEND_TOOLS or ctx.exception is not None:
             return
         result = inputs.tool_result
-        if isinstance(result, ToolOutput) and result.success and result.data.get("speech_request"):
-            turn = ctx.extra[_TURN]
-            turn.queued_content.append(result.data["message"]["content"].strip())
+        if not isinstance(result, ToolOutput) or not result.success or not isinstance(result.data, dict):
+            return
+        # SDK send_message and group_send_message use different admission receipts.
+        # Direct sends, including omitted/null speech_text, never wake playback.
+        if result.data.get("type") != "queued" and result.data.get("queued") is not True:
+            return
+        ctx.extra.setdefault(_TURN, _PublicationTurn()).queued = True
+        if self.on_queued is not None:
+            try:
+                self.on_queued()
+            except Exception:
+                # Admission already committed. Preserve the SDK receipt so the
+                # caller does not retry a successful send and queue a duplicate.
+                logger.exception("Meeting consumer wake-up failed after queue admission")
 
 
 async def create_meeting_publication_rail(
@@ -376,7 +306,7 @@ async def create_meeting_publication_rail(
     exist before live agents can be switched to queued publication.
     """
     state = await coordinator.for_member(member_name).get_state()
-    if state is None or state.closed:
+    if state is None or not state.enabled:
         raise ValueError("An active meeting is required for publication tools")
     rail = MeetingPublicationRail(
         coordinator, member_name, leader=member_name == state.leader_member_name,
