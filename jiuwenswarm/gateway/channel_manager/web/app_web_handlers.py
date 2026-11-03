@@ -5131,7 +5131,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                     owned.pop(ownership_key, None)
                 elif getattr(ws, "_meeting_disconnected", False):
                     await _release_meeting(ws, target_session, user_id, startup_id)
-            elif ok:
+            elif ok and method != ReqMethod.MEETING_END:
                 owned.pop(ownership_key, None)
                 await forget_playback_routes(
                     ws, target_session, params.get("meeting_id") if method == ReqMethod.MEETING_END else None,

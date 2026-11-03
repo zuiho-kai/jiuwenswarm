@@ -51,6 +51,8 @@ class GatewayPlaybackRoute:
         self.tasks: dict[tuple, asyncio.Task] = {}
         self.tts = TtsSession(config)
         self.stops: dict[str, asyncio.Task] = {}
+        self.stop_receipts: dict[str, dict] = {}
+        self.shutdown_stop_id: str | None = None
         self.interrupted: set[str] = set()
         _routes[self.id] = self
 
@@ -116,6 +118,7 @@ class GatewayPlaybackRoute:
             stop_id = payload.get("stop_id")
             if not isinstance(stop_id, str) or not stop_id:
                 raise ValueError("Invalid playback stop identity")
+            self.shutdown_stop_id = stop_id
             if stop_id not in self.stops:
                 self.stops[stop_id] = asyncio.create_task(self.stop_media())
         elif event == "meeting.speech.stop":
@@ -192,6 +195,12 @@ def bind_playback_handlers(channel, agent_client):
                 routes = {}
                 setattr(ws, "_meeting_playback_routes", routes)
             route = routes.get((target, meeting_id))
+            if route is not None and route.revoked and (
+                route.shutdown_stop_id in route.stop_receipts
+                or any(outcome == "stopped" for outcome, _ in route.receipts.values())
+            ):
+                await forget_playback_routes(ws, target, meeting_id, startup_id=route.startup_id)
+                route = None
             if route is None:
                 route = GatewayPlaybackRoute(channel, ws, agent_client, target, meeting_id, owner, user_id, config, startup_id)
                 routes[(target, meeting_id)] = route
@@ -307,6 +316,8 @@ def bind_playback_handlers(channel, agent_client):
                 })
                 route.receipts[identity["playback_id"]] = (outcome, count)
                 route.pending_receipts.pop(identity["playback_id"], None)
+                if outcome == "stopped":
+                    getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
             await channel.send_response(ws, req_id, ok=True, payload=payload)
         except (ValueError, RuntimeError) as exc:
             await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_RESULT_FAILED")
@@ -318,11 +329,17 @@ def bind_playback_handlers(channel, agent_client):
             stop_id = params.get("stop_id")
             if stop_id not in route.stops:
                 raise ValueError("Unknown meeting playback stop")
+            if stop_id in route.stop_receipts:
+                await channel.send_response(ws, req_id, ok=True, payload=route.stop_receipts[stop_id])
+                return
             await asyncio.shield(route.stops[stop_id])
             payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_STOPPED, {
                 "meeting_id": route.meeting_id, "stop_id": stop_id,
             })
+            route.stop_receipts[stop_id] = payload
             await channel.send_response(ws, req_id, ok=True, payload=payload)
+            if route.revoked:
+                getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
         except (ValueError, RuntimeError) as exc:
             await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_STOP_FAILED")
 

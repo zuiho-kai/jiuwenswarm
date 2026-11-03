@@ -81,13 +81,7 @@ class BrowserPlaybackConsumer:
     async def speech_ready(self, request) -> None:
         if self._closing or request.scope != self.scope or not request.lease_token or request.source_message_id is None:
             raise ValueError("A matching granted speech request is required")
-        speaker = await self.driver.coordinator.get_speaker()
-        current = self.driver.state
-        if (
-            speaker is None or speaker.lease_token != request.lease_token
-            or current.phase != "awaiting_playback" or current.request is None
-            or current.request.lease_token != request.lease_token
-        ):
+        if not await self.driver.playback_is_current(request.scope, request.request_id, request.lease_token):
             return
         playback_id = self._request_ids.get(request.request_id)
         if playback_id is None:
@@ -122,11 +116,7 @@ class BrowserPlaybackConsumer:
         record = self._record(params)
         if self._closing or self._current != record.playback_id or record.playback_id in self._receipts or record.playback_id in self._interrupted:
             raise ValueError("Speech playback is no longer active")
-        speaker = await self.driver.coordinator.get_speaker()
-        if (
-            self.driver.state.phase != "awaiting_playback" or speaker is None
-            or speaker.request_id != record.request_id or speaker.lease_token != record.lease_token
-        ):
+        if not await self.driver.playback_is_current(self.scope, record.request_id, record.lease_token):
             raise ValueError("Speech lease is no longer active")
         index = params.get("chunk_index")
         if type(index) is not int or not 0 <= index < len(record.chunks):

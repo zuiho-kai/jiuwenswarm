@@ -12,6 +12,7 @@ from openjiuwen.agent_teams.meeting import (
     MeetingCoordinator,
     MeetingState,
 )
+from openjiuwen.agent_teams.schema.events import TeamEvent, TeamTopic
 
 from jiuwenswarm.common.config import get_config
 
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _Meeting:
     owner_id: str | None
-    phase: Literal["pending", "starting", "active", "closing", "cleanup_failed"]
+    phase: Literal["pending", "starting", "active", "disabled", "closing", "cleanup_failed"]
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     abandoned: bool = False
     backend: Any = None
@@ -38,6 +39,9 @@ class _Meeting:
     startup_id: str | None = None
     publication: MeetingPublicationSession | None = None
     driver: MeetingGrantDriver | None = None
+    disable_on_cleanup: bool = True
+    release_playback: bool = False
+    retiring: bool = False
 
 
 def _meeting_enabled() -> bool:
@@ -64,6 +68,10 @@ class MeetingManager:
         self._lock = asyncio.Lock()
         self._playback_ready_lock = asyncio.Lock()
         self._voice_registries: dict[str, tuple[Any, Any]] = {}
+        self._runtime_listeners: dict[str, tuple[Any, Callable]] = {}
+        self._queue_topics: dict[str, tuple[Any, str]] = {}
+        self._runtime_lock = asyncio.Lock()
+        self._stopped_sessions: set[str] = set()
         self._stopping = False
 
     async def prepare_browser_playback(
@@ -80,11 +88,14 @@ class MeetingManager:
                 meeting = self._require_publication_locked(session_id, meeting_id)
                 if meeting.owner_id != owner_id or meeting.startup_id != startup_id:
                     raise ValueError("Meeting playback is not owned by this connection/startup")
-                if meeting.driver is not None:
+                if not await self._refresh_enabled_locked(session_id, meeting):
+                    raise ValueError("Team meeting is no longer enabled")
+                if meeting.driver is not None and meeting.driver.consumer is not None:
                     consumer = meeting.driver.consumer
                     if (
                         not isinstance(consumer, BrowserPlaybackConsumer) or consumer.route_id != route_id
                         or consumer.config_revision != config_revision
+                        or meeting.driver.state.phase in {"closing", "closed"}
                     ):
                         raise ValueError("Meeting already has a different playback consumer")
                     return {"ready": True, "meeting_id": meeting_id}
@@ -102,7 +113,7 @@ class MeetingManager:
                     meeting.state.scope, voices, owner_id=owner_id, route_id=route_id,
                     config_revision=config_revision, emit=emit,
                 )
-            consumer.driver = await self.enable_grant_driver(session_id, meeting_id, consumer=consumer, voices=voices)
+            await self.enable_grant_driver(session_id, meeting_id, consumer=consumer, voices=voices)
             return {"ready": True, "meeting_id": meeting_id}
 
     async def browser_playback(self, session_id: str, meeting_id: str, owner_id: str, *, closing=False):
@@ -113,14 +124,17 @@ class MeetingManager:
             if (
                 not owner_id or meeting is None or meeting.state is None or meeting.owner_id != owner_id
                 or meeting.state.scope.meeting_id != meeting_id or meeting.driver is None
-                or meeting.phase not in ({"active", "closing", "cleanup_failed"} if closing else {"active"})
+                or meeting.phase not in ({"active", "disabled", "closing", "cleanup_failed"} if closing else {"active", "disabled", "closing"})
                 or not isinstance(meeting.driver.consumer, BrowserPlaybackConsumer)
             ):
                 raise ValueError("Meeting playback is not owned by this connection or no longer active")
-            if not closing and (not self._enabled() or not self._runtime_matches(session_id, meeting)):
+            if not closing and not self._runtime_matches(session_id, meeting):
                 self._begin_close_locked(session_id, meeting)
                 raise ValueError("Meeting playback runtime has ended")
-            return meeting.driver.consumer
+            consumer = meeting.driver.consumer
+        if not closing and not await self._driver_is_current(session_id, meeting):
+            raise ValueError("Team meeting is no longer enabled")
+        return consumer
 
     def publication_for_session(self, session_id: str, team_name: str) -> MeetingPublicationSession | None:
         """Resolve only the current native scope; ordinary sessions allocate nothing."""
@@ -130,10 +144,10 @@ class MeetingManager:
         if (
             meeting.phase != "active" or not self._enabled()
             or not self._runtime_matches(session_id, meeting)
+            or not meeting.backend.meeting_enabled
         ):
             meeting.publication.close()
-            if meeting.driver is not None and meeting.driver.state.phase not in {"closing", "closed"}:
-                meeting.driver.close()
+            if meeting.driver is not None:
                 self._spawn(self._driver_is_current(session_id, meeting))
             return None
         if meeting.state is None or meeting.state.scope.team_name != team_name:
@@ -181,7 +195,9 @@ class MeetingManager:
             if meeting.publication.on_queued != on_queued or meeting.publication.closed:
                 raise ValueError("Meeting publication already has a consumer")
             if voices is not None and meeting.publication.voices is not voices:
-                raise ValueError("Meeting publication already has a different voice registry")
+                if meeting.publication.voices is not None:
+                    raise ValueError("Meeting publication already has a different voice registry")
+                meeting.publication.voices = voices
             return meeting.publication
         team_agent = self._team_manager.get_team_agent(session_id)
         if getattr(getattr(team_agent, "spec", None), "spawn_mode", "inprocess") != "inprocess":
@@ -208,32 +224,37 @@ class MeetingManager:
         self, session_id: str, meeting_id: str, *, consumer: MeetingPlaybackConsumer,
         voices: MemberVoiceRegistry | None = None,
     ) -> MeetingGrantDriver:
-        """Attach a playback consumer before enabling native publication and grants."""
-        from .grant_driver import MeetingGrantDriver
+        """Attach audio to the already running Team queue consumer."""
+        from .playback import BrowserPlaybackConsumer
 
         async with self._lock:
             meeting = self._require_publication_locked(session_id, meeting_id)
-            if meeting.driver is not None:
+            if not await self._refresh_enabled_locked(session_id, meeting):
+                raise ValueError("Team meeting is no longer enabled")
+            if meeting.driver is not None and meeting.driver.consumer is not None:
                 if meeting.driver.consumer is not consumer or meeting.driver.state.phase in {"closing", "closed"}:
                     raise ValueError("Meeting grant driver already has a consumer")
                 if voices is not None and meeting.publication.voices is not voices:
                     raise ValueError("Meeting grant driver already has a different voice registry")
                 return meeting.driver
             assert meeting.coordinator is not None
-            state = await meeting.coordinator.get_state()
-            if state is None or not state.enabled or state.owner_request_id or state.interruption_id:
-                raise ValueError("Grant driver requires an open meeting without an existing lease or interruption")
-            driver = MeetingGrantDriver(
-                meeting.coordinator, consumer,
-                is_current=lambda: self._driver_is_current(session_id, meeting),
-            )
+            state = meeting.state
+            driver = meeting.driver
+            if driver is None:
+                raise ValueError("The Team queue consumer has not started")
+            if state.interruption_id:
+                raise ValueError("Resolve the retained interruption before attaching playback")
             await self._enable_publication_locked(
                 session_id, meeting, driver.wake, voices,
                 on_addressed_members=getattr(consumer, "addressed_members_changed", None),
                 on_interrupt=lambda member, token: driver.interrupt(token, leader=member),
             )
             meeting.driver = driver
-            driver.start()
+            # Bind the browser boundary before the worker can offer its first
+            # SDK grant, including work queued before playback became ready.
+            if isinstance(consumer, BrowserPlaybackConsumer):
+                consumer.driver = driver
+            await driver.attach_consumer(consumer)
             return driver
 
     async def prepare_human_input(self, session_id: str, meeting_id: str, owner_id: str, text: str) -> dict:
@@ -243,6 +264,8 @@ class MeetingManager:
             raise ValueError("Meeting transcript must contain 1-16000 characters")
         consumer = await self.browser_playback(session_id, meeting_id, owner_id)
         driver = consumer.driver
+        if not driver.audio_enabled:
+            return {}
         speaker = await driver.coordinator.get_speaker()
         if speaker is None:
             return {}
@@ -264,23 +287,39 @@ class MeetingManager:
             raise ValueError("Human input interruption is no longer current")
         return {"accepted": True}
 
+    async def _refresh_enabled_locked(self, session_id: str, meeting: _Meeting) -> bool:
+        """Reconcile SDK-owned lifecycle at playback boundaries, without polling."""
+        assert meeting.coordinator is not None
+        state = await meeting.coordinator.get_state()
+        if state is None or state.closed:
+            return False
+        meeting.state = state
+        if meeting.driver is not None:
+            meeting.driver.set_audio_enabled(state.enabled and self._enabled())
+        if not state.enabled and meeting.publication is not None:
+            meeting.publication.close()
+        return state.enabled
+
     async def _driver_is_current(self, session_id: str, meeting: _Meeting) -> bool:
         async with self._lock:
-            if self._sessions.get(session_id) is not meeting or meeting.phase != "active":
+            if self._sessions.get(session_id) is not meeting or meeting.retiring or meeting.phase in {"pending", "starting"}:
                 return False
-            if (
-                not self._enabled() or not self._runtime_matches(session_id, meeting)
-                or meeting.publication is None or meeting.publication.closed
-            ):
-                self._begin_close_locked(session_id, meeting)
+            if not self._runtime_matches(session_id, meeting):
                 return False
+            state = await meeting.coordinator.get_state()
+            if state is None or state.closed:
+                return False
+            meeting.state = state
+            meeting.driver.set_audio_enabled(state.enabled and self._enabled() and meeting.phase == "active")
+            if not state.enabled and meeting.publication is not None:
+                meeting.publication.close()
             return True
 
     async def _owned_driver(self, session_id: str, meeting_id: str, owner_id: str) -> MeetingGrantDriver | None:
         async with self._lock:
             meeting = self._sessions.get(session_id)
             if (
-                not owner_id or meeting is None or meeting.phase != "active" or meeting.state is None
+                not owner_id or meeting is None or meeting.phase not in {"active", "disabled", "closing"} or meeting.state is None
                 or meeting.state.scope.meeting_id != meeting_id or meeting.owner_id != owner_id
             ):
                 return None
@@ -343,6 +382,149 @@ class MeetingManager:
             return False
         return backend is meeting.backend
 
+    def team_runtime_ready(self, session_id: str) -> None:
+        """Register queue discovery once per Team activation, without creating a queue."""
+        if not self._stopping:
+            self._stopped_sessions.discard(session_id)
+            meeting = self._sessions.get(session_id)
+            if meeting is not None and meeting.phase == "pending":
+                meeting.ready.set()
+            self._spawn(self.attach_team_runtime(session_id))
+
+    async def attach_team_runtime(self, session_id: str, *, wake: bool = False) -> None:
+        from .grant_driver import MeetingGrantDriver
+
+        async with self._runtime_lock:
+            if self._stopping or session_id in self._stopped_sessions or not self._team_manager.is_runtime_active(session_id):
+                return
+            _, backend = self._team_backend(session_id)
+            agent = self._team_manager.get_team_agent(session_id)
+            listener = self._runtime_listeners.get(session_id)
+            if listener is None or listener[0] is not agent:
+                if listener is not None:
+                    listener[0].remove_event_listener(listener[1])
+
+                async def on_event(event) -> None:
+                    if event.payload.get("team_name") != backend.team_name:
+                        return
+                    if event.event_type == TeamEvent.MEETING_QUEUE_CHANGED:
+                        current = self._sessions.get(session_id)
+                        if current is not None and current.driver is not None and current.driver.started:
+                            current.driver.wake()
+                        else:
+                            self._spawn(self.attach_team_runtime(session_id, wake=True))
+                    elif event.event_type == TeamEvent.MEETING_STATE_CHANGED:
+                        self._spawn(self.attach_team_runtime(session_id))
+
+                agent.add_event_listener(on_event)
+                self._runtime_listeners[session_id] = (agent, on_event)
+            # Listen before the queue exists, so its first admission can create
+            # and wake the worker without a browser or a global runtime scan.
+            queue_topic = TeamTopic.MEETING_QUEUE.build(session_id, backend.team_name)
+            topic = self._queue_topics.get(session_id)
+            if topic != (backend.messager, queue_topic):
+                if topic is not None:
+                    await topic[0].unsubscribe(topic[1])
+                await backend.messager.subscribe(queue_topic, self._runtime_listeners[session_id][1])
+                self._queue_topics[session_id] = (backend.messager, queue_topic)
+            coordinator = await backend.get_meeting()
+            if coordinator is None:
+                old = self._sessions.get(session_id)
+                if old is not None and old.driver is not None:
+                    if old.publication is not None:
+                        old.publication.close()
+                    await old.driver.aclose()
+                    async with self._lock:
+                        if self._sessions.get(session_id) is old:
+                            self._sessions.pop(session_id)
+                return
+            state = await coordinator.get_state()
+            if state is None or state.closed:
+                return
+            old = self._sessions.get(session_id)
+            if old is not None and old.coordinator is not None and (
+                old.backend is not backend or old.coordinator.scope != coordinator.scope
+            ):
+                if old.publication is not None:
+                    old.publication.close()
+                if old.driver is not None:
+                    await old.driver.aclose()
+                async with self._lock:
+                    if self._sessions.get(session_id) is old:
+                        self._sessions.pop(session_id)
+            async with self._lock:
+                meeting = self._sessions.get(session_id)
+                if meeting is None:
+                    meeting = _Meeting(None, "active" if state.enabled else "disabled")
+                    meeting.backend, meeting.coordinator, meeting.state = backend, coordinator, state
+                    self._sessions[session_id] = meeting
+                if meeting.backend is not backend or meeting.coordinator is None:
+                    return
+                meeting.state = state
+                if meeting.driver is None:
+                    meeting.driver = MeetingGrantDriver(
+                        coordinator, is_current=lambda: self._driver_is_current(session_id, meeting),
+                    )
+                    if state.owner_request_id:
+                        request = await coordinator.get_request(state.owner_request_id)
+                        if request is not None:
+                            meeting.driver.recover_publication(request)
+                            wake = True
+                if not meeting.driver.started and not state.owner_request_id:
+                    # Start on actual queued work, not an empty enable/disable
+                    # notification. This also recovers backlog on runtime reload.
+                    wake = bool(await coordinator.list_pending())
+                meeting.driver.set_audio_enabled(state.enabled and self._enabled() and meeting.phase == "active")
+                if state.enabled and meeting.phase == "disabled":
+                    meeting.phase = "active"
+                    meeting.disable_on_cleanup = True
+                    meeting.release_playback = False
+                    meeting.driver.set_audio_enabled(self._enabled())
+                consumer = meeting.driver.consumer
+                if state.enabled and meeting.phase == "active" and consumer is not None and meeting.publication is None:
+                    await self._enable_publication_locked(
+                        session_id, meeting, meeting.driver.wake,
+                        voices=getattr(consumer, "voices", None),
+                        on_addressed_members=getattr(consumer, "addressed_members_changed", None),
+                        on_interrupt=lambda member, token: meeting.driver.interrupt(token, leader=member),
+                    )
+                if not state.enabled and meeting.phase == "active":
+                    meeting.disable_on_cleanup = False
+                    self._begin_close_locked(session_id, meeting)
+                if wake:
+                    meeting.driver.wake()
+
+    async def stop_team_runtime(self, session_id: str) -> None:
+        """Stop and await the queue worker before its Team backend is torn down."""
+        self._stopped_sessions.add(session_id)
+        async with self._runtime_lock:
+            listener = self._runtime_listeners.pop(session_id, None)
+            if listener is not None:
+                listener[0].remove_event_listener(listener[1])
+            topic = self._queue_topics.pop(session_id, None)
+            if topic is not None:
+                await topic[0].unsubscribe(topic[1])
+            async with self._lock:
+                meeting = self._sessions.get(session_id)
+                if meeting is None:
+                    return
+                if meeting.publication is not None:
+                    meeting.publication.close()
+                meeting.retiring = True
+                pending = [task for task in (meeting.initializing, meeting.task) if task is not None and not task.done()]
+                for task in pending:
+                    task.cancel()
+                driver = meeting.driver
+                if driver is not None:
+                    driver.close()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if driver is not None:
+                await driver.aclose()
+            async with self._lock:
+                if self._sessions.get(session_id) is meeting:
+                    self._sessions.pop(session_id)
+
     def _request_locked(
         self, session_id: str, owner_id: str | None, startup_id: str | None = None
     ) -> _Meeting:
@@ -363,6 +545,12 @@ class MeetingManager:
                 raise RuntimeError("Another connection owns this meeting")
             if startup_id is not None and meeting.startup_id not in (None, startup_id):
                 raise RuntimeError("Another startup already owns this meeting")
+            if meeting.phase == "disabled":
+                meeting.phase = "starting"
+                meeting.abandoned = False
+                meeting.disable_on_cleanup = True
+                meeting.release_playback = False
+                meeting.task = self._spawn(self._run_start(session_id, meeting))
             if meeting.phase == "active" and not self._runtime_matches(
                 session_id, meeting
             ):
@@ -447,7 +635,9 @@ class MeetingManager:
                     meeting.state = state
                     meeting.phase = "active"
                     activated = True
-                    return state
+            if activated:
+                await self.attach_team_runtime(session_id)
+                return state
             return None
         except TimeoutError:
             logger.info("Meeting startup timed out: session_id=%s", session_id)
@@ -457,7 +647,7 @@ class MeetingManager:
                 raise
             return None
         finally:
-            if not activated:
+            if not activated and not meeting.retiring:
                 # Cancellation is cooperative. Keep the session reserved while a
                 # dependency unwinds, even if it suppresses cancellation briefly.
                 initializing = meeting.initializing
@@ -484,7 +674,7 @@ class MeetingManager:
         if meeting.publication is not None:
             meeting.publication.close()
         if meeting.driver is not None:
-            meeting.driver.close()
+            meeting.driver.set_audio_enabled(False)
         if meeting.backend is None:
             self._sessions.pop(session_id)
             return None
@@ -493,27 +683,32 @@ class MeetingManager:
 
     async def _close(self, session_id: str, meeting: _Meeting) -> None:
         try:
-            if meeting.driver is not None:
-                await meeting.driver.aclose()
             # Enable may persist a row before its state-change notification fails.
             coordinator = meeting.coordinator or await meeting.backend.get_meeting()
-            if coordinator is not None:
+            if coordinator is not None and meeting.disable_on_cleanup:
                 disabled = await meeting.backend.disable_meeting(meeting_id=coordinator.scope.meeting_id)
                 if not disabled:
                     state = await coordinator.get_state()
-                    if state is not None and (state.enabled or state.flushing):
+                    if state is not None and state.enabled:
                         raise RuntimeError("Team meeting disable did not finish; retry cleanup")
+            if meeting.release_playback and meeting.driver is not None:
+                await meeting.driver.detach_consumer()
         except BaseException:
             async with self._lock:
                 meeting.phase = "cleanup_failed"
             raise
         async with self._lock:
             if self._sessions.get(session_id) is meeting:
-                self._sessions.pop(session_id)
+                meeting.phase = "disabled"
+                if meeting.release_playback:
+                    meeting.owner_id = None
+                    meeting.startup_id = None
+                meeting.publication = None
 
     def _release_locked(
         self, session_id: str, meeting: _Meeting
     ) -> asyncio.Task | None:
+        meeting.release_playback = True
         if meeting.phase in ("pending", "starting"):
             meeting.abandoned = True
             meeting.phase = "closing"
@@ -522,6 +717,8 @@ class MeetingManager:
                 meeting.initializing.cancel()
             return meeting.task
         if meeting.phase == "closing":
+            if meeting.driver is not None:
+                self._spawn(meeting.driver.detach_consumer())
             return meeting.task
         return self._begin_close_locked(session_id, meeting)
 
@@ -535,11 +732,15 @@ class MeetingManager:
             meeting = self._sessions.get(session_id)
             if meeting is None:
                 return True
+            if meeting.owner_id is None and (meeting.driver is None or meeting.driver.consumer is None):
+                return True
             if meeting.owner_id != owner_id:
                 return False
             if startup_id is not None and meeting.startup_id != startup_id:
                 return False
-            self._release_locked(session_id, meeting)
+            task = self._release_locked(session_id, meeting)
+        if task is not None:
+            await asyncio.shield(task)
         return True
 
     async def end(
@@ -551,7 +752,7 @@ class MeetingManager:
             if (
                 meeting is None
                 or meeting.state is None
-                or meeting.phase not in ("active", "closing", "cleanup_failed")
+                or meeting.phase not in ("active", "disabled", "closing", "cleanup_failed")
                 or meeting.state.scope.meeting_id != meeting_id
                 or (owner_id is not None and meeting.owner_id != owner_id)
             ):
@@ -605,7 +806,7 @@ class MeetingManager:
                 self._release_locked(session_id, meeting)
             if meeting.phase != "active":
                 return {
-                    "state": "starting" if meeting.phase == "pending" else meeting.phase
+                    "state": "starting" if meeting.phase == "pending" else "idle" if meeting.phase == "disabled" else meeting.phase
                 }
             coordinator = meeting.coordinator
         assert coordinator is not None
@@ -616,12 +817,13 @@ class MeetingManager:
             if meeting.phase != "active":
                 return {"state": meeting.phase}
             if state is None or not state.enabled:
+                meeting.disable_on_cleanup = False
                 if meeting.publication is not None:
                     meeting.publication.close()
                 if meeting.driver is not None:
                     self._begin_close_locked(session_id, meeting)
                     return {"state": "closing"}
-                self._sessions.pop(session_id)
+                meeting.phase = "disabled"
                 return {"state": "idle"}
             meeting.state = state
             return {
@@ -643,11 +845,10 @@ class MeetingManager:
 
     async def aclose(self) -> None:
         """Drain lifecycle work before the Team databases are shut down."""
-        async with self._lock:
-            self._stopping = True
-            for session_id, meeting in list(self._sessions.items()):
-                self._release_locked(session_id, meeting)
-            tasks = tuple(self._tasks)
+        self._stopping = True
+        for session_id in list(set(self._sessions) | set(self._runtime_listeners)):
+            await self.stop_team_runtime(session_id)
+        tasks = tuple(self._tasks)
         if tasks:
             await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
         if self._sessions:
@@ -674,6 +875,12 @@ def get_server_meeting_manager() -> MeetingManager:
 
         _server_manager = MeetingManager(get_team_manager())
     return _server_manager
+
+
+async def stop_meeting_runtime(session_id: str) -> None:
+    """Teardown an existing runtime without creating the global service."""
+    if _server_manager is not None:
+        await _server_manager.stop_team_runtime(session_id)
 
 
 async def close_server_meeting_manager() -> None:

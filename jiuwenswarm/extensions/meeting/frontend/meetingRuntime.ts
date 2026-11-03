@@ -299,6 +299,12 @@ export class MeetingSession {
       });
   }
 
+  resume(): void {
+    if (!this.active || this.disposed) throw new Error('disconnected');
+    this.paused = false;
+    this.startRecording();
+  }
+
   startRecording(): void {
     if (!this.active || !this.streamId || this.listening || this.resuming) return;
     this.resuming = true;

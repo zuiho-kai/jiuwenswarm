@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from openjiuwen.agent_teams.meeting import MeetingCoordinator
-from openjiuwen.agent_teams.schema.meeting import MeetingScope, SpeechInterruption, SpeechRequest
+from openjiuwen.agent_teams.schema.meeting import (
+    MeetingScope,
+    SpeechInterruption,
+    SpeechRequest,
+    SpeechRequestStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +57,10 @@ class MeetingGrantDriver:
     """
 
     def __init__(
-        self, coordinator: MeetingCoordinator, consumer: MeetingPlaybackConsumer, *,
+        self, coordinator: MeetingCoordinator, consumer: MeetingPlaybackConsumer | None = None, *,
         is_current: Callable[[], Awaitable[bool]],
     ) -> None:
-        if any(not callable(getattr(consumer, name, None)) for name in ("speech_ready", "speech_error", "stop")):
+        if consumer is not None and any(not callable(getattr(consumer, name, None)) for name in ("speech_ready", "speech_error", "stop", "interrupt")):
             raise ValueError("A playback consumer with ready, error, and stop callbacks is required")
         self.coordinator = coordinator
         self.consumer = consumer
@@ -71,10 +76,76 @@ class MeetingGrantDriver:
         self._audio_stopped = False
         self._input_admitted = False
         self._finished_interruptions: set[str] = set()
+        self._audio_enabled = True
+        self._detaching = False
+        self._attachment_lock = asyncio.Lock()
+        self._shutdown_phase: str | None = None
+        self._recovering = False
+
+    def set_audio_enabled(self, enabled: bool) -> None:
+        if self._audio_enabled != enabled:
+            self._audio_enabled = enabled
+            if self._task is not None:
+                self.wake()
+
+    def recover_publication(self, request: SpeechRequest) -> None:
+        if not request.lease_token or self._task is not None:
+            raise ValueError("Recovery requires an unstarted worker and a claimed request")
+        self._state = GrantDriverState("publication_failed", request)
+        self._retry_requested = True
+        self._recovering = True
+
+    async def attach_consumer(self, consumer: MeetingPlaybackConsumer) -> None:
+        if any(not callable(getattr(consumer, name, None)) for name in ("speech_ready", "speech_error", "stop", "interrupt")):
+            raise ValueError("A playback consumer with ready, error, stop, and interrupt callbacks is required")
+        async with self._attachment_lock, self._lock:
+            if self._closed or self._detaching or (self.consumer is not None and self.consumer is not consumer):
+                raise ValueError("Meeting queue already has a playback consumer or is stopping")
+            self.consumer = consumer
+            self._stopped = False
+            if self._task is not None:
+                self.wake()
+
+    async def detach_consumer(self) -> None:
+        """Explicit transport teardown; meeting disable only changes the audio gate."""
+        self._detaching = True
+        async with self._attachment_lock:
+            consumer = self.consumer
+            if consumer is None:
+                self._detaching = False
+                return
+            await consumer.stop()
+            async with self._lock:
+                request = self._state.request
+                if self._interruption is not None:
+                    if not await self.coordinator.resume_after_interruption(self._interruption.interruption_id):
+                        raise RuntimeError("Stopped interruption barrier could not be released")
+                    self._interruption = None
+                    self._state = GrantDriverState()
+                    request = None
+                if request is not None and self._state.phase != "publication_failed" and request.lease_token:
+                    interruption = await self.coordinator.interrupt_speech(expected_token=request.lease_token)
+                    if interruption is not None:
+                        if not await self.coordinator.resume_after_interruption(interruption.interruption_id):
+                            raise RuntimeError("Stopped speech interruption could not be released")
+                    self._state = GrantDriverState()
+                    self._interruption = None
+                self.consumer = None
+                self._detaching = False
+                if self._task is not None:
+                    self.wake()
 
     @property
     def state(self) -> GrantDriverState:
         return self._state
+
+    @property
+    def started(self) -> bool:
+        return self._task is not None
+
+    @property
+    def audio_enabled(self) -> bool:
+        return self._audio_enabled
 
     @property
     def pending_interruption(self) -> SpeechInterruption | None:
@@ -83,18 +154,21 @@ class MeetingGrantDriver:
     def start(self) -> None:
         if self._closed:
             raise ValueError("This grant driver has ended")
-        if self._task is None:
-            self._task = asyncio.create_task(self._run(), name=f"meeting-grants-{self.coordinator.scope.meeting_id}")
         self.wake()
 
     def wake(self) -> None:
         if not self._closed:
+            if self._task is None:
+                self._task = asyncio.create_task(self._run(), name=f"meeting-grants-{self.coordinator.scope.meeting_id}")
+            if self._state.phase == "publication_failed":
+                self._retry_requested = True
             self._wake.set()
 
     def close(self) -> None:
         """Revoke immediately; aclose drains work before the manager closes the DB scope."""
         if self._closed:
             return
+        self._shutdown_phase = self._state.phase
         self._closed = True
         self._state = GrantDriverState("closing", self._state.request)
         if self._task is not None and self._task is not asyncio.current_task():
@@ -107,9 +181,18 @@ class MeetingGrantDriver:
         # Drain a completion already in progress before stopping playback and
         # letting the manager close the coordinator/database resources.
         async with self._lock:
-            if not self._stopped:
+            if self.consumer is not None and not self._stopped:
                 await self.consumer.stop()
                 self._stopped = True
+            request = self._state.request
+            if request is not None and request.lease_token and self._shutdown_phase not in {"publication_failed", "publishing"}:
+                interruption = await self.coordinator.interrupt_speech(expected_token=request.lease_token)
+                if interruption is not None:
+                    await self.coordinator.resume_after_interruption(interruption.interruption_id)
+            if self._interruption is not None:
+                await self.coordinator.resume_after_interruption(self._interruption.interruption_id)
+                self._interruption = None
+            self.consumer = None
             self._state = GrantDriverState("closed", self._state.request, "meeting_closed")
 
     def _matches(self, scope: MeetingScope, request_id: str, lease_token: str) -> bool:
@@ -117,6 +200,19 @@ class MeetingGrantDriver:
         return bool(
             not self._closed and scope == self.coordinator.scope and request is not None
             and request.request_id == request_id and lease_token and request.lease_token == lease_token
+        )
+
+    async def playback_is_current(self, scope: MeetingScope, request_id: str, lease_token: str) -> bool:
+        """Authorize audio against both local playback and the SDK's current lease."""
+        if not await self._is_current():
+            return False
+        speaker = await self.coordinator.get_speaker()
+        # Recheck local state after the SDK read: interruption/teardown may have
+        # completed while it was in flight. Reading never grants or republishes.
+        return bool(
+            self._state.phase == "awaiting_playback" and self._matches(scope, request_id, lease_token)
+            and speaker is not None and speaker.scope == scope
+            and speaker.request_id == request_id and speaker.lease_token == lease_token
         )
 
     async def complete_playback(self, scope: MeetingScope, request_id: str, lease_token: str) -> bool:
@@ -140,7 +236,7 @@ class MeetingGrantDriver:
         async with self._lock:
             if not self._matches(scope, request_id, lease_token) or self._state.phase != "awaiting_playback":
                 return False
-            if advance:
+            if advance or self._detaching or not self._audio_enabled:
                 # The owner reported failed audio and Gateway drained synthesis.
                 # Revoke as interrupted, never falsely acknowledge it as played.
                 interruption = await self.coordinator.interrupt_speech(expected_token=lease_token)
@@ -176,7 +272,7 @@ class MeetingGrantDriver:
         async with self._lock:
             request = self._state.request
             if (
-                self._closed or request is None or request.lease_token != expected_token
+                self._closed or self.consumer is None or request is None or request.lease_token != expected_token
                 or self._interruption is not None or self._state.phase not in {"awaiting_playback", "publication_failed"}
             ):
                 return None
@@ -208,6 +304,8 @@ class MeetingGrantDriver:
         return interruption
 
     async def input_admitted(self, interruption_id: str) -> bool:
+        if not await self._is_current():
+            return False
         async with self._lock:
             if self._closed:
                 return False
@@ -231,7 +329,7 @@ class MeetingGrantDriver:
         self.wake()
 
     async def _report_error(self) -> None:
-        if self._closed:
+        if self._closed or self.consumer is None:
             return
         try:
             await self.consumer.speech_error(self._state.request, self._state.error or "coordination_failed")
@@ -250,11 +348,12 @@ class MeetingGrantDriver:
                 return
             self._retry_requested = False
             self._state = GrantDriverState("publishing", current.request)
+            playback_ready = self.consumer is not None and self._audio_enabled and not self._detaching and not self._recovering
             if retry:
                 assert current.request is not None and current.request.lease_token
-                request = await self.coordinator.retry_publication(current.request.lease_token)
+                request = await self.coordinator.retry_publication(current.request.lease_token, playback_ready=playback_ready)
             else:
-                request = await self.coordinator.grant_next()
+                request = await self.coordinator.grant_next(playback_ready=playback_ready)
             if self._closed:
                 return
             if request is None:
@@ -264,20 +363,47 @@ class MeetingGrantDriver:
                     GrantDriverState("coordination_failed", current.request, "lease_unavailable")
                     if retry else GrantDriverState()
                 )
+            elif (
+                request.scope != self.coordinator.scope
+                or request.status not in {SpeechRequestStatus.GRANTED, SpeechRequestStatus.PUBLISHING, SpeechRequestStatus.TEXT_ONLY}
+                or (retry and (
+                    request.request_id != current.request.request_id
+                    or (request.status != SpeechRequestStatus.TEXT_ONLY and request.lease_token != current.request.lease_token)
+                ))
+            ):
+                self._state = GrantDriverState("coordination_failed", current.request, "invalid_speech_grant")
+            elif (
+                request.status == SpeechRequestStatus.TEXT_ONLY and request.lease_token is None
+                and request.source_message_id is not None and not request.delivery_error
+            ):
+                # The SDK published and completed a text-only dequeue. There
+                # was no audio lease to acknowledge or speech to replay later.
+                self._state = GrantDriverState()
+                self._recovering = False
+                self.wake()
+            elif not request.lease_token:
+                self._state = GrantDriverState("coordination_failed", request, "invalid_speech_grant")
             elif request.delivery_error or request.message_error or request.source_message_id is None:
                 self._state = GrantDriverState(
                     "publication_failed", request,
                     request.delivery_error or request.message_error or "source_message_unavailable",
                 )
+            elif request.status != SpeechRequestStatus.GRANTED or not playback_ready:
+                self._state = GrantDriverState("coordination_failed", request, "invalid_speech_grant")
             else:
                 self._state = GrantDriverState("awaiting_playback", request)
         if self._state.error:
             await self._report_error()
-        elif request is not None and not self._closed and await self._is_current():
+        elif self._state.phase == "awaiting_playback" and request is not None and not self._closed and await self._is_current():
+            consumer = self.consumer
+            if consumer is None or self._state.phase != "awaiting_playback" or not self._matches(
+                request.scope, request.request_id, request.lease_token,
+            ):
+                return
             try:
                 # Do not hold the lock across consumer code: a controlled consumer
                 # may acknowledge actual completion within this callback.
-                await self.consumer.speech_ready(request)
+                await consumer.speech_ready(request)
             except Exception:
                 logger.exception("Meeting playback delivery failed for %s", request.request_id)
                 failed = False
