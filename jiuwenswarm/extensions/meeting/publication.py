@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
@@ -16,6 +17,7 @@ from openjiuwen.core.foundation.llm import ToolMessage
 from openjiuwen.core.foundation.tool import ToolCard, ToolExposure
 from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackContext,
+    AgentCallbackEvent,
     ModelCallInputs,
     ToolCallInputs,
 )
@@ -152,6 +154,10 @@ class MeetingPublicationRail(DeepAgentRail):
 
     priority = 950
 
+    def callback_priority(self, event: AgentCallbackEvent) -> int:
+        # Apply meeting prompt/schema changes after the SDK Team policies.
+        return 0 if event == AgentCallbackEvent.BEFORE_MODEL_CALL else self.priority
+
     def __init__(
         self, coordinator: MeetingCoordinator, member_name: str, *, leader: bool,
         language: str = "en", on_queued: Callable[[], None] | None = None,
@@ -236,12 +242,16 @@ class MeetingPublicationRail(DeepAgentRail):
                         continue
                     if "speech_text" not in tool.parameters.get("properties", {}):
                         continue
-                    # Tool definitions are request-local: retain the SDK's routing,
-                    # optional silent sends, and original card after meeting exit.
+                    # Require teammate speech on this request without changing
+                    # the SDK's original tool card or recipient routing.
                     scoped = deepcopy(tool)
-                    scoped.parameters["properties"]["speech_text"]["description"] = (
-                        teammate_speech_guidance(self.language)
-                    )
+                    scoped.parameters["properties"]["speech_text"].update({
+                        "type": "string", "minLength": 1,
+                        "description": teammate_speech_guidance(self.language),
+                    })
+                    required = scoped.parameters.setdefault("required", [])
+                    if "speech_text" not in required:
+                        required.append("speech_text")
                     ctx.inputs.tools[index] = scoped
 
     def _blocked_tool(self, name: str) -> bool:
@@ -277,6 +287,19 @@ class MeetingPublicationRail(DeepAgentRail):
                 if inputs.tool_name == "build_team" else
                 "This runtime or cross-Team delivery is not supported during a coordinated native meeting."
             )
+        elif not self._leader and inputs.tool_name in _SEND_TOOLS:
+            arguments = inputs.tool_args
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    arguments = None
+            speech = arguments.get("speech_text") if isinstance(arguments, dict) else None
+            if not isinstance(speech, str) or not speech.strip():
+                message = (
+                    "Every teammate meeting message requires nonempty speech_text in the same call as content. "
+                    "Provide its spoken version in 1-2 sentences and at most 50 words."
+                )
         if message is not None:
             # A model can still emit a hidden/cached tool name. Reject execution
             # rather than relying on the tool list or prompt for enforcement.

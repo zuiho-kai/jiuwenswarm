@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy.exc import SQLAlchemyError
 
 from openjiuwen.agent_teams.meeting import MeetingCoordinator
-from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ModelCallInputs
+from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentCallbackEvent, ModelCallInputs
 from openjiuwen.harness.rails.base import DeepAgentRail
 
 from .publication import MeetingPublicationRail, create_meeting_publication_rail
@@ -104,6 +104,9 @@ class MeetingParticipantRail(DeepAgentRail):
     # Reconcile after SDK Team policy/tool rails so bootstrap removal and
     # meeting controls apply to the model's final prompt and tool list.
     priority = MeetingPublicationRail.priority
+
+    def callback_priority(self, event: AgentCallbackEvent) -> int:
+        return 0 if event == AgentCallbackEvent.BEFORE_MODEL_CALL else self.priority
 
     def __init__(
         self, session_id: str, team_name: str, member_name: str, *, language: str = "en",

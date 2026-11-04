@@ -364,16 +364,17 @@ class MeetingManager:
             self._team_manager.get_team_agent(session_id), "team_backend", None
         )
         if (
-            not team_name
-            or not self._team_manager.is_runtime_active(session_id)
+            session_id in self._stopped_sessions
             or backend is None
-            or backend.team_name != team_name
+            or (team_name is not None and backend.team_name != team_name)
             or backend.group_session_id != session_id
         ):
             raise RuntimeError(
-                "An active Team is required to start a meeting"
+                "An existing Team runtime is required to start a meeting"
             )
-        return team_name, backend
+        # Request-round markers can be cleared while the retained Team still
+        # owns its meeting, queued messages, and browser playback.
+        return backend.team_name, backend
 
     def _runtime_matches(self, session_id: str, meeting: _Meeting) -> bool:
         try:
@@ -422,9 +423,12 @@ class MeetingManager:
         from .grant_driver import MeetingGrantDriver
 
         async with self._runtime_lock:
-            if self._stopping or session_id in self._stopped_sessions or not self._team_manager.is_runtime_active(session_id):
+            if self._stopping or session_id in self._stopped_sessions:
                 return
-            _, backend = self._team_backend(session_id)
+            try:
+                _, backend = self._team_backend(session_id)
+            except RuntimeError:
+                return
             agent = self._team_manager.get_team_agent(session_id)
             listener = self._runtime_listeners.get(session_id)
             if listener is None or listener[0] is not agent:
@@ -598,7 +602,7 @@ class MeetingManager:
         return meeting
 
     async def start(self, session_id: str) -> MeetingState:
-        """Wait for startup on an already active Team without owning its task."""
+        """Wait for startup on an existing Team without owning its task."""
         async with self._lock:
             if not session_id or not session_id.strip():
                 raise ValueError("Meeting session ID must be non-empty")
