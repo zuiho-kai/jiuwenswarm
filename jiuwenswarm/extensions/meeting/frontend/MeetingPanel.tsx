@@ -60,7 +60,10 @@ export function MeetingPanel({ sessionId }: { sessionId: string | null }) {
                 <dd className="text-sm text-text" data-testid="team-area-meeting-playback">
                   {snapshot.playback === 'idle'
                     ? t('meeting.panel.noSpeaker')
-                    : t(`meeting.playback.${snapshot.playback}`, { speaker: snapshot.speaker, voice: snapshot.voice })}
+                    : t(`meeting.playback.${snapshot.playback}`, {
+                        speaker: snapshot.speaker,
+                        voice: snapshot.voice,
+                      })}
                 </dd>
               </div>
             </dl>
@@ -94,9 +97,10 @@ export function MeetingPanel({ sessionId }: { sessionId: string | null }) {
               </button>
             </div>
 
-            {state === 'cleanup_failed' && (
+            {(state === 'cleanup_failed' || state === 'failed') && (
               <p className="text-sm text-warn" role="alert" data-testid="team-area-meeting-cleanup-error">
-                {t('meeting.errors.cleanupFailed')}
+                {t(state === 'cleanup_failed' ? 'meeting.errors.cleanupFailed' : 'meeting.errors.meetingStartFailed')}
+                {snapshot.error ? ` ${t(`meeting.errors.${snapshot.error}`, { defaultValue: snapshot.error })}` : ''}
               </p>
             )}
           </>

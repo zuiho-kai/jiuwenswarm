@@ -11,7 +11,8 @@ _ROLE = {
         "A meeting is enabled on this Team. Use the existing send_message tool, or "
         "group_send_message when available, following their normal recipient and dispatch rules. "
         "Use content for the complete message and speech_text for its spoken version in the same call. "
-        "Keep speech_text to 1-2 sentences and at most 50 words, in the same language as content. "
+        "Aim for 1-2 short sentences and roughly 50 characters in speech_text, in the same language as content. "
+        "This is a soft length target; exceed it when needed to preserve the meaning. "
         "Preserve the main point, uncertainty, requested action, and essential question details. "
         "Keep detailed material in content; do not read code, tables, file paths, or URLs aloud. "
         "Queued content reaches its Team recipients when the SDK grants the turn. A queue receipt "
@@ -22,7 +23,8 @@ _ROLE = {
     "cn": (
         "当前 Team 已启用会议。使用现有 send_message，或在可用时使用 group_send_message，"
         "遵循工具原有的接收者和分发规则。在同一次调用中，用 content 提供完整正文，"
-        "用 speech_text 提供口述版本。speech_text 限 1-2 句话、最多 50 个词，与 content 保持同一语言，"
+        "用 speech_text 提供口述版本。speech_text 以 1-2 句短句、约 50 个字符为目标，与 content 保持同一语言。"
+        "这是长度软性目标，必要时可超出以保留原意。"
         "保留要点、不确定性、所需行动及问题关键细节。详细内容放在 content，"
         "不要朗读代码、表格、文件路径或链接。"
         "排队正文在 SDK 授予发言权时才投递给 Team 接收者；排队回执不代表投递或播放完成。"
@@ -36,6 +38,10 @@ _LEADER = {
         "from the current roster and forward the message with send_message, using to or targets "
         "as supported. Preserve the original message, making only changes necessary for the "
         "recipient to understand the request. Omit speech_text from that forwarding call. "
+        "Before forwarding, call meeting_set_addressed_members(member_names=[...]) with the addressed "
+        "agents' roster names to set speaking priority. Keep them selected while their replies are pending, "
+        "replace the list when focus changes, and clear it with member_names=[] when the exchange finishes "
+        "or is abandoned. A forwarding receipt alone does not finish the exchange. "
         "Let the addressed agent reply without narrating the handoff. "
         "If the intended recipient is ambiguous, ask for clarification. "
         "For messages you author yourself, include speech_text under the meeting speech rules."
@@ -43,6 +49,9 @@ _LEADER = {
     "cn": (
         "\n\n用户消息明确点名其他代理时，根据当前名册确定接收者，通过 send_message "
         "使用工具支持的 to 或 targets 转发消息。保留原始消息，仅在接收者理解请求所必需时修改。"
+        "转发前，用被点名代理的名册名称调用 meeting_set_addressed_members(member_names=[...]) 设置发言优先级。"
+        "回复仍待完成时保留选中状态，焦点变化时更新名单，交流结束或被放弃时用 member_names=[] 清空。"
+        "仅收到转发回执不代表交流已完成。"
         "该转发调用不提供 speech_text。让被点名代理回复，不要口头宣布转交。"
         "接收者有歧义时先澄清。你自己撰写的消息必须按会议发言规则提供 speech_text。"
     ),
@@ -51,14 +60,16 @@ _TEAMMATE_SPEECH = {
     "en": (
         "Every send_message or group_send_message call in this meeting must include speech_text "
         "as a nonempty string alongside content, regardless of recipient or purpose. "
-        "Keep speech_text to 1-2 sentences and at most 50 words, in the same language as content. "
+        "Aim for 1-2 short sentences and roughly 50 characters in speech_text, in the same language as content. "
+        "This is a soft length target; exceed it when needed to preserve the meaning. "
         "Speak the core message, preserving essential uncertainty and requested actions; "
         "keep detailed material in content."
     ),
     "cn": (
         "当前会议中，每次 send_message 或 group_send_message 调用都必须在提供 content 的同时，"
         "提供非空字符串 speech_text，无论接收者或消息用途是什么。"
-        "speech_text 限 1-2 句话、最多 50 个词，与 content 保持同一语言。"
+        "speech_text 以 1-2 句短句、约 50 个字符为目标，与 content 保持同一语言。"
+        "这是长度软性目标，必要时可超出以保留原意。"
         "口述核心信息，保留必要的不确定性和所需行动；详细内容放在 content。"
     ),
 }

@@ -298,7 +298,7 @@ class MeetingPublicationRail(DeepAgentRail):
             if not isinstance(speech, str) or not speech.strip():
                 message = (
                     "Every teammate meeting message requires nonempty speech_text in the same call as content. "
-                    "Provide its spoken version in 1-2 sentences and at most 50 words."
+                    "Aim for 1-2 short sentences and roughly 50 characters, exceeding that soft target when needed."
                 )
         if message is not None:
             # A model can still emit a hidden/cached tool name. Reject execution

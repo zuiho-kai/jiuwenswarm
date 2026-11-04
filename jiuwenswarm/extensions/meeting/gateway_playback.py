@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 from uuid import uuid4
 import weakref
 
@@ -18,6 +19,7 @@ from jiuwenswarm.gateway.voice.tts import TtsSession
 from .playback import IDENTITY_FIELDS
 
 _routes = weakref.WeakValueDictionary()
+logger = logging.getLogger(__name__)
 
 
 def config_revision(config: TtsConfig) -> str:
@@ -206,10 +208,17 @@ async def playback_ready(channel, agent_client, ws, req_id, params, session_id, 
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        from jiuwenswarm.common.utils import mask_sensitive
+
+        message = mask_sensitive(str(exc).strip() or type(exc).__name__)
+        logger.exception(
+            "Meeting playback preparation failed: session_id=%s meeting_id=%s startup_id=%s request_id=%s route_created=%s error=%s",
+            target, meeting_id, startup_id, req_id, created, message,
+        )
         if created:
             await route.stop_media()
             await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
-        await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_UNAVAILABLE")
+        await channel.send_response(ws, req_id, ok=False, error=message, code="MEETING_PLAYBACK_UNAVAILABLE")
 
 
 async def synthesize_speech(channel, ws, req_id, params, session_id, user_id=None):

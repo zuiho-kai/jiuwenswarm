@@ -14,7 +14,10 @@ import './TaskMeetingAction.css';
 export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTaskInputActionProps) {
   const { t } = useTranslation();
   const enabled = useTeamMeetingEnabled();
-  const { tooltip, handlers: tooltipHandlers } = useAdaptiveTooltip({ placement: 'top', multiline: true });
+  const { tooltip, handlers: tooltipHandlers } = useAdaptiveTooltip({
+    placement: 'top',
+    multiline: true,
+  });
   const snapshot = useMeetingSnapshot();
   const active = snapshot.sessionId === sessionId;
   const requested = active && snapshot.enabled;
@@ -70,13 +73,17 @@ export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTask
       : '';
   const playbackStatus =
     status === 'active' && snapshot.playback !== 'idle'
-      ? t(`meeting.playback.${snapshot.playback}`, { speaker: snapshot.speaker, voice: snapshot.voice })
+      ? t(`meeting.playback.${snapshot.playback}`, {
+          speaker: snapshot.speaker,
+          voice: snapshot.voice,
+        })
       : '';
   const statusDescription = [
     `${t('meeting.panel.title')}: ${t(`meeting.panel.states.${status}`)}`,
     title,
     activationError,
     status === 'cleanup_failed' ? t('meeting.errors.cleanupFailed') : '',
+    status === 'cleanup_failed' ? snapshot.error : '',
     playbackStatus,
   ]
     .filter(Boolean)
@@ -128,6 +135,7 @@ export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTask
           {status === 'cleanup_failed' && (
             <span className="sr-only" role="status" data-testid="chat-panel-meeting-cleanup-error">
               {t('meeting.errors.cleanupFailed')}
+              {snapshot.error ? ` ${snapshot.error}` : ''}
             </span>
           )}
           {status === 'active' && snapshot.playback !== 'idle' && (

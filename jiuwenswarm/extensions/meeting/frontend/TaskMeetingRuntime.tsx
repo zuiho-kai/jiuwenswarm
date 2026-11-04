@@ -7,15 +7,17 @@ import { webClient } from '../../../channels/web/frontend/src/services/webClient
 import { useSessionStore } from '../../../channels/web/frontend/src/stores/sessionStore';
 import { toast } from '../../../channels/web/frontend/src/components/ui/Toast/toastStore';
 import { MeetingSession, type MeetingContext } from './meetingRuntime';
-import { publishMeeting, registerMeetingController, useMeetingSnapshot } from './taskMeetingStore';
+import { meetingErrorDetails, publishMeeting, registerMeetingController, useMeetingSnapshot } from './taskMeetingStore';
 
 type ServerMeeting = {
   state: 'idle' | 'starting' | 'active' | 'closing' | 'cleanup_failed' | 'failed';
   meeting_id?: string;
   conversation_mode?: string;
   error?: string;
+  activation_error?: string;
   team_exists: boolean;
   enabled: boolean;
+  addressed_members?: string[];
 };
 
 type ActiveMeeting = {
@@ -67,6 +69,7 @@ async function enableServerMeeting(active: ActiveMeeting): Promise<string> {
       enabled: server.enabled,
       teamExists: server.team_exists,
       meetingId: server.meeting_id,
+      addressedMembers: server.addressed_members ?? [],
     });
     return server.meeting_id;
   } finally {
@@ -140,6 +143,8 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         playback: 'idle',
         speaker: '',
         voice: '',
+        addressedMembers: server.addressed_members ?? [],
+        error: undefined,
       });
     };
     active.endingRelease = release;
@@ -154,25 +159,31 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
           },
           { timeoutMs: 25000 },
         );
-        if (result.state !== 'idle') throw new Error('cleanupPending');
+        if (result.state !== 'idle') throw new Error(result.error || 'cleanupPending');
         finish(result);
-      } catch {
+      } catch (error) {
         // Disabled state alone does not prove that a transport release finished.
         let settled: ServerMeeting | undefined;
+        let detail = error instanceof Error ? error.message : undefined;
         try {
           const status = await webClient.request<ServerMeeting>(release ? 'meeting.release' : 'meeting.status', {
             session_id: active.sessionId,
             startup_id: active.startupId,
           });
           if (status.state === 'idle') settled = status;
-        } catch {
-          /* Keep the explicit cleanup retry available. */
+          else detail = meetingErrorDetails(detail, status.activation_error, status.error);
+        } catch (retryError) {
+          detail = meetingErrorDetails(detail, retryError instanceof Error ? retryError.message : undefined);
         }
         if (settled) finish(settled);
         else if (current.current === active) {
-          publishMeeting({ state: 'cleanup_failed' });
+          const message = meetingErrorDetails(active.error, detail);
+          publishMeeting({ state: 'cleanup_failed', error: message });
           if (mounted.current)
-            toast.open({ content: translator.current('meeting.errors.cleanupFailed'), variant: 'error' });
+            toast.open({
+              content: meetingErrorDetails(translator.current('meeting.errors.cleanupFailed'), message),
+              variant: 'error',
+            });
         }
       } finally {
         active.ending = undefined;
@@ -206,7 +217,10 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         })
         .catch((error) => {
           if (visibleSession.current === sessionId)
-            publishMeeting({ state: 'failed', error: error instanceof Error ? error.message : 'cleanupFailed' });
+            publishMeeting({
+              state: 'failed',
+              error: error instanceof Error ? error.message : 'cleanupFailed',
+            });
         });
       return;
     }
@@ -230,7 +244,12 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
           await previous.ending;
           if (current.current !== previous || previous.cancellation.signal.aborted) return;
           if (!previous.disabled) {
-            if (previous.playbackReady) publishMeeting({ state: 'active', sessionId: id, error: undefined });
+            if (previous.playbackReady)
+              publishMeeting({
+                state: 'active',
+                sessionId: id,
+                error: undefined,
+              });
             return;
           }
           publishMeeting({ state: 'starting', sessionId: id });
@@ -241,9 +260,10 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
             previous.meeting.resume();
             publishMeeting({ state: 'active' });
           } catch (error) {
+            previous.error = error instanceof Error ? error.message : 'meetingStartFailed';
             previous.meeting.stop();
             await endServer(previous);
-            if (!previous.cancelled) throw error;
+            if (!previous.cancelled && current.current !== previous) throw error;
           }
           return;
         } finally {
@@ -283,7 +303,11 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
           const unexpected = !cancellation.signal.aborted && !!active.error;
           void endServer(active).then(() => {
             if (unexpected && mounted.current && !current.current && visibleSession.current === id) {
-              publishMeeting({ state: 'failed', sessionId: id, error: active.error });
+              publishMeeting({
+                state: 'failed',
+                sessionId: id,
+                error: active.error,
+              });
             }
           });
         },
@@ -310,23 +334,20 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         active.meetingId = meetingId;
         await meeting.start();
         if (mounted.current && current.current === active && !cancellation.signal.aborted) {
-          try {
-            await meeting.activatePlayback(meetingId, startupId);
-          } catch {
-            throw new Error('playbackUnavailable');
-          }
+          await meeting.activatePlayback(meetingId, startupId);
           if (current.current !== active || cancellation.signal.aborted) return;
           active.playbackReady = true;
           publishMeeting({ state: 'active' });
         }
       } catch (error) {
+        active.error = error instanceof Error ? error.message : 'meetingStartFailed';
         if (error instanceof Error && /Another (connection|startup)/.test(error.message)) {
           cancellation.abort();
           if (current.current === active) current.current = null;
         }
         meeting.stop();
         await endServer(active);
-        if (!active.cancelled) throw error;
+        if (!active.cancelled && current.current !== active) throw error;
       }
     },
     [context, enabled, endServer, t],
@@ -366,6 +387,7 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
       state: 'idle',
       error: undefined,
       meetingId: undefined,
+      addressedMembers: [],
     });
     if (!enabled || !sessionId || sessionId === 'new') return;
     let cancelled = false;
@@ -383,10 +405,18 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
     };
     const reflect = async (server: ServerMeeting) => {
       if (cancelled) return;
-      publishMeeting({ teamExists: server.team_exists, enabled: server.enabled, meetingId: server.meeting_id });
+      publishMeeting({
+        teamExists: server.team_exists,
+        enabled: server.enabled,
+        meetingId: server.meeting_id,
+        addressedMembers: server.addressed_members ?? [],
+      });
       const local = current.current?.sessionId === sessionId ? current.current : null;
       if (server.state === 'failed' || server.state === 'cleanup_failed') {
-        publishMeeting({ state: server.state, error: server.error });
+        publishMeeting({
+          state: server.state,
+          error: meetingErrorDetails(local?.error, server.activation_error, server.error),
+        });
       } else if (server.state === 'starting' || server.state === 'closing') {
         if (server.state === 'closing' || !local?.ending) publishMeeting({ state: server.state });
       } else if (!server.enabled) {

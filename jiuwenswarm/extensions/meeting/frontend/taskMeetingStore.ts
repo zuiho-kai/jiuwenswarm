@@ -33,6 +33,10 @@ let snapshot: MeetingSnapshot = {
 const listeners = new Set<() => void>();
 let releaseInput: (() => void) | undefined;
 
+export function meetingErrorDetails(...messages: Array<string | undefined>): string {
+  return [...new Set(messages.filter((message) => message?.trim()))].join('\n');
+}
+
 export function registerMeetingController(next: Controller): () => void {
   controller = next;
   return () => {
