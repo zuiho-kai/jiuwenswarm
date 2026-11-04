@@ -1,7 +1,8 @@
 import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { LoaderCircle, UsersRound, VolumeX } from 'lucide-react';
+import { LoaderCircle, UsersRound, VolumeX, X } from 'lucide-react';
 import type { ApplicationPluginTaskInputActionProps } from '../../../channels/web/frontend/src/applicationPlugins/types';
+import { useAdaptiveTooltip } from '../../../channels/web/frontend/src/hooks/useAdaptiveTooltip';
 import {
   setTeamMeetingEnabled,
   useTeamMeetingEnabled,
@@ -13,6 +14,7 @@ import './TaskMeetingAction.css';
 export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTaskInputActionProps) {
   const { t } = useTranslation();
   const enabled = useTeamMeetingEnabled();
+  const { tooltip, handlers: tooltipHandlers } = useAdaptiveTooltip({ placement: 'top', multiline: true });
   const snapshot = useMeetingSnapshot();
   const active = snapshot.sessionId === sessionId;
   const requested = active && snapshot.enabled;
@@ -58,8 +60,27 @@ export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTask
     if (requested || status === 'starting') stopMeeting();
   };
   const title = t(
-    `meeting.task.${status === 'idle' ? 'enable' : status === 'starting' ? 'enabling' : status === 'closing' ? 'disabling' : status === 'cleanup_failed' ? 'retryCleanup' : status === 'failed' ? 'retryEnable' : 'enabled'}`,
+    `meeting.task.${status === 'idle' ? 'enable' : status === 'starting' ? 'enabling' : status === 'closing' ? 'disabling' : status === 'cleanup_failed' ? 'retryCleanup' : status === 'failed' ? 'retryEnable' : 'stop'}`,
   );
+  const activationError =
+    status === 'failed'
+      ? t(`meeting.errors.${snapshot.error || 'meetingStartFailed'}`, {
+          defaultValue: snapshot.error || t('meeting.errors.meetingStartFailed'),
+        })
+      : '';
+  const playbackStatus =
+    status === 'active' && snapshot.playback !== 'idle'
+      ? t(`meeting.playback.${snapshot.playback}`, { speaker: snapshot.speaker, voice: snapshot.voice })
+      : '';
+  const statusDescription = [
+    `${t('meeting.panel.title')}: ${t(`meeting.panel.states.${status}`)}`,
+    title,
+    activationError,
+    status === 'cleanup_failed' ? t('meeting.errors.cleanupFailed') : '',
+    playbackStatus,
+  ]
+    .filter(Boolean)
+    .join('\n');
   return (
     <>
       {((enabled && active && snapshot.teamExists) || status === 'closing' || status === 'cleanup_failed') && (
@@ -67,8 +88,9 @@ export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTask
           <button
             type="button"
             className={`chat-input-btn task-meeting-action is-${status}`}
-            title={title}
-            aria-label={title}
+            data-tooltip={statusDescription}
+            {...tooltipHandlers}
+            aria-label={statusDescription}
             aria-pressed={requested}
             aria-busy={status === 'starting' || status === 'closing'}
             disabled={status === 'closing'}
@@ -81,48 +103,48 @@ export function TaskMeetingAction({ fallback, sessionId }: ApplicationPluginTask
             ) : (
               <UsersRound className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
             )}
-            <span data-testid="chat-panel-meeting-toggle-label">{title}</span>
           </button>
+          {tooltip}
           {status === 'failed' && (
             <>
-              <span className="task-meeting-waiting" role="alert" data-testid="chat-panel-meeting-activation-error">
-                {t(`meeting.errors.${snapshot.error || 'meetingStartFailed'}`, {
-                  defaultValue: snapshot.error || t('meeting.errors.meetingStartFailed'),
-                })}
+              <span className="sr-only" role="alert" data-testid="chat-panel-meeting-activation-error">
+                {activationError}
               </span>
               <button
                 type="button"
                 className="chat-input-btn task-meeting-action"
+                title={t('meeting.task.stop')}
+                aria-label={t('meeting.task.stop')}
                 data-testid="chat-panel-meeting-cancel-enable"
                 onClick={() => {
                   if (requested) stopMeeting();
                   else publishMeeting({ state: 'idle', error: undefined });
                 }}
               >
-                {t('meeting.task.stop')}
+                <X className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
               </button>
             </>
           )}
           {status === 'cleanup_failed' && (
-            <span className="task-meeting-waiting" role="status" data-testid="chat-panel-meeting-cleanup-error">
+            <span className="sr-only" role="status" data-testid="chat-panel-meeting-cleanup-error">
               {t('meeting.errors.cleanupFailed')}
             </span>
           )}
           {status === 'active' && snapshot.playback !== 'idle' && (
             <span
-              className="task-meeting-waiting"
+              className="sr-only"
               role="status"
               data-testid="chat-panel-meeting-playback"
               data-variant={snapshot.playback}
             >
-              {t(`meeting.playback.${snapshot.playback}`, { speaker: snapshot.speaker, voice: snapshot.voice })}
+              {playbackStatus}
             </span>
           )}
           {status === 'active' && (
             <>
               <button
                 type="button"
-                className="chat-input-btn"
+                className="chat-input-btn task-meeting-action"
                 title={t('meeting.stopPlayback')}
                 aria-label={t('meeting.stopPlayback')}
                 data-testid="chat-panel-input-meeting-stop-audio"

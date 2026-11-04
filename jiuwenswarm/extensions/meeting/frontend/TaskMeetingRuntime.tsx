@@ -30,12 +30,14 @@ type ActiveMeeting = {
   error?: string;
   enabling?: boolean;
   cancelled?: boolean;
+  playbackReady?: boolean;
 };
 
 // Keep the browser session for same-page Stop/Start. Unmount releases its media.
 const retainedMeeting: { current: ActiveMeeting | null } = { current: null };
 
 async function enableServerMeeting(active: ActiveMeeting): Promise<string> {
+  const deadline = Date.now() + 60_000;
   let startupError: string | undefined;
   const off = webClient.on('chat.error', ({ payload }) => {
     if (payload.session_id === active.sessionId)
@@ -48,6 +50,7 @@ async function enableServerMeeting(active: ActiveMeeting): Promise<string> {
     });
     while (server.state === 'starting') {
       if (active.cancellation.signal.aborted) throw new Error('disconnected');
+      if (Date.now() >= deadline) throw new Error('meetingStartFailed');
       if (startupError) throw new Error(startupError);
       publishMeeting({ state: server.state });
       await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -128,7 +131,7 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
       else active.disabled = true;
       if (current.current !== active) return;
       if (release) current.current = null;
-      if (visibleSession.current !== active.sessionId) return;
+      if (!mounted.current || visibleSession.current !== active.sessionId) return;
       publishMeeting({
         state: 'idle',
         enabled: server.enabled,
@@ -225,7 +228,11 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         previous.enabling = true;
         try {
           await previous.ending;
-          if (current.current !== previous || !previous.disabled || previous.cancellation.signal.aborted) return;
+          if (current.current !== previous || previous.cancellation.signal.aborted) return;
+          if (!previous.disabled) {
+            if (previous.playbackReady) publishMeeting({ state: 'active', sessionId: id, error: undefined });
+            return;
+          }
           publishMeeting({ state: 'starting', sessionId: id });
           try {
             const meetingId = await enableServerMeeting(previous);
@@ -309,6 +316,7 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
             throw new Error('playbackUnavailable');
           }
           if (current.current !== active || cancellation.signal.aborted) return;
+          active.playbackReady = true;
           publishMeeting({ state: 'active' });
         }
       } catch (error) {
@@ -380,9 +388,14 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
       if (server.state === 'failed' || server.state === 'cleanup_failed') {
         publishMeeting({ state: server.state, error: server.error });
       } else if (server.state === 'starting' || server.state === 'closing') {
-        if (!local?.ending) publishMeeting({ state: server.state });
+        if (server.state === 'closing' || !local?.ending) publishMeeting({ state: server.state });
       } else if (!server.enabled) {
-        if (local?.ending) return;
+        if (local?.ending) {
+          await local.ending;
+          if (cancelled || (current.current && current.current !== local)) return;
+          // Failed release retains the aborted instance for an explicit retry.
+          if (current.current === local && local.cancellation.signal.aborted) return;
+        }
         if (local) {
           local.disabled = true;
         }
@@ -396,6 +409,9 @@ export function TaskMeetingRuntime({ sessionId }: ApplicationPluginTaskRuntimePr
         } finally {
           attaching = false;
         }
+      } else if (local?.playbackReady && !local.ending && !local.enabling && !local.cancellation.signal.aborted) {
+        attachmentFailed = false;
+        publishMeeting({ state: 'active', error: undefined });
       }
     };
     const refresh = () => {

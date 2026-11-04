@@ -1,29 +1,34 @@
 .task-meeting-actions {
   display: inline-flex;
-  flex-wrap: wrap;
-  max-width: 100%;
+  flex: 0 0 auto;
   align-items: center;
   gap: 4px;
 }
-.task-meeting-action.is-active {
-  color: var(--color-text-link);
-  background: var(--color-surface-highlight);
+.chat-input-btn.task-meeting-action.is-active {
+  color: var(--color-feedback-success);
+  background: var(--color-feedback-success-subtle);
 }
-.task-meeting-action {
-  width: auto;
-  gap: 6px;
-  padding-inline: 10px;
-  white-space: nowrap;
+.chat-input-btn.task-meeting-action {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+.chat-input-btn.task-meeting-action.is-starting,
+.chat-input-btn.task-meeting-action.is-closing,
+.chat-input-btn.task-meeting-action.is-cleanup_failed {
+  color: var(--color-feedback-warning);
+  background: var(--color-feedback-warning-subtle);
+}
+.chat-input-btn.task-meeting-action.is-failed {
+  color: var(--color-feedback-danger);
+  background: var(--color-feedback-danger-subtle);
+}
+.chat-input-btn.task-meeting-action:disabled {
+  cursor: wait;
 }
 .task-meeting-spinner {
   animation: task-meeting-spin 1s linear infinite;
-}
-.task-meeting-waiting {
-  color: var(--color-text-secondary);
-  font-size: 12px;
-  max-width: 240px;
-  white-space: normal;
-  overflow-wrap: anywhere;
 }
 @keyframes task-meeting-spin {
   to {

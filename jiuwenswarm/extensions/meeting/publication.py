@@ -22,7 +22,7 @@ from openjiuwen.core.single_agent.rail.base import (
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
-from .prompts import SECTION_NAME, build_meeting_role_section
+from .prompts import SECTION_NAME, build_meeting_role_section, teammate_speech_guidance
 
 logger = logging.getLogger(__name__)
 _SEND_TOOLS = frozenset({"send_message", "group_send_message"})
@@ -144,7 +144,7 @@ class _ScopedTool(TeamTool):
 
 
 class MeetingPublicationRail(DeepAgentRail):
-    """Attach meeting controls without replacing SDK send tools or their schemas.
+    """Attach meeting controls while preserving SDK send tools and routing.
 
     Construct via ``create_meeting_publication_rail``. This is intentionally an
     explicit capability, not a global patch to Team tools or SDK prompts.
@@ -230,6 +230,19 @@ class MeetingPublicationRail(DeepAgentRail):
             ctx.inputs.tools = [
                 tool for tool in ctx.inputs.tools if not self._blocked_tool(tool.name)
             ]
+            if not self._leader:
+                for index, tool in enumerate(ctx.inputs.tools):
+                    if tool.name not in _SEND_TOOLS or not isinstance(tool.parameters, dict):
+                        continue
+                    if "speech_text" not in tool.parameters.get("properties", {}):
+                        continue
+                    # Tool definitions are request-local: retain the SDK's routing,
+                    # optional silent sends, and original card after meeting exit.
+                    scoped = deepcopy(tool)
+                    scoped.parameters["properties"]["speech_text"]["description"] = (
+                        teammate_speech_guidance(self.language)
+                    )
+                    ctx.inputs.tools[index] = scoped
 
     def _blocked_tool(self, name: str) -> bool:
         return _unsupported_tool(name)

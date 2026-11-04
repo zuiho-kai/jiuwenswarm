@@ -78,6 +78,34 @@ _LEADER = {
         "路由成功也不代表任务完成。"
     ),
 }
+_TEAMMATE_SPEECH = {
+    "en": (
+        "During this active meeting, include a concise nonempty speech_text for substantive reports, "
+        "research findings, conclusions, progress updates, answers and clarification questions, "
+        "including reports sent privately to the Leader. The recipient chooses who receives the text; "
+        "speech_text chooses whether the meeting hears you. A report sent to the Leader still needs "
+        "speech_text to be heard in the meeting. Supply it in the same send_message or group_send_message "
+        "call as content. For a finished report, keep its file path and short handoff in content and "
+        "speak the key findings and uncertainty, without reading the path aloud. "
+        "Omit speech_text or pass null only for intentionally silent coordination or routine acknowledgements. "
+        "Do not send a second copy just to add speech after a successful send."
+    ),
+    "cn": (
+        "当前会议中，实质报告、调研发现、结论、进展、回答和澄清问题都应提供简短且非空的 speech_text，"
+        "包括私发给 Leader 的报告。接收者决定谁收到正文，speech_text 决定会议是否听到发言；"
+        "给 Leader 的报告也需要 speech_text 才能在会议中被听到。"
+        "在同一次 send_message 或 group_send_message 调用中同时提供 content 和 speech_text。"
+        "完整报告的文件路径及简短交接说明放在 content，speech_text 口述关键发现和不确定性，不要朗读路径。"
+        "仅在有意静默协调或例行确认时省略 speech_text 或传 null。不要在成功发送后为了补充语音再发一份。"
+    ),
+}
+
+
+def teammate_speech_guidance(language: str) -> str:
+    """Use the same meeting speech policy in the prompt and message-tool hint."""
+    return _TEAMMATE_SPEECH.get(language, _TEAMMATE_SPEECH["en"])
+
+
 _INTERRUPTION = {
     "en": (
         "\n\nTo stop another member's speech, inspect meeting_get_speaker once and pass that "
@@ -98,7 +126,8 @@ def build_meeting_role_section(*, leader: bool, can_interrupt: bool = False) -> 
         name=SECTION_NAME,
         content={
             language: text + (
-                _LEADER[language] + (_INTERRUPTION[language] if can_interrupt else "") if leader else ""
+                _LEADER[language] + (_INTERRUPTION[language] if can_interrupt else "")
+                if leader else "\n\n" + teammate_speech_guidance(language)
             )
             for language, text in _ROLE.items()
         },
