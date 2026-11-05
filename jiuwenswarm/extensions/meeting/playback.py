@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 EVENT = "meeting.playback"
 STOP_TIMEOUT_SECONDS = 10
@@ -151,6 +154,10 @@ class BrowserPlaybackConsumer:
             if not accepted:
                 raise ValueError("Playback lease is no longer current")
             self._receipts[record.playback_id] = (outcome, count)
+            logger.info(
+                "Meeting playback result: session_id=%s request_id=%s playback_id=%s outcome=%s completed_chunks=%s/%s",
+                self.scope.session_id, record.request_id, record.playback_id, outcome, count, len(record.chunks),
+            )
         return {"accepted": True}
 
     def confirm_stop(self, stop_id: str) -> dict:
