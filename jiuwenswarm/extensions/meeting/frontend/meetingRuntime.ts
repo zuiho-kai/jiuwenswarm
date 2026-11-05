@@ -17,7 +17,7 @@ type Speech = Payload & {
   meeting_id: string;
   request_id: string;
   lease_token: string;
-  source_message_id: string;
+  source_message_id: string | null;
   speaker_id: string;
   playback_id: string;
   chunks: string[];
@@ -36,6 +36,13 @@ const identityFields = [
 ] as const;
 function identity(speech: Speech): Payload {
   return Object.fromEntries(identityFields.map((key) => [key, speech[key]]));
+}
+
+function hasSpeechIdentity(payload: Payload): boolean {
+  return identityFields.every(
+    (key) =>
+      (key === 'source_message_id' && payload[key] === null) || (typeof payload[key] === 'string' && !!payload[key]),
+  );
 }
 
 export class MeetingSession {
@@ -87,7 +94,7 @@ export class MeetingSession {
           !this.matchesMeeting(payload) ||
           typeof payload.stop_id !== 'string' ||
           !payload.stop_id ||
-          identityFields.some((key) => typeof payload[key] !== 'string' || !payload[key])
+          !hasSpeechIdentity(payload)
         )
           return;
         const attempt = this.currentSpeech;
@@ -181,7 +188,7 @@ export class MeetingSession {
 
   private receiveSpeech(payload: Payload): void {
     if (!this.active || !this.matchesMeeting(payload)) return;
-    if (identityFields.some((key) => typeof payload[key] !== 'string' || !payload[key])) return;
+    if (!hasSpeechIdentity(payload)) return;
     if (
       !Array.isArray(payload.chunks) ||
       !payload.chunks.length ||
@@ -204,7 +211,7 @@ export class MeetingSession {
         }
         this.currentSpeech = attempt;
         this.callbacks.line({
-          id: speech.source_message_id,
+          id: speech.source_message_id ?? speech.request_id,
           speaker: speech.speaker_id,
           text: speech.chunks.join(''),
         });

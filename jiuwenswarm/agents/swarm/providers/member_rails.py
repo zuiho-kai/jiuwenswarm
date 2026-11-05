@@ -15,6 +15,7 @@ by the build context instead of imperatively threaded dataclasses.
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -98,6 +99,7 @@ def build_meeting_participant(params: dict[str, Any], context: SwarmBuildContext
     ):
         return None
     from jiuwenswarm.extensions.meeting.participants import MeetingParticipantRail
+    from jiuwenswarm.extensions.meeting.messages import create_meeting_message_tool
     from openjiuwen.agent_teams.tools.locales import make_translator
     from openjiuwen.agent_teams.tools.tool_member import ListMembersTool
 
@@ -105,6 +107,7 @@ def build_meeting_participant(params: dict[str, Any], context: SwarmBuildContext
         context.session_id, backend.team_name, context.member_name,
         language=context.language or "en",
         roster_tool=ListMembersTool(backend, make_translator(context.language or "en")),
+        create_send_tool=partial(create_meeting_message_tool, backend, language=context.language or "en"),
     )
 
 

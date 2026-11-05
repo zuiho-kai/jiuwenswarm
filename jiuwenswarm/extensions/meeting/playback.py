@@ -32,7 +32,7 @@ class SpeechPlayback:
     meeting_id: str
     request_id: str
     lease_token: str
-    source_message_id: str
+    source_message_id: str | None
     speaker_id: str
     playback_id: str
     voice: str
@@ -45,7 +45,7 @@ class SpeechPlayback:
         return {key: getattr(self, key) for key in IDENTITY_FIELDS}
 
     def matches(self, params: dict) -> bool:
-        return all(params.get(key) == value for key, value in self.identity().items())
+        return all(key in params and params[key] == value for key, value in self.identity().items())
 
 
 class BrowserPlaybackConsumer:
@@ -79,7 +79,10 @@ class BrowserPlaybackConsumer:
             await self._push("meeting.addressed_members", {"addressed_members": names})
 
     async def speech_ready(self, request) -> None:
-        if self._closing or request.scope != self.scope or not request.lease_token or request.source_message_id is None:
+        if (
+            self._closing or request.scope != self.scope or not request.lease_token
+            or (request.source_message_id is None and request.content != "")
+        ):
             raise ValueError("A matching granted speech request is required")
         if not await self.driver.playback_is_current(request.scope, request.request_id, request.lease_token):
             return
@@ -89,7 +92,7 @@ class BrowserPlaybackConsumer:
             playback_id = uuid4().hex
             record = SpeechPlayback(
                 self.scope.session_id, self.scope.meeting_id, request.request_id,
-                request.lease_token, str(request.source_message_id), request.member_name,
+                request.lease_token, request.source_message_id, request.member_name,
                 playback_id, voice.provider_voice_id, voice.model, voice.catalog_version,
                 self.config_revision, speech_chunks(request.speech_text),
             )

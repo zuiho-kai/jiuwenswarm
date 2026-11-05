@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 from openjiuwen.agent_teams.meeting import (
@@ -421,6 +422,7 @@ class MeetingManager:
 
     async def attach_team_runtime(self, session_id: str, *, wake: bool = False) -> None:
         from .grant_driver import MeetingGrantDriver
+        from .messages import publish_message
 
         async with self._runtime_lock:
             if self._stopping or session_id in self._stopped_sessions:
@@ -495,8 +497,12 @@ class MeetingManager:
                     return
                 meeting.state = state
                 if meeting.driver is None:
+                    conversation = (
+                        await backend.group_conversation() if backend.conversation_mode == "group_chat" else None
+                    )
                     meeting.driver = MeetingGrantDriver(
                         coordinator, is_current=lambda: self._driver_is_current(session_id, meeting),
+                        publish_granted=partial(publish_message, coordinator, backend.message_manager, conversation),
                     )
                     if state.owner_request_id:
                         request = await coordinator.get_request(state.owner_request_id)

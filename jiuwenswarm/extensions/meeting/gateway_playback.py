@@ -63,7 +63,7 @@ class GatewayPlaybackRoute:
 
     def identity(self, params):
         record = self.records.get(params.get("playback_id"))
-        if record is None or any(params.get(key) != record.get(key) for key in IDENTITY_FIELDS):
+        if record is None or any(key not in params or params[key] != record.get(key) for key in IDENTITY_FIELDS):
             raise ValueError("Unknown or stale meeting speech identity")
         return {key: record[key] for key in IDENTITY_FIELDS}
 

@@ -17,6 +17,7 @@ from .publication import MeetingPublicationRail, create_meeting_publication_rail
 if TYPE_CHECKING:
     from openjiuwen.agent_teams.schema.meeting import SpeechRequest
     from openjiuwen.agent_teams.tools.tool_base import TeamTool
+    from openjiuwen.core.foundation.tool import ToolCard
     from jiuwenswarm.common.voice_matching import MemberVoiceRegistry, VoiceAssignment
 
 _POLICY = "_meeting_member_publication_policy"
@@ -58,6 +59,7 @@ class MeetingPublicationSession:
 
     async def attach(
         self, agent: Any, member_name: str, language: str, roster_tool: TeamTool | None = None,
+        *, create_send_tool: Callable[[MeetingCoordinator, ToolCard], TeamTool],
     ) -> MeetingPublicationRail:
         if self.closed:
             raise ValueError("Meeting publication scope has ended")
@@ -66,6 +68,7 @@ class MeetingPublicationSession:
         policy = await create_meeting_publication_rail(
             self.coordinator, member_name, language=language, on_queued=self.on_queued,
             roster_tool=roster_tool,
+            create_send_tool=create_send_tool,
             on_addressed_members=self.on_addressed_members,
             on_interrupt=self.on_interrupt,
         )
@@ -106,11 +109,12 @@ class MeetingParticipantRail(DeepAgentRail):
     priority = MeetingPublicationRail.priority
 
     def callback_priority(self, event: AgentCallbackEvent) -> int:
-        return 0 if event == AgentCallbackEvent.BEFORE_MODEL_CALL else self.priority
+        return 0 if event in {AgentCallbackEvent.BEFORE_MODEL_CALL, AgentCallbackEvent.BEFORE_TOOL_CALL} else self.priority
 
     def __init__(
         self, session_id: str, team_name: str, member_name: str, *, language: str = "en",
         roster_tool: TeamTool | None = None,
+        create_send_tool: Callable[[MeetingCoordinator, ToolCard], TeamTool],
         resolve_session: Callable[[str, str], MeetingPublicationSession | None] = _resolve_session,
     ) -> None:
         super().__init__()
@@ -119,6 +123,7 @@ class MeetingParticipantRail(DeepAgentRail):
         self._member_name = member_name
         self._language = language
         self._roster_tool = roster_tool
+        self._create_send_tool = create_send_tool
         self._resolve = resolve_session
         self._agent: Any = None
         self._session: MeetingPublicationSession | None = None
@@ -158,7 +163,10 @@ class MeetingParticipantRail(DeepAgentRail):
             return
         try:
             if self._policy is None:
-                self._policy = await session.attach(self._agent, self._member_name, self._language, self._roster_tool)
+                self._policy = await session.attach(
+                    self._agent, self._member_name, self._language, self._roster_tool,
+                    create_send_tool=self._create_send_tool,
+                )
                 if session.voices is not None:
                     self.voice_assignment = session.voices.get_voice(self._member_name)
                 if isinstance(ctx.inputs, ModelCallInputs) and not ctx.extra.get("_finalizing_max_iterations"):

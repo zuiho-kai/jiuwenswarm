@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from functools import partial
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -24,10 +24,13 @@ from openjiuwen.core.single_agent.rail.base import (
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
-from .prompts import SECTION_NAME, build_meeting_role_section, teammate_speech_guidance
+from .prompts import SECTION_NAME, build_meeting_role_section
 
 logger = logging.getLogger(__name__)
 _SEND_TOOLS = frozenset({"send_message", "group_send_message"})
+_MEETING_SEND = "meeting_send_message"
+_MEETING_GROUP_SEND = "group_meeting_send_message"
+_MEETING_SEND_TOOLS = frozenset({_MEETING_SEND, _MEETING_GROUP_SEND, "meeting_speak"})
 _ADDRESSED = "meeting_set_addressed_members"
 _STREAMING = "_meeting_previous_streaming"
 _TURN = "_meeting_publication_turn"
@@ -146,7 +149,7 @@ class _ScopedTool(TeamTool):
 
 
 class MeetingPublicationRail(DeepAgentRail):
-    """Attach meeting controls while preserving SDK send tools and routing.
+    """Attach meeting controls and host-owned speech admission to SDK send tools.
 
     Construct via ``create_meeting_publication_rail``. This is intentionally an
     explicit capability, not a global patch to Team tools or SDK prompts.
@@ -156,15 +159,18 @@ class MeetingPublicationRail(DeepAgentRail):
 
     def callback_priority(self, event: AgentCallbackEvent) -> int:
         # Apply meeting prompt/schema changes after the SDK Team policies.
-        return 0 if event == AgentCallbackEvent.BEFORE_MODEL_CALL else self.priority
+        # Keep permission checks ahead of meeting policy checks.
+        return 0 if event in {AgentCallbackEvent.BEFORE_MODEL_CALL, AgentCallbackEvent.BEFORE_TOOL_CALL} else self.priority
 
     def __init__(
         self, coordinator: MeetingCoordinator, member_name: str, *, leader: bool,
         language: str = "en", on_queued: Callable[[], None] | None = None,
+        create_send_tool: Callable[[MeetingCoordinator, ToolCard], TeamTool],
         on_interrupt=None,
     ) -> None:
         super().__init__()
         self._client = coordinator.for_member(member_name)
+        self._create_send_tool = partial(create_send_tool, coordinator)
         self._leader = leader
         self.language = language
         self.on_queued = on_queued
@@ -187,6 +193,16 @@ class MeetingPublicationRail(DeepAgentRail):
             raise ValueError("Meeting publication requires a native agent with prompt and tool support")
         if builder.get_section(SECTION_NAME) is not None:
             raise ValueError("This member runtime already has a meeting publication scope")
+        source = agent.ability_manager.get("send_message")
+        if not isinstance(source, ToolCard):
+            raise ValueError("Meeting messaging requires the member's send_message tool")
+        send_tool = self._create_send_tool(source)
+        self._tools[send_tool.card.name] = _ScopedTool(send_tool, self)
+        group_source = agent.ability_manager.get("group_send_message")
+        if not self._leader and isinstance(group_source, ToolCard):
+            self._tools[_MEETING_GROUP_SEND] = _ScopedTool(
+                self._create_send_tool(group_source), self,
+            )
         self._agent = agent
         self.system_prompt_builder = builder
         for tool in self._tools.values():
@@ -210,10 +226,9 @@ class MeetingPublicationRail(DeepAgentRail):
         self.system_prompt_builder = None
 
     async def before_model_call(self, ctx: AgentCallbackContext) -> None:
-        # The pinned native runtime streams model text before AFTER_MODEL_CALL.
-        # Buffer this member's model response so ordinary final text stays hidden.
-        ctx.extra[_STREAMING] = ctx.extra.get("_streaming", False)
-        ctx.extra["_streaming"] = False
+        if not self._leader:
+            ctx.extra[_STREAMING] = ctx.extra.get("_streaming", False)
+            ctx.extra["_streaming"] = False
         ctx.extra.setdefault(_TURN, _PublicationTurn())
         # The participant rail reconciles the current host scope. SDK tools
         # validate persisted meeting state at admission/control execution.
@@ -236,31 +251,16 @@ class MeetingPublicationRail(DeepAgentRail):
             ctx.inputs.tools = [
                 tool for tool in ctx.inputs.tools if not self._blocked_tool(tool.name)
             ]
-            if not self._leader:
-                for index, tool in enumerate(ctx.inputs.tools):
-                    if tool.name not in _SEND_TOOLS or not isinstance(tool.parameters, dict):
-                        continue
-                    if "speech_text" not in tool.parameters.get("properties", {}):
-                        continue
-                    # Require teammate speech on this request without changing
-                    # the SDK's original tool card or recipient routing.
-                    scoped = deepcopy(tool)
-                    scoped.parameters["properties"]["speech_text"].update({
-                        "type": "string", "minLength": 1,
-                        "description": teammate_speech_guidance(self.language),
-                    })
-                    required = scoped.parameters.setdefault("required", [])
-                    if "speech_text" not in required:
-                        required.append("speech_text")
-                    ctx.inputs.tools[index] = scoped
 
     def _blocked_tool(self, name: str) -> bool:
-        return _unsupported_tool(name)
+        return _unsupported_tool(name) or (not self._leader and name in _SEND_TOOLS)
 
     async def after_model_call(self, ctx: AgentCallbackContext) -> None:
         if _STREAMING in ctx.extra:
             ctx.extra["_streaming"] = ctx.extra.pop(_STREAMING)
         if ctx.exception is not None or ctx.has_force_finish_request:
+            return
+        if self._leader:
             return
         if not self.active:
             ctx.request_force_finish({"output": "Meeting scope ended.", "result_type": "error"})
@@ -280,26 +280,22 @@ class MeetingPublicationRail(DeepAgentRail):
         if not isinstance(ctx.inputs, ToolCallInputs):
             return
         inputs = ctx.inputs
+        if (
+            ctx.has_force_finish_request or ctx.extra.get("_skip_tool")
+            or ctx.extra.get("_skip_tool_calls", {}).get(inputs.tool_call.id)
+        ):
+            return
         message = None
         if self._blocked_tool(inputs.tool_name):
             message = (
                 "The host has already built this Team. Use the existing roster; do not call build_team again."
                 if inputs.tool_name == "build_team" else
+                "Use group_meeting_send_message with content, client_message_id, and nonempty speech_text."
+                if inputs.tool_name == "group_send_message" else
+                "Use meeting_send_message with content and nonempty speech_text for teammate meeting messages."
+                if inputs.tool_name in _SEND_TOOLS else
                 "This runtime or cross-Team delivery is not supported during a coordinated native meeting."
             )
-        elif not self._leader and inputs.tool_name in _SEND_TOOLS:
-            arguments = inputs.tool_args
-            if isinstance(arguments, str):
-                try:
-                    arguments = json.loads(arguments)
-                except ValueError:
-                    arguments = None
-            speech = arguments.get("speech_text") if isinstance(arguments, dict) else None
-            if not isinstance(speech, str) or not speech.strip():
-                message = (
-                    "Every teammate meeting message requires nonempty speech_text in the same call as content. "
-                    "Aim for 1-2 short sentences and roughly 50 characters, exceeding that soft target when needed."
-                )
         if message is not None:
             # A model can still emit a hidden/cached tool name. Reject execution
             # rather than relying on the tool list or prompt for enforcement.
@@ -310,14 +306,12 @@ class MeetingPublicationRail(DeepAgentRail):
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
         inputs = ctx.inputs
-        if not isinstance(inputs, ToolCallInputs) or inputs.tool_name not in _SEND_TOOLS or ctx.exception is not None:
+        if not isinstance(inputs, ToolCallInputs) or inputs.tool_name not in _MEETING_SEND_TOOLS or ctx.exception is not None:
             return
         result = inputs.tool_result
-        if not isinstance(result, ToolOutput) or not result.success or not isinstance(result.data, dict):
+        if not isinstance(result, ToolOutput) or not isinstance(result.data, dict):
             return
-        # SDK send_message and group_send_message use different admission receipts.
-        # Direct sends, including omitted/null speech_text, never wake playback.
-        if result.data.get("type") != "queued" and result.data.get("queued") is not True:
+        if result.data.get("type") != "queued":
             return
         ctx.extra.setdefault(_TURN, _PublicationTurn()).queued = True
         if self.on_queued is not None:
@@ -332,6 +326,7 @@ class MeetingPublicationRail(DeepAgentRail):
 async def create_meeting_publication_rail(
     coordinator: MeetingCoordinator, member_name: str, *, language: str = "en",
     roster_tool: TeamTool | None = None,
+    create_send_tool: Callable[[MeetingCoordinator, ToolCard], TeamTool],
     on_queued: Callable[[], None] | None = None,
     on_addressed_members: Callable[[list[str]], Awaitable[None]] | None = None,
     on_interrupt=None,
@@ -347,8 +342,12 @@ async def create_meeting_publication_rail(
     rail = MeetingPublicationRail(
         coordinator, member_name, leader=member_name == state.leader_member_name,
         language=language, on_queued=on_queued, on_interrupt=on_interrupt,
+        create_send_tool=create_send_tool,
     )
-    tools = await create_meeting_tools(coordinator.for_member(member_name), language=language)
+    tools = (
+        await create_meeting_tools(coordinator.for_member(member_name), language=language)
+        if rail._leader else {}
+    )
     if roster_tool is not None:
         tools[roster_tool.card.name] = roster_tool
     if rail._leader:

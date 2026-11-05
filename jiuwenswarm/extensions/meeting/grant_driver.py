@@ -1,4 +1,4 @@
-"""Event-driven SDK grants; audio transport belongs to an injected consumer."""
+"""Event-driven SDK grants with injected publication and playback operations."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ class GrantDriverState:
 class MeetingGrantDriver:
     """One serialized worker per meeting, woken by admission and explicit acks.
 
-    SDK methods alone choose the next speaker and publish full text. No timer,
+    SDK methods choose the next speaker; the host explicitly publishes full text. No timer,
     synthesis result, or consumer callback return can release a speaking lease.
     Publication failures and explicit audio stops hold coordination. Confirmed
     failed audio revokes its lease and advances. Interruption waits
@@ -59,12 +59,14 @@ class MeetingGrantDriver:
     def __init__(
         self, coordinator: MeetingCoordinator, consumer: MeetingPlaybackConsumer | None = None, *,
         is_current: Callable[[], Awaitable[bool]],
+        publish_granted: Callable[[str, str | None, bool, bool], Awaitable[SpeechRequest | None]],
     ) -> None:
         if consumer is not None and any(not callable(getattr(consumer, name, None)) for name in ("speech_ready", "speech_error", "stop", "interrupt")):
             raise ValueError("A playback consumer with ready, error, and stop callbacks is required")
         self.coordinator = coordinator
         self.consumer = consumer
         self._is_current = is_current
+        self._publish_granted = publish_granted
         self._wake = asyncio.Event()
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
@@ -351,9 +353,15 @@ class MeetingGrantDriver:
             playback_ready = self.consumer is not None and self._audio_enabled and not self._detaching and not self._recovering
             if retry:
                 assert current.request is not None and current.request.lease_token
-                request = await self.coordinator.retry_publication(current.request.lease_token, playback_ready=playback_ready)
+                request = await self.coordinator.get_speaker()
+                if request is not None and request.lease_token != current.request.lease_token:
+                    request = None
             else:
                 request = await self.coordinator.grant_next(playback_ready=playback_ready)
+            if request is not None:
+                request = await self._publish_granted(
+                    request.request_id, request.lease_token, playback_ready, retry,
+                )
             if self._closed:
                 return
             if request is None:
@@ -374,16 +382,20 @@ class MeetingGrantDriver:
                 self._state = GrantDriverState("coordination_failed", current.request, "invalid_speech_grant")
             elif (
                 request.status == SpeechRequestStatus.TEXT_ONLY and request.lease_token is None
-                and request.source_message_id is not None and not request.delivery_error
+                and (request.source_message_id is not None or request.content == "")
+                and not request.delivery_error and not request.message_error
             ):
-                # The SDK published and completed a text-only dequeue. There
-                # was no audio lease to acknowledge or speech to replay later.
+                # The host finished a dequeue with audio disabled, publishing
+                # text only when present. There is no speech to replay later.
                 self._state = GrantDriverState()
                 self._recovering = False
                 self.wake()
             elif not request.lease_token:
                 self._state = GrantDriverState("coordination_failed", request, "invalid_speech_grant")
-            elif request.delivery_error or request.message_error or request.source_message_id is None:
+            elif (
+                request.delivery_error or request.message_error
+                or (request.source_message_id is None and request.content != "")
+            ):
                 self._state = GrantDriverState(
                     "publication_failed", request,
                     request.delivery_error or request.message_error or "source_message_unavailable",
