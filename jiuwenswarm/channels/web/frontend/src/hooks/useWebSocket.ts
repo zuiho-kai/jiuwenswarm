@@ -1988,7 +1988,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
       resetContextCompressionTurn(sessionId);
       userInputVersionRef.current += 1;
-      if (!hasMeetingAudioOwner(sessionId)) stopAllTts();
+      stopAllTts();
 
       // A new query supersedes an unanswered inline question for this same session.
       if (useChatStore.getState().getRuntime(sessionId)?.pendingQuestions[0]) {
@@ -2259,7 +2259,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     async (content: unknown, sessionId: string) => {
       resetContextCompressionTurn(sessionId);
       userInputVersionRef.current += 1;
-      if (!hasMeetingAudioOwner(sessionId)) stopAllTts();
+      stopAllTts();
 
       useChatStore.getState().setProcessing(sessionId, true);
       useChatStore.getState().setThinking(sessionId, true);
@@ -2393,7 +2393,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       if (intent === 'supplement' && newInput) {
         resetContextCompressionTurn(sessionId);
         userInputVersionRef.current += 1;
-        if (!hasMeetingAudioOwner(sessionId)) stopAllTts();
+        stopAllTts();
         if (useSessionStore.getState().getRuntime(sessionId)?.mode === 'team') {
           closeActiveTeamLeaderMessages(sessionId);
         }
