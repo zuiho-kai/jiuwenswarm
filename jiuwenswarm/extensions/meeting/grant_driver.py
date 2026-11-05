@@ -34,6 +34,8 @@ class MeetingPlaybackConsumer(Protocol):
 
     async def interrupt(self, interruption: SpeechInterruption) -> None: ...
 
+    def abandon_transport(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class GrantDriverState:
@@ -83,6 +85,7 @@ class MeetingGrantDriver:
         self._attachment_lock = asyncio.Lock()
         self._shutdown_phase: str | None = None
         self._recovering = False
+        self._transport_lost = False
 
     def set_audio_enabled(self, enabled: bool) -> None:
         if self._audio_enabled != enabled:
@@ -105,8 +108,53 @@ class MeetingGrantDriver:
                 raise ValueError("Meeting queue already has a playback consumer or is stopping")
             self.consumer = consumer
             self._stopped = False
+            self._transport_lost = False
             if self._task is not None:
                 self.wake()
+
+    def abandon_transport(self, consumer: MeetingPlaybackConsumer) -> None:
+        if self.consumer is not consumer:
+            raise ValueError("Playback consumer is no longer current")
+        consumer.abandon_transport()
+        self._transport_lost = True
+        self._detaching = True
+
+    async def _release_abandoned_speech(self) -> None:
+        state = await self.coordinator.get_state()
+        if state is not None and not state.closed and state.lease_token:
+            request = await self.coordinator.get_speaker()
+            current = self._state.request
+            if (
+                request is None or current is None or request.request_id != current.request_id
+                or request.lease_token != current.lease_token or request.lease_token != state.lease_token
+            ):
+                raise RuntimeError("Abandoned speech no longer matches the current claim")
+            if request.source_message_id is None and request.content != "":
+                # Detaching audio must not discard text whose publication failed.
+                published = await self._publish_granted(request.request_id, request.lease_token, False, True)
+                if published is not None and (published.delivery_error or published.message_error):
+                    self._recovering = True
+                    self._state = GrantDriverState(
+                        "publication_failed", published,
+                        published.delivery_error or published.message_error,
+                    )
+                    return
+                state = await self.coordinator.get_state()
+                if state is not None and state.lease_token:
+                    raise RuntimeError("Abandoned publication could not be finished silently")
+        if state is not None and not state.closed and (state.lease_token or state.interruption_id):
+            released = await self.coordinator.force_release(
+                expected_token=state.lease_token, expected_interruption_id=state.interruption_id,
+            )
+            if not released:
+                latest = await self.coordinator.get_state()
+                if latest is not None and not latest.closed and (latest.lease_token or latest.interruption_id):
+                    raise RuntimeError("Abandoned speech ownership changed during recovery")
+        self._interruption = None
+        self._audio_stopped = False
+        self._input_admitted = False
+        self._state = GrantDriverState()
+        self._recovering = False
 
     async def detach_consumer(self) -> None:
         """Explicit transport teardown; meeting disable only changes the audio gate."""
@@ -119,7 +167,10 @@ class MeetingGrantDriver:
             await consumer.stop()
             async with self._lock:
                 request = self._state.request
-                if self._interruption is not None:
+                if self._transport_lost:
+                    await self._release_abandoned_speech()
+                    request = None
+                elif self._interruption is not None:
                     if not await self.coordinator.resume_after_interruption(self._interruption.interruption_id):
                         raise RuntimeError("Stopped interruption barrier could not be released")
                     self._interruption = None
@@ -187,7 +238,9 @@ class MeetingGrantDriver:
                 await self.consumer.stop()
                 self._stopped = True
             request = self._state.request
-            if request is not None and request.lease_token and self._shutdown_phase not in {"publication_failed", "publishing"}:
+            if self._transport_lost and self.consumer is not None:
+                await self._release_abandoned_speech()
+            elif request is not None and request.lease_token and self._shutdown_phase not in {"publication_failed", "publishing"}:
                 interruption = await self.coordinator.interrupt_speech(expected_token=request.lease_token)
                 if interruption is not None:
                     await self.coordinator.resume_after_interruption(interruption.interruption_id)
@@ -200,7 +253,7 @@ class MeetingGrantDriver:
     def _matches(self, scope: MeetingScope, request_id: str, lease_token: str) -> bool:
         request = self._state.request
         return bool(
-            not self._closed and scope == self.coordinator.scope and request is not None
+            not self._closed and not self._transport_lost and scope == self.coordinator.scope and request is not None
             and request.request_id == request_id and lease_token and request.lease_token == lease_token
         )
 
@@ -212,7 +265,7 @@ class MeetingGrantDriver:
         # Recheck local state after the SDK read: interruption/teardown may have
         # completed while it was in flight. Reading never grants or republishes.
         return bool(
-            self._state.phase == "awaiting_playback" and self._matches(scope, request_id, lease_token)
+            not self._detaching and self._state.phase == "awaiting_playback" and self._matches(scope, request_id, lease_token)
             and speaker is not None and speaker.scope == scope
             and speaker.request_id == request_id and speaker.lease_token == lease_token
         )
@@ -223,7 +276,7 @@ class MeetingGrantDriver:
         async with self._lock:
             if not self._matches(scope, request_id, lease_token) or self._state.phase != "awaiting_playback":
                 return False
-            if not await self.coordinator.complete_playback(lease_token):
+            if not await self.coordinator.release(lease_token):
                 return False
             if not self._closed:
                 self._state = GrantDriverState()
@@ -274,7 +327,7 @@ class MeetingGrantDriver:
         async with self._lock:
             request = self._state.request
             if (
-                self._closed or self.consumer is None or request is None or request.lease_token != expected_token
+                self._closed or self._transport_lost or self.consumer is None or request is None or request.lease_token != expected_token
                 or self._interruption is not None or self._state.phase not in {"awaiting_playback", "publication_failed"}
             ):
                 return None
@@ -294,13 +347,17 @@ class MeetingGrantDriver:
         try:
             await self.consumer.interrupt(interruption)
         except Exception:
-            logger.exception("Meeting speech stop was not confirmed")
             async with self._lock:
+                if self._transport_lost or self._interruption is not interruption:
+                    return interruption
                 if not self._closed:
                     self._state = GrantDriverState("interruption_failed", request, "interruption_stop_failed")
+            logger.exception("Meeting speech stop was not confirmed")
             await self._report_error()
             raise RuntimeError("Meeting speech stop was not confirmed; end the meeting to recover") from None
         async with self._lock:
+            if self._transport_lost or self._interruption is not interruption:
+                return interruption
             self._audio_stopped = True
             await self._resume_interruption()
         return interruption
@@ -309,7 +366,7 @@ class MeetingGrantDriver:
         if not await self._is_current():
             return False
         async with self._lock:
-            if self._closed:
+            if self._closed or self._transport_lost:
                 return False
             if interruption_id in self._finished_interruptions:
                 return True
@@ -320,7 +377,7 @@ class MeetingGrantDriver:
             return True
 
     async def _resume_interruption(self) -> None:
-        if self._closed or not self._audio_stopped or not self._input_admitted:
+        if self._closed or self._transport_lost or self._interruption is None or not self._audio_stopped or not self._input_admitted:
             return
         interruption_id = self._interruption.interruption_id
         if not await self.coordinator.resume_after_interruption(interruption_id):
@@ -331,7 +388,7 @@ class MeetingGrantDriver:
         self.wake()
 
     async def _report_error(self) -> None:
-        if self._closed or self.consumer is None:
+        if self._closed or self._transport_lost or self.consumer is None:
             return
         try:
             await self.consumer.speech_error(self._state.request, self._state.error or "coordination_failed")
@@ -342,7 +399,7 @@ class MeetingGrantDriver:
         if not await self._is_current():
             return
         async with self._lock:
-            if self._closed:
+            if self._closed or self._detaching:
                 return
             current = self._state
             retry = current.phase == "publication_failed" and self._retry_requested

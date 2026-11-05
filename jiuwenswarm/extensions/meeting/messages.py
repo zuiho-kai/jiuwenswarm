@@ -34,6 +34,7 @@ async def publish_message(
     if request is None or request.request_id != request_id or not lease_token or request.lease_token != lease_token:
         return None
     try:
+        ids = request.source_message_ids or ((request.source_message_id,) if request.source_message_id else ())
         if request.content and request.source_message_id is None:
             ids = await _publish_route(
                 coordinator, manager, conversation,
@@ -41,16 +42,13 @@ async def publish_message(
                 request.request_id, recover=recover,
             )
             request = replace(request, source_message_id=ids[0], source_message_ids=ids)
-            await coordinator.record_publication(request.request_id, ids)
         # An earlier send can succeed while recording fails. Retrying uses
         # deterministic IDs so it links the same messages, never duplicates.
-        elif recover and request.source_message_id is not None:
-            await coordinator.record_publication(
-                request.request_id, request.source_message_ids or (request.source_message_id,),
-            )
         # Empty content has no mailbox publication to record; it still follows
         # the same queue lease and playback acknowledgement path.
-        return await coordinator.finish_publication(lease_token, playback_ready=playback_ready)
+        return await coordinator.finish_publication(
+            request.request_id, lease_token, source_message_ids=ids, playback_ready=playback_ready,
+        )
     except Exception as exc:
         from jiuwenswarm.common.utils import mask_sensitive
 

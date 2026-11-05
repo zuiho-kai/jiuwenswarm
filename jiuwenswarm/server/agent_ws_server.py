@@ -5352,6 +5352,7 @@ class AgentWebSocketServer:
         """Run meeting controls in the AgentServer that owns the Team runtime."""
         from jiuwenswarm.common.protocol_ids import is_valid_session_id
         from jiuwenswarm.extensions.meeting.meeting_manager import get_server_meeting_manager
+        from openjiuwen.core.common.exception.errors import ValidationError as SDKValidationError
 
         params = request.params if isinstance(request.params, dict) else {}
         session_id = str(request.session_id or "").strip()
@@ -5399,7 +5400,9 @@ class AgentWebSocketServer:
                 else:
                     playback_payload = consumer.confirm_stop(str(params.get("stop_id") or ""))
             elif request.req_method == ReqMethod.MEETING_RELEASE:
-                if not await manager.release(session_id, owner_id, startup_id):
+                if not await manager.release(
+                    session_id, owner_id, startup_id, transport_loss=params.get("_meeting_transport_loss"),
+                ):
                     raise ValueError("Meeting is not owned by this connection")
             elif request.req_method == ReqMethod.MEETING_END:
                 meeting_id = str(params.get("meeting_id") or "").strip()
@@ -5411,7 +5414,7 @@ class AgentWebSocketServer:
                 request_id=request.request_id, channel_id=request.channel_id,
                 ok=True, payload=payload, metadata=request.metadata,
             )
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, SDKValidationError) as exc:
             resp = AgentResponse(
                 request_id=request.request_id, channel_id=request.channel_id,
                 ok=False, payload={"error": str(exc), "code": "BAD_REQUEST"},

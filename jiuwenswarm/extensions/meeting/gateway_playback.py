@@ -42,6 +42,7 @@ class GatewayPlaybackRoute:
         self.drained_playbacks: set[str] = set()
         self.current_playback = None
         self.result_lock = asyncio.Lock()
+        self._media_lock = asyncio.Lock()
         self.tasks: dict[tuple, asyncio.Task] = {}
         self.tts = TtsSession(config)
         self.stops: dict[str, asyncio.Task] = {}
@@ -68,16 +69,17 @@ class GatewayPlaybackRoute:
         return {key: record[key] for key in IDENTITY_FIELDS}
 
     async def cancel_synthesis(self):
-        pending = list(self.tasks.items())
-        tasks = [task for _, task in pending]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for key, task in pending:
-            if self.tasks.get(key) is task:
-                self.tasks.pop(key, None)
-        await self.tts.aclose()
+        async with self._media_lock:
+            pending = list(self.tasks.items())
+            tasks = [task for _, task in pending]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            for key, task in pending:
+                if self.tasks.get(key) is task:
+                    self.tasks.pop(key, None)
+            await self.tts.aclose()
 
     async def interrupt_synthesis(self):
         await self.cancel_synthesis()
@@ -166,6 +168,7 @@ def _route_for(ws, params, session_id):
 async def playback_ready(channel, agent_client, ws, req_id, params, session_id, user_id=None):
     route = None
     created = False
+    attachment_requested = False
     try:
         params = params if isinstance(params, dict) else {}
         target = str(params.get("session_id") or session_id or "")
@@ -199,6 +202,9 @@ async def playback_ready(channel, agent_client, ws, req_id, params, session_id, 
             raise ValueError("Meeting playback configuration changed or has stopped")
         # Prepare the meeting-owned provider session before grants.
         await route.tts.start()
+        if route.revoked or getattr(ws, "_meeting_disconnected", False):
+            raise ValueError("Meeting playback transport has stopped")
+        attachment_requested = True
         payload = await route.fetch(ReqMethod.MEETING_PLAYBACK_READY, {
             "meeting_id": meeting_id, "startup_id": startup_id,
             "_meeting_route_id": route.id, "_tts_model": config.model,
@@ -217,7 +223,10 @@ async def playback_ready(channel, agent_client, ws, req_id, params, session_id, 
         )
         if created:
             await route.stop_media()
-            await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
+            # A lost ready response may still have installed this consumer.
+            # Retain its route identity until release confirms server cleanup.
+            if not attachment_requested:
+                await forget_playback_routes(ws, target, meeting_id, startup_id=startup_id)
         await channel.send_response(ws, req_id, ok=False, error=message, code="MEETING_PLAYBACK_UNAVAILABLE")
 
 
@@ -312,8 +321,6 @@ async def playback_result(channel, ws, req_id, params, session_id, user_id=None)
             })
             route.receipts[identity["playback_id"]] = (outcome, count)
             route.pending_receipts.pop(identity["playback_id"], None)
-            if outcome == "stopped":
-                getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
         await channel.send_response(ws, req_id, ok=True, payload=payload)
     except (ValueError, RuntimeError) as exc:
         await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_RESULT_FAILED")
@@ -335,8 +342,6 @@ async def playback_stopped(channel, ws, req_id, params, session_id, user_id=None
         })
         route.stop_receipts[stop_id] = payload
         await channel.send_response(ws, req_id, ok=True, payload=payload)
-        if route.revoked:
-            getattr(ws, "_meeting_owned_sessions", {}).pop((route.session_id, route.startup_id), None)
     except (ValueError, RuntimeError) as exc:
         await channel.send_response(ws, req_id, ok=False, error=str(exc), code="MEETING_PLAYBACK_STOP_FAILED")
 
@@ -344,3 +349,23 @@ async def playback_stopped(channel, ws, req_id, params, session_id, user_id=None
 async def close_browser_playback(ws, _sessions=None):
     for route in list(getattr(ws, "_meeting_playback_routes", {}).values()):
         await route.stop_media()
+
+
+async def drain_lost_playback(ws, session_id, startup_id):
+    if not getattr(ws, "_meeting_disconnected", False):
+        raise ValueError("Playback transport is still connected")
+    routes = [
+        route for route in getattr(ws, "_meeting_playback_routes", {}).values()
+        if route.session_id == session_id and route.startup_id == startup_id
+    ]
+    if not routes:
+        return None
+    if len(routes) != 1 or routes[0].owner_id != getattr(ws, "_meeting_owner_id", None):
+        raise ValueError("Disconnected playback ownership is ambiguous")
+    route = routes[0]
+    route.revoked = True
+    async with route.result_lock:
+        await route.stop_media()
+        if route.stops:
+            await asyncio.gather(*route.stops.values())
+    return {"meeting_id": route.meeting_id, "route_id": route.id}

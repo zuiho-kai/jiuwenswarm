@@ -2299,7 +2299,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             user_id=user_id,
             req_method=method,
             label=method.value,
-            drop_params=("_meeting_owner_id",),
+            drop_params=("_meeting_owner_id", "_meeting_transport_loss"),
             extra_params={"_meeting_owner_id": owner_id} if owner_id else None,
             on_done=_on_done,
         )
@@ -2311,26 +2311,40 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         owner_id = getattr(ws, "_meeting_owner_id", None)
         if not owner_id:
             return
-        await fetch_agent_unary(
+        # Recheck drain here: a failed earlier disconnect hook must not let
+        # release bypass provider/input cleanup, including late start replies.
+        await voice_input.close_voice_input(ws)
+        transport_loss = await meeting_playback.drain_lost_playback(ws, session_id, startup_id)
+        params = {"_meeting_owner_id": owner_id, "startup_id": startup_id}
+        if transport_loss is not None:
+            params["_meeting_transport_loss"] = transport_loss
+        ok, payload = await fetch_agent_unary(
             agent_client=_resolve(agent_client),
             req_method=ReqMethod.MEETING_RELEASE,
-            params={"_meeting_owner_id": owner_id, "startup_id": startup_id},
+            params=params,
             session_id=session_id,
             user_id=user_id,
             channel_id=channel.channel_id,
             label="meeting.disconnect",
             timeout_seconds=5,
         )
+        if not ok:
+            raise RuntimeError(payload.get("error") or "Meeting disconnect release failed")
+        await meeting_playback.forget_playback_routes(ws, session_id, startup_id=startup_id)
+        getattr(ws, "_meeting_owned_sessions", {}).pop((session_id, startup_id), None)
 
     async def _release_meetings_on_disconnect(ws, _session_ids):
         setattr(ws, "_meeting_disconnected", True)
         owned = getattr(ws, "_meeting_owned_sessions", {})
         for (owned_session, startup_id), user_id in list(owned.items()):
-            try:
-                await _release_meeting(ws, owned_session, user_id, startup_id)
-            except Exception:
-                logger.exception("Meeting disconnect cleanup failed: session_id=%s", owned_session)
-        owned.clear()
+            for attempt in range(3):
+                try:
+                    await _release_meeting(ws, owned_session, user_id, startup_id)
+                    break
+                except Exception:
+                    logger.exception("Meeting disconnect cleanup failed: session_id=%s attempt=%s", owned_session, attempt + 1)
+                    if attempt < 2:
+                        await asyncio.sleep(0.2 * (attempt + 1))
 
     async def _meeting_start(ws, req_id, params, session_id, user_id=None):
         from jiuwenswarm.common.schema.message import ReqMethod

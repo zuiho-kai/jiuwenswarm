@@ -44,6 +44,7 @@ class _Meeting:
     retiring: bool = False
     activation_error: str | None = None
     cleanup_error: str | None = None
+    lost_route_id: str | None = None
 
 
 def _meeting_enabled() -> bool:
@@ -585,6 +586,7 @@ class MeetingManager:
                 raise RuntimeError("Another startup already owns this meeting")
             if meeting.phase == "disabled":
                 meeting.activation_error = None
+                meeting.lost_route_id = None
                 meeting.phase = "starting"
                 meeting.abandoned = False
                 meeting.disable_on_cleanup = True
@@ -754,9 +756,28 @@ class MeetingManager:
                     state = await coordinator.get_state()
                     if state is not None and state.enabled:
                         raise RuntimeError("Team meeting disable did not finish; retry cleanup")
-            if meeting.release_playback and meeting.driver is not None:
-                stage = "detach_playback"
-                await meeting.driver.detach_consumer()
+            while True:
+                if meeting.release_playback and meeting.driver is not None:
+                    stage = "detach_playback"
+                    await meeting.driver.detach_consumer()
+                state = await coordinator.get_state() if coordinator is not None else None
+                async with self._lock:
+                    if self._sessions.get(session_id) is not meeting:
+                        return
+                    # A disconnect can upgrade an End already in progress.
+                    # Recheck after taking the lock instead of spawning another
+                    # detach or clearing ownership before media is retired.
+                    if meeting.release_playback and meeting.driver is not None and meeting.driver.consumer is not None:
+                        continue
+                    meeting.phase = "disabled"
+                    meeting.cleanup_error = None
+                    if state is not None:
+                        meeting.state = state
+                    if meeting.release_playback:
+                        meeting.owner_id = None
+                        meeting.startup_id = None
+                    meeting.publication = None
+                    break
         except BaseException as exc:
             from jiuwenswarm.common.utils import mask_sensitive
 
@@ -771,14 +792,6 @@ class MeetingManager:
             )
             await self._publish_status(session_id)
             raise
-        async with self._lock:
-            if self._sessions.get(session_id) is meeting:
-                meeting.phase = "disabled"
-                meeting.cleanup_error = None
-                if meeting.release_playback:
-                    meeting.owner_id = None
-                    meeting.startup_id = None
-                meeting.publication = None
         await self._publish_status(session_id)
 
     def _release_locked(
@@ -793,13 +806,12 @@ class MeetingManager:
                 meeting.initializing.cancel()
             return meeting.task
         if meeting.phase == "closing":
-            if meeting.driver is not None:
-                self._spawn(meeting.driver.detach_consumer())
             return meeting.task
         return self._begin_close_locked(session_id, meeting)
 
     async def release(
-        self, session_id: str, owner_id: str, startup_id: str | None = None
+        self, session_id: str, owner_id: str, startup_id: str | None = None,
+        *, transport_loss: dict | None = None,
     ) -> bool:
         """Connection/page teardown: stop media and disable the Team meeting."""
         if not owner_id:
@@ -818,6 +830,29 @@ class MeetingManager:
                 logger.warning("Meeting release rejected: session_id=%s startup_id=%s phase=%s reason=startup_mismatch",
                                session_id, startup_id, meeting.phase)
                 return False
+            if transport_loss is not None:
+                from .playback import BrowserPlaybackConsumer
+
+                if (
+                    not isinstance(transport_loss, dict) or set(transport_loss) != {"meeting_id", "route_id"}
+                    or any(not isinstance(value, str) or not value.strip() for value in transport_loss.values())
+                    or not startup_id or meeting.state is None
+                    or transport_loss["meeting_id"] != meeting.state.scope.meeting_id
+                ):
+                    raise ValueError("Invalid disconnected playback identity")
+                consumer = meeting.driver.consumer if meeting.driver is not None else None
+                route_id = transport_loss["route_id"]
+                if consumer is not None:
+                    if (
+                        not isinstance(consumer, BrowserPlaybackConsumer)
+                        or consumer.owner_id != owner_id or consumer.route_id != route_id
+                        or consumer.scope != meeting.state.scope
+                    ):
+                        raise ValueError("Disconnected playback consumer is no longer current")
+                    meeting.driver.abandon_transport(consumer)
+                elif meeting.lost_route_id not in (None, route_id):
+                    raise ValueError("Disconnected playback route is no longer current")
+                meeting.lost_route_id = route_id
             task = self._release_locked(session_id, meeting)
         if task is not None:
             await asyncio.shield(task)

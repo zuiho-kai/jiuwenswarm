@@ -59,6 +59,7 @@ class BrowserPlaybackConsumer:
         self._receipts: dict[str, tuple[str, int]] = {}
         self._current: str | None = None
         self._closing = False
+        self._transport_lost = False
         self._result_lock = asyncio.Lock()
         self._stop_id: str | None = None
         self._stop_waiter: asyncio.Future | None = None
@@ -156,6 +157,8 @@ class BrowserPlaybackConsumer:
     def confirm_stop(self, stop_id: str) -> dict:
         # Deliberately independent from driver/result locks: aclose holds the
         # driver lock while waiting for this receipt, including cleanup retries.
+        if self._transport_lost:
+            raise ValueError("Playback transport has been retired")
         speech_waiter = self._speech_stops.get(stop_id)
         if speech_waiter is not None:
             if not speech_waiter.done():
@@ -166,6 +169,16 @@ class BrowserPlaybackConsumer:
         if not self._stop_waiter.done():
             self._stop_waiter.set_result(True)
         return {"accepted": True}
+
+    def abandon_transport(self) -> None:
+        self._transport_lost = True
+        self._closing = True
+        self._current = None
+        self._interrupted.update(self._records)
+        # False retires waiters without fabricating a browser acknowledgement.
+        for waiter in [self._stop_waiter, *self._speech_stops.values()]:
+            if waiter is not None and not waiter.done():
+                waiter.set_result(False)
 
     async def interrupt(self, interruption) -> None:
         playback_id = self._request_ids.get(interruption.request_id)
@@ -183,12 +196,15 @@ class BrowserPlaybackConsumer:
         )
         await self._push("meeting.speech.stop", {**record.identity(), "stop_id": interruption.interruption_id})
         try:
-            await asyncio.wait_for(asyncio.shield(waiter), self._stop_timeout)
+            if not await asyncio.wait_for(asyncio.shield(waiter), self._stop_timeout):
+                raise RuntimeError("Meeting playback transport was lost")
         except TimeoutError:
             raise RuntimeError("Interrupted speech stop was not confirmed") from None
 
     async def stop(self) -> None:
         self._closing = True
+        if self._transport_lost:
+            return
         if self._stop_waiter is None:
             self._stop_id = uuid4().hex
             self._stop_waiter = asyncio.get_running_loop().create_future()
