@@ -287,10 +287,10 @@ class MeetingSpeakTool(TeamTool):
         super().__init__(ToolCard(
             id="team.meeting_speak", name="meeting_speak",
             description=(
-                "Queue a spoken reply to the human during this meeting. Leader only. "
-                "Provide the actual nonempty spoken reply in speech_text. "
-                "This queues audio without sending a Team message; use ordinary assistant output for the text reply. "
-                "A queue receipt is not playback completion."
+                "Before EVERY reply to the human, you MUST call meeting_speak "
+                "with the spoken summary in speech_text as the FIRST action of your turn. "
+                "Only then produce ordinary assistant output. "
+                "Correct: meeting_speak → text reply. Never: text reply → meeting_speak."
             ),
             input_params={
                 "type": "object",

@@ -38,10 +38,8 @@ _ROLE = {
 }
 _LEADER = {
     "en": (
-        "A meeting is enabled on this Team. Reply to the human using ordinary assistant output. "
-        "For each reply to the human, explicitly call meeting_speak(speech_text='the spoken reply') to enqueue its audio. "
-        "speech_text must contain the actual nonempty spoken reply. "
-        "This queues only audio and does not publish another message. "
+        "Before replying to the human, call meeting_speak(speech_text='the spoken reply'), "
+        "then reply using ordinary assistant output. "
         "Use the normal SDK message tools without speech_text for messages to other agents. "
         "When a human message explicitly addresses another agent, identify the recipient "
         "from the current roster and forward the message with send_message, using to or targets "
@@ -55,10 +53,8 @@ _LEADER = {
         "If the intended recipient is ambiguous, ask for clarification."
     ),
     "cn": (
-        "当前 Team 已启用会议。通过普通助手输出回复用户。每次回复用户时，显式调用 "
-        "meeting_speak(speech_text='口述答复') 将语音入队。"
-        "speech_text 必须是实际的非空口述答复。"
-        "这只排队语音，不会发布另一条消息。向其他代理发送消息时正常使用 SDK 消息工具，不传 speech_text。"
+        "回复用户前，先调用 meeting_speak(speech_text='口述答复')，再通过普通助手输出回复用户。"
+        "向其他代理发送消息时正常使用 SDK 消息工具，不传 speech_text。"
         "用户消息明确点名其他代理时，根据当前名册确定接收者，通过 send_message "
         "使用工具支持的 to 或 targets 转发消息。保留原始消息，仅在接收者理解请求所必需时修改。"
         "转发前，用被点名代理的名册名称调用 meeting_set_addressed_members(member_names=[...]) 设置发言优先级。"
