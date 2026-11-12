@@ -487,6 +487,26 @@ Agent Team 不是一次性分完工就结束，而是依靠事件驱动持续推
 
 ---
 
+
+### 私信的投递模式（本地补丁）
+
+普通集群的 Agent 间私信 `send_message` 可以加 `mode`；省略时沿用原行为。广播、多收件人消息、发给用户的消息和 SwarmChat 群聊不使用此字段。
+
+| 模式 | 行为 |
+| --- | --- |
+| `steer` | 空闲时直接处理；忙时在下一次模型决策前插入，不打断正在运行的工具。 |
+| `follow_up` | 空闲时直接处理；忙时等发送时所绑定的任务不再由该成员执行，再按后续输入投递。没有任务记录时等当前轮结束。 |
+| `abort` | 仅 Leader 可发送。空闲时直接投递；忙时必须能确定唯一活跃任务。成员核对任务后中止其当前执行，再处理消息。任务已变化时不执行中止。中止不移除成员、不改任务板状态。 |
+
+普通成员需要中止时，用私信向 Leader 说明任务和原因，由 Leader 决定。消息发送成功表示已入收件箱，不代表成员已经停止。
+
+实现位于本仓库锁定的 `agent-core` 依赖。将 [补丁](../../patches/agent-core-private-message.patch) 应用到该依赖的固定提交 `2f4bedb9c5d85ab70d7c79d36183e6a98799e94e`。在已同步 JiuwenSwarm 环境的仓库根目录，用 `uv pip install --no-deps -e <agent-core目录>` 使用修改后的依赖，随后用 `uv run --no-sync jiuwenswarm-start` 启动服务。
+
+
+普通集群用 `send_message(to="*")` 发广播时，发送方不指定模式。已启动的接收成员用 Jev 从 `steer`、`follow_up`、`drop` 中选择。广播不会启动尚未运行的成员，也不能中止任务。Jev 不可用时丢弃该成员的广播投递；使用现有 `JEV_BASE_URL`、`JEV_MODEL`、`JEV_API_KEY` 配置。广播按接收顺序处理：较早的广播在等待时，较新的广播保留未读，私信仍可投递。
+
+公开群聊沿用 @ 点名路由：未被点名不唤起；空闲时直接处理；被点名且忙碌时由 Jev 在 steer 与 follow_up 中选择。Jev 超时或返回非法结果时使用 follow_up，不丢弃点名消息。已有 follow_up 不因新 steer 被清空。Jev 支持 JEV_ENDPOINT_PATH，默认 /v1/systemone；Mindshub 使用 JEV_BASE_URL=https://api.mindshub.ai、JEV_MODEL=jev-1.13.0、JEV_ENDPOINT_PATH=/v1/decisions，密钥通过 JEV_API_KEY 注入。
+
 ## 五、常见问题
 
 ### Q1：Agent Team 和普通对话有什么区别？

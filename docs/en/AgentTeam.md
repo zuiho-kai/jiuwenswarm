@@ -503,6 +503,23 @@ Agent Team does not stop after a one-time assignment; it advances through events
 
 ---
 
+### Private message delivery modes (local patch)
+
+In a normal team, agents can set `mode` on a private `send_message`. Omitting it preserves existing behavior. Broadcasts, multicast, messages to the user, and SwarmChat do not use this field.
+
+- `steer`: Deliver immediately if idle. Otherwise inject before the next model decision without stopping a running tool.
+- `follow_up`: Deliver immediately if idle. Otherwise wait for the task active at send time to leave the recipient's active work. If there is no tracked task, wait for the current round.
+- `abort`: Leader only. Deliver if idle. A busy recipient must have one identifiable active task. Stop its execution before delivering the message. Do not abort if the target has changed. The member stays on the team and its task-board state is unchanged.
+
+Members can ask the leader to stop a task by sending a private message with the task and reason. A successful send confirms mailbox submission, not execution cancellation.
+
+Apply the [patch](../../patches/agent-core-private-message.patch) to the pinned `agent-core` revision `2f4bedb9c5d85ab70d7c79d36183e6a98799e94e`. From the JiuwenSwarm checkout with its environment already synced, install the patched dependency with `uv pip install --no-deps -e <agent-core-path>`, then start the service with `uv run --no-sync jiuwenswarm-start`.
+
+
+For ordinary team broadcasts sent with `send_message(to="*")`, the sender does not select a mode. Each running recipient uses Jev to choose `steer`, `follow_up`, or `drop`. A broadcast does not start an unstarted member or abort work. If Jev is unavailable, delivery is dropped for that recipient. Configure Jev using the existing `JEV_BASE_URL`, `JEV_MODEL`, and `JEV_API_KEY`. A deferred broadcast keeps later broadcasts unread; direct messages can still pass.
+
+Public group chat keeps mention-based routing: unmentioned members are not woken; idle recipients process immediately; busy mentioned recipients use Jev to choose steer or follow_up. Errors or invalid choices fall back to follow_up, never dropping a mention. A new steer does not clear queued follow-ups. JEV_ENDPOINT_PATH defaults to /v1/systemone; for Mindshub use JEV_BASE_URL=https://api.mindshub.ai, JEV_MODEL=jev-1.13.0 and JEV_ENDPOINT_PATH=/v1/decisions. Inject credentials through JEV_API_KEY.
+
 ## FAQ
 
 ### Q1: Agent Team vs normal chat?
